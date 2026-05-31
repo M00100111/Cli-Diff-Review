@@ -1,71 +1,38 @@
-# cli-diff README
+# CLI Diff
 
-This is the README for your extension "cli-diff". After writing up a brief description, we recommend including the following sections.
+CLI Diff brings Cursor-style code change review to VS Code for files modified by CLI coding agents.
 
 ## Features
 
-Describe specific features of your extension including screenshots of your extension in action. Image paths are relative to this README file.
+- Review Git working-tree changes directly from VS Code.
+- Capture a snapshot baseline before running a CLI agent, then review the resulting edits.
+- Inspect full-file old/current changes in a review view with red and green diff blocks.
+- Accept or reject individual hunks.
+- Accept or reject all changes in a file.
+- Jump to the previous or next change.
+- Open the native VS Code diff editor when you want a side-by-side comparison.
 
-For example if there is an image subfolder under your extension project workspace:
+## Commands
 
-\!\[feature X\]\(images/feature-x.png\)
+- `CLI Diff: Start Git Review`
+- `CLI Diff: Capture Baseline`
+- `CLI Diff: Start Snapshot Review`
+- `CLI Diff: Open Review`
+- `CLI Diff: Accept Change`
+- `CLI Diff: Reject Change`
+- `CLI Diff: Next Change`
+- `CLI Diff: Previous Change`
+- `CLI Diff: Apply Cursor Review Style`
 
-> Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
+## Settings
 
-## Requirements
+- `cliDiff.autoStartGitReview`: automatically start a Git review session for changed files.
+- `cliDiff.autoOpenReviewView`: automatically open the review view when the active file has pending hunks.
+- `cliDiff.maxFileBytes`: maximum file size included in review.
+- `cliDiff.maxDiffLines`: maximum combined old and new line count diffed for one file.
+- `cliDiff.maxFiles`: maximum number of files scanned for snapshot reviews.
+- `cliDiff.exclude`: glob pattern excluded from snapshot scans.
 
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
+## Notes
 
-## Extension Settings
-
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
-
-For example:
-
-This extension contributes the following settings:
-
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
-
-## Known Issues
-
-Calling out known issues can help limit users opening duplicate issues against your extension.
-
-## Release Notes
-
-Users appreciate release notes as you update your extension.
-
-### 1.0.0
-
-Initial release of ...
-
-### 1.0.1
-
-Fixed issue #.
-
-### 1.1.0
-
-Added features X, Y, and Z.
-
----
-
-## Following extension guidelines
-
-Ensure that you've read through the extensions guidelines and follow the best practices for creating your extension.
-
-* [Extension Guidelines](https://code.visualstudio.com/api/references/extension-guidelines)
-
-## Working with Markdown
-
-You can author your README using Visual Studio Code. Here are some useful editor keyboard shortcuts:
-
-* Split the editor (`Cmd+\` on macOS or `Ctrl+\` on Windows and Linux).
-* Toggle preview (`Shift+Cmd+V` on macOS or `Shift+Ctrl+V` on Windows and Linux).
-* Press `Ctrl+Space` (Windows, Linux, macOS) to see a list of Markdown snippets.
-
-## For more information
-
-* [Visual Studio Code's Markdown Support](http://code.visualstudio.com/docs/languages/markdown)
-* [Markdown Syntax Reference](https://help.github.com/articles/markdown-basics/)
-
-**Enjoy!**
+CLI Diff does not stage, commit, or rewrite Git history. Accepting a change marks it as reviewed in the current session; rejecting a change edits the working file back to the baseline content for that hunk.

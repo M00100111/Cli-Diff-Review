@@ -3,44 +3,176 @@
   "displayName": "cli-diff",
   "description": "cli-diff is a lightweight CLI diff tool that brings Cursor-like code review to the terminal.",
   "version": "0.0.1",
+  "publisher": "local",
   "engines": {
-    "vscode": "^1.120.0"
+    "vscode": "^1.117.0"
   },
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:cli-diff.captureBaseline",
+    "onCommand:cli-diff.startSnapshotReview",
+    "onCommand:cli-diff.startGitReview",
+    "onCommand:cli-diff.acceptChange",
+    "onCommand:cli-diff.rejectChange",
+    "onCommand:cli-diff.acceptFile",
+    "onCommand:cli-diff.rejectFile",
+    "onCommand:cli-diff.nextChange",
+    "onCommand:cli-diff.previousChange",
+    "onCommand:cli-diff.openReviewView",
+    "onCommand:cli-diff.refresh",
+    "onView:cli-diff.review"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "cli-diff.helloWorld",
-        "title": "Hello World"
+        "command": "cli-diff.captureBaseline",
+        "title": "Capture Baseline",
+        "category": "CLI Diff"
+      },
+      {
+        "command": "cli-diff.startSnapshotReview",
+        "title": "Start Snapshot Review",
+        "category": "CLI Diff"
+      },
+      {
+        "command": "cli-diff.startGitReview",
+        "title": "Start Git Review",
+        "category": "CLI Diff"
+      },
+      {
+        "command": "cli-diff.acceptChange",
+        "title": "Accept Change",
+        "category": "CLI Diff"
+      },
+      {
+        "command": "cli-diff.rejectChange",
+        "title": "Reject Change",
+        "category": "CLI Diff"
+      },
+      {
+        "command": "cli-diff.acceptFile",
+        "title": "Accept File",
+        "category": "CLI Diff",
+        "icon": "$(check)"
+      },
+      {
+        "command": "cli-diff.rejectFile",
+        "title": "Reject File",
+        "category": "CLI Diff",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "cli-diff.nextChange",
+        "title": "Next Change",
+        "category": "CLI Diff"
+      },
+      {
+        "command": "cli-diff.previousChange",
+        "title": "Previous Change",
+        "category": "CLI Diff"
+      },
+      {
+        "command": "cli-diff.openReviewView",
+        "title": "Open Review",
+        "category": "CLI Diff"
+      },
+      {
+        "command": "cli-diff.refresh",
+        "title": "Refresh Review",
+        "category": "CLI Diff",
+        "icon": "$(refresh)"
       }
-    ]
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "cli-diff.review",
+          "name": "CLI Diff Review"
+        }
+      ]
+    },
+    "menus": {
+      "view/item/context": [
+        {
+          "command": "cli-diff.acceptFile",
+          "when": "view == cli-diff.review && viewItem == cliDiffFile",
+          "group": "inline@1"
+        },
+        {
+          "command": "cli-diff.rejectFile",
+          "when": "view == cli-diff.review && viewItem == cliDiffFile",
+          "group": "inline@2"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "cli-diff.refresh",
+          "when": "view == cli-diff.review",
+          "group": "navigation@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "CLI Diff",
+      "properties": {
+        "cliDiff.maxFileBytes": {
+          "type": "number",
+          "default": 524288,
+          "minimum": 1024,
+          "description": "Maximum file size, in bytes, included in CLI Diff baselines and reviews."
+        },
+        "cliDiff.maxFiles": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 1,
+          "description": "Maximum number of workspace files captured or scanned for snapshot reviews."
+        },
+        "cliDiff.maxDiffLines": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 100,
+          "description": "Maximum combined old and new line count diffed for one file."
+        },
+        "cliDiff.autoStartGitReview": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start a lightweight Git review session so changed files appear in the CLI Diff Review view."
+        },
+        "cliDiff.exclude": {
+          "type": "string",
+          "default": "**/{.git,node_modules,dist,out,.vscode-test}/**",
+          "description": "Glob pattern excluded when capturing or scanning snapshot review files."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
     "compile": "webpack",
     "watch": "webpack --watch",
     "package": "webpack --mode production --devtool hidden-source-map",
-    "compile-tests": "tsc -p . --outDir out",
+    "compile-tests": "node -e \"require('fs').rmSync('out',{recursive:true,force:true})\" && tsc -p . --outDir out",
     "watch-tests": "tsc -p . -w --outDir out",
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
     "lint": "eslint src",
     "test": "vscode-test"
   },
   "devDependencies": {
-    "@types/vscode": "^1.120.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
-    "typescript-eslint": "^8.56.1",
-    "eslint": "^9.39.3",
-    "typescript": "^5.9.3",
-    "ts-loader": "^9.5.4",
-    "webpack": "^5.105.3",
-    "webpack-cli": "^6.0.1",
+    "@types/vscode": "^1.117.0",
     "@vscode/test-cli": "^0.0.12",
-    "@vscode/test-electron": "^2.5.2"
+    "@vscode/test-electron": "^2.5.2",
+    "eslint": "^9.39.3",
+    "monaco-editor": "^0.55.1",
+    "ts-loader": "^9.5.4",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.56.1",
+    "webpack": "^5.105.3",
+    "webpack-cli": "^6.0.1"
   }
 }

@@ -3,9 +3,22 @@
 'use strict';
 
 const path = require('path');
+const fs = require('fs');
 
 //@ts-check
 /** @typedef {import('webpack').Configuration} WebpackConfig **/
+
+class MonacoAssetsPlugin {
+  apply(compiler) {
+    compiler.hooks.afterEmit.tap('MonacoAssetsPlugin', () => {
+      const source = path.resolve(__dirname, 'node_modules', 'monaco-editor', 'min', 'vs');
+      const target = path.resolve(__dirname, 'dist', 'monaco', 'vs');
+      fs.rmSync(target, { recursive: true, force: true });
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.cpSync(source, target, { recursive: true });
+    });
+  }
+}
 
 /** @type WebpackConfig */
 const extensionConfig = {
@@ -44,5 +57,8 @@ const extensionConfig = {
   infrastructureLogging: {
     level: "log", // enables logging required for problem matchers
   },
+  plugins: [
+    new MonacoAssetsPlugin(),
+  ],
 };
 module.exports = [ extensionConfig ];

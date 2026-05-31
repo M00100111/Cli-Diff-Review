@@ -1,9 +1,8 @@
-# Change Log
+# Changelog
 
-All notable changes to the "cli-diff" extension will be documented in this file.
+## 0.0.1
 
-Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
-
-## [Unreleased]
-
-- Initial release
+- Add Git and snapshot review sessions.
+- Add hunk-level accept, reject, next, and previous commands.
+- Add a review view with red and green diff blocks.
+- Add inline editor decorations and review tree integration.
