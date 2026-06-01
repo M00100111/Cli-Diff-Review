@@ -8,6 +8,8 @@ import { SnapshotStore } from './snapshotStore';
 import { decodeUtf8, encodeUtf8, isProbablyBinary, lineRange, relativePath, replaceLineBlock, splitLines } from './text';
 import { FilePair, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewSession, ReviewSource, uriKey } from './types';
 
+type InternalWriteSource = 'plugin' | 'human';
+
 export class ReviewController implements vscode.Disposable {
 	private readonly snapshotStore: SnapshotStore;
 	private readonly gitService = new GitService();
@@ -15,8 +17,10 @@ export class ReviewController implements vscode.Disposable {
 	private readonly treeProvider: ReviewTreeProvider;
 	private readonly reviewWebview: ReviewWebviewManager;
 	private readonly refreshTimers = new Map<string, NodeJS.Timeout>();
-	private readonly ordinaryEditorEdits = new Map<string, EditedRange[]>();
-	private readonly suppressedDocumentChanges = new Map<string, number>();
+	private readonly humanEditBatches = new Map<string, EditedRange[]>();
+	private readonly humanSaveIntents = new Map<string, number>();
+	private readonly internalWriteDepth = new Map<string, number>();
+	private readonly writeGraceUntil = new Map<string, { source: InternalWriteSource; until: number }>();
 	private activeSession: ReviewSession | undefined;
 
 	public constructor(private readonly context: vscode.ExtensionContext) {
@@ -38,6 +42,7 @@ export class ReviewController implements vscode.Disposable {
 				}
 			}),
 			vscode.workspace.onDidOpenTextDocument((document) => this.scheduleRefresh(document.uri)),
+			vscode.workspace.onWillSaveTextDocument((event) => this.handleWillSaveDocument(event)),
 			vscode.workspace.onDidSaveTextDocument((document) => {
 				void this.handleSavedDocument(document);
 			}),
@@ -77,19 +82,34 @@ export class ReviewController implements vscode.Disposable {
 		}
 
 		const key = uriKey(event.document.uri);
-		if (this.isDocumentChangeSuppressed(event.document.uri)) {
-			this.ordinaryEditorEdits.delete(key);
+		if (this.isInternalWriteActive(event.document.uri)) {
+			this.humanEditBatches.delete(key);
 			return;
 		}
 
-		const ranges = this.ordinaryEditorEdits.get(key) ?? [];
+		if (!event.document.isDirty) {
+			this.humanEditBatches.delete(key);
+			this.handleFileSystemChange(event.document.uri);
+			return;
+		}
+
+		const ranges = this.humanEditBatches.get(key) ?? [];
 		for (const change of event.contentChanges) {
 			const startLine = Math.max(0, change.range.start.line);
 			const insertedLines = this.countInsertedLines(change.text);
 			const endLine = Math.max(change.range.end.line, startLine + insertedLines);
 			ranges.push({ startLine, endLine: Math.max(startLine + 1, endLine) });
 		}
-		this.ordinaryEditorEdits.set(key, this.mergeEditedRanges(ranges));
+		this.humanEditBatches.set(key, this.mergeEditedRanges(ranges));
+	}
+
+	private handleWillSaveDocument(event: vscode.TextDocumentWillSaveEvent): void {
+		if (event.document.uri.scheme !== 'file' || this.isInternalWriteActive(event.document.uri)) {
+			return;
+		}
+
+		this.humanSaveIntents.set(uriKey(event.document.uri), Date.now() + 5000);
+		this.markWriteGrace(event.document.uri, 'human');
 	}
 
 	private async handleSavedDocument(document: vscode.TextDocument): Promise<void> {
@@ -98,17 +118,19 @@ export class ReviewController implements vscode.Disposable {
 		}
 
 		const key = uriKey(document.uri);
-		if (this.isDocumentChangeSuppressed(document.uri)) {
-			this.ordinaryEditorEdits.delete(key);
+		if (this.isInternalWriteActive(document.uri)) {
+			this.humanEditBatches.delete(key);
 			return;
 		}
 
-		if (this.ordinaryEditorEdits.has(key)) {
-			await this.flushOrdinaryEditorEdits(document);
+		if (this.humanEditBatches.has(key) || this.hasHumanSaveIntent(document.uri)) {
+			this.markWriteGrace(document.uri, 'human');
+			await this.flushHumanEdits(document);
+			this.markWriteGrace(document.uri, 'human');
 			return;
 		}
 
-		this.scheduleRefresh(document.uri);
+		this.scheduleRefresh(document.uri, { preferDisk: true });
 	}
 
 	private async captureBaseline(): Promise<void> {
@@ -328,7 +350,7 @@ export class ReviewController implements vscode.Disposable {
 			}
 
 			if (!target.file.currentExists) {
-				await this.writeFileText(target.file.uri, target.file.oldText);
+				await this.withInternalWrite(target.file.uri, 'plugin', () => this.writeFileText(target.file.uri, target.file.oldText));
 				this.recordDecisionHunk(target.file, target.hunk, 'reject');
 				await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 				return;
@@ -336,7 +358,7 @@ export class ReviewController implements vscode.Disposable {
 
 			const document = await vscode.workspace.openTextDocument(target.file.uri);
 			const wasDirty = document.isDirty;
-			await this.withSuppressedDocumentChanges(target.file.uri, async () => {
+			await this.withInternalWrite(target.file.uri, 'plugin', async () => {
 				const edit = new vscode.WorkspaceEdit();
 				edit.replace(target.file.uri, lineRange(document, target.hunk.newStart, target.hunk.newLines), target.hunk.oldText);
 				const applied = await vscode.workspace.applyEdit(edit);
@@ -433,12 +455,12 @@ export class ReviewController implements vscode.Disposable {
 
 			const file = this.resolveFile(uriString);
 			if (!file) {
-				await this.writeCurrentFileText(uri, editedText);
+				await this.writeCurrentFileText(uri, editedText, 'human');
 				return;
 			}
 
 			this.applyManualEditsToBaseline(file, editedText, editedRanges);
-			await this.writeCurrentFileText(uri, editedText);
+			await this.writeCurrentFileText(uri, editedText, 'human');
 
 			if (this.activeSession?.mode === 'snapshot') {
 				await this.snapshotStore.updateBaselineFile(file.uri, file.oldText);
@@ -450,15 +472,12 @@ export class ReviewController implements vscode.Disposable {
 		}
 	}
 
-	private async flushOrdinaryEditorEdits(document: vscode.TextDocument): Promise<void> {
+	private async flushHumanEdits(document: vscode.TextDocument): Promise<void> {
 		try {
 			const key = uriKey(document.uri);
-			const editedRanges = this.ordinaryEditorEdits.get(key) ?? [];
-			this.ordinaryEditorEdits.delete(key);
-			if (editedRanges.length === 0) {
-				this.scheduleRefresh(document.uri);
-				return;
-			}
+			const editedRanges = this.humanEditBatches.get(key) ?? [];
+			this.humanEditBatches.delete(key);
+			this.humanSaveIntents.delete(key);
 
 			await this.ensureManualReviewSession(document.uri);
 			let file = this.resolveFile(document.uri.toString());
@@ -609,18 +628,18 @@ export class ReviewController implements vscode.Disposable {
 		this.refreshUi();
 	}
 
-	private async refreshFile(uri: vscode.Uri, options: { reconcileExternalChanges?: boolean } = {}): Promise<void> {
+	private async refreshFile(uri: vscode.Uri, options: { reconcileExternalChanges?: boolean; preferDisk?: boolean } = {}): Promise<void> {
 		if (uri.scheme !== 'file') {
 			return;
 		}
 
 		if (!this.activeSession) {
-			await this.ensureGitReviewForUri(uri);
+			await this.ensureGitReviewForUri(uri, { preferDisk: options.preferDisk });
 			return;
 		}
 
 		const key = uriKey(uri);
-		if (options.reconcileExternalChanges !== false && this.ordinaryEditorEdits.has(key) && this.isOpenDocumentDirty(uri)) {
+		if (options.reconcileExternalChanges !== false && this.isOpenDocumentDirty(uri)) {
 			return;
 		}
 
@@ -630,7 +649,7 @@ export class ReviewController implements vscode.Disposable {
 				return;
 			}
 
-			const pair = await this.createGitFilePair(uri);
+			const pair = await this.createGitFilePair(uri, { preferDisk: options.preferDisk });
 			if (!pair) {
 				return;
 			}
@@ -644,7 +663,7 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 
-		const current = await this.readCurrentText(uri);
+		const current = await this.readCurrentText(uri, { preferDisk: options.preferDisk });
 		if (options.reconcileExternalChanges !== false && current.text !== file.newText && this.decisionHunks(file).length > 0) {
 			const externalHunks = computeLineDiff(file.uri.toString(), file.newText, current.text);
 			this.reconcileDecisionHunksForExternalChanges(file, externalHunks);
@@ -685,22 +704,57 @@ export class ReviewController implements vscode.Disposable {
 		return vscode.workspace.textDocuments.some((document) => document.uri.toString() === uri.toString() && document.isDirty);
 	}
 
-	private isDocumentChangeSuppressed(uri: vscode.Uri): boolean {
-		return (this.suppressedDocumentChanges.get(uriKey(uri)) ?? 0) > 0;
+	private isInternalWriteActive(uri: vscode.Uri): boolean {
+		return (this.internalWriteDepth.get(uriKey(uri)) ?? 0) > 0;
 	}
 
-	private async withSuppressedDocumentChanges<T>(uri: vscode.Uri, callback: () => Promise<T>): Promise<T> {
+	private hasHumanSaveIntent(uri: vscode.Uri): boolean {
 		const key = uriKey(uri);
-		this.ordinaryEditorEdits.delete(key);
-		this.suppressedDocumentChanges.set(key, (this.suppressedDocumentChanges.get(key) ?? 0) + 1);
+		const until = this.humanSaveIntents.get(key);
+		if (!until) {
+			return false;
+		}
+
+		if (Date.now() > until) {
+			this.humanSaveIntents.delete(key);
+			return false;
+		}
+
+		return true;
+	}
+
+	private isInWriteGrace(uri: vscode.Uri, source?: InternalWriteSource): boolean {
+		const grace = this.writeGraceUntil.get(uriKey(uri));
+		if (!grace) {
+			return false;
+		}
+
+		if (Date.now() > grace.until) {
+			this.writeGraceUntil.delete(uriKey(uri));
+			return false;
+		}
+
+		return source ? grace.source === source : true;
+	}
+
+	private markWriteGrace(uri: vscode.Uri, source: InternalWriteSource): void {
+		this.writeGraceUntil.set(uriKey(uri), { source, until: Date.now() + 1000 });
+	}
+
+	private async withInternalWrite<T>(uri: vscode.Uri, source: InternalWriteSource, callback: () => Promise<T>): Promise<T> {
+		const key = uriKey(uri);
+		this.humanEditBatches.delete(key);
+		this.humanSaveIntents.delete(key);
+		this.internalWriteDepth.set(key, (this.internalWriteDepth.get(key) ?? 0) + 1);
 		try {
 			return await callback();
 		} finally {
-			const nextCount = (this.suppressedDocumentChanges.get(key) ?? 1) - 1;
+			const nextCount = (this.internalWriteDepth.get(key) ?? 1) - 1;
 			if (nextCount <= 0) {
-				this.suppressedDocumentChanges.delete(key);
+				this.internalWriteDepth.delete(key);
+				this.markWriteGrace(uri, source);
 			} else {
-				this.suppressedDocumentChanges.set(key, nextCount);
+				this.internalWriteDepth.set(key, nextCount);
 			}
 		}
 	}
@@ -730,7 +784,23 @@ export class ReviewController implements vscode.Disposable {
 		return merged;
 	}
 
-	private scheduleRefresh(uri: vscode.Uri): void {
+	private handleFileSystemChange(uri: vscode.Uri): void {
+		if (uri.scheme !== 'file') {
+			return;
+		}
+
+		if (this.isInternalWriteActive(uri) || this.isInWriteGrace(uri, 'plugin') || this.isInWriteGrace(uri, 'human')) {
+			return;
+		}
+
+		if (this.humanEditBatches.has(uriKey(uri)) || this.hasHumanSaveIntent(uri) || this.isOpenDocumentDirty(uri)) {
+			return;
+		}
+
+		this.scheduleRefresh(uri, { preferDisk: true });
+	}
+
+	private scheduleRefresh(uri: vscode.Uri, options: { preferDisk?: boolean } = {}): void {
 		if (uri.scheme !== 'file') {
 			return;
 		}
@@ -747,7 +817,7 @@ export class ReviewController implements vscode.Disposable {
 
 		this.refreshTimers.set(key, setTimeout(() => {
 			this.refreshTimers.delete(key);
-			void this.refreshFile(uri);
+			void this.refreshFile(uri, { preferDisk: options.preferDisk });
 		}, 250));
 	}
 
@@ -757,7 +827,7 @@ export class ReviewController implements vscode.Disposable {
 		}
 	}
 
-	private async ensureGitReviewForUri(uri: vscode.Uri): Promise<void> {
+	private async ensureGitReviewForUri(uri: vscode.Uri, options: { preferDisk?: boolean } = {}): Promise<void> {
 		if (uri.scheme !== 'file' || !vscode.workspace.getConfiguration('cliDiff').get<boolean>('autoStartGitReview', true)) {
 			return;
 		}
@@ -779,14 +849,14 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 
-		await this.refreshFile(uri);
+		await this.refreshFile(uri, { preferDisk: options.preferDisk });
 	}
 
-	private async createGitFilePair(uri: vscode.Uri): Promise<FilePair | undefined> {
+	private async createGitFilePair(uri: vscode.Uri, options: { preferDisk?: boolean } = {}): Promise<FilePair | undefined> {
 		const folder = vscode.workspace.getWorkspaceFolder(uri);
 
 		try {
-			return await this.gitService.createFilePairForUri(uri, folder);
+			return await this.gitService.createFilePairForUri(uri, folder, { preferDisk: options.preferDisk });
 		} catch {
 			return undefined;
 		}
@@ -1034,11 +1104,9 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private manualHunkTouchesPending(manualHunk: ReviewHunk, pendingHunks: ReviewHunk[], editedRanges: EditedRange[]): boolean {
-		const hunkTouches = pendingHunks.some((pending) => this.lineSpansTouch(
-			manualHunk.oldStart,
-			manualHunk.oldLines,
-			pending.newStart,
-			pending.newLines,
+		const hunkTouches = pendingHunks.some((pending) => (
+			this.lineSpansTouch(manualHunk.oldStart, manualHunk.oldLines, pending.newStart, pending.newLines)
+			|| this.lineSpansTouch(manualHunk.newStart, manualHunk.newLines, pending.newStart, pending.newLines)
 		));
 		if (hunkTouches) {
 			return true;
@@ -1094,9 +1162,9 @@ export class ReviewController implements vscode.Disposable {
 		return files;
 	}
 
-	private async readCurrentText(uri: vscode.Uri): Promise<{ exists: boolean; text: string }> {
+	private async readCurrentText(uri: vscode.Uri, options: { preferDisk?: boolean } = {}): Promise<{ exists: boolean; text: string }> {
 		const openDocument = vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri.toString());
-		if (openDocument) {
+		if (openDocument && (!options.preferDisk || openDocument.isDirty)) {
 			return { exists: true, text: openDocument.getText() };
 		}
 
@@ -1111,15 +1179,15 @@ export class ReviewController implements vscode.Disposable {
 		}
 	}
 
-	private async writeCurrentFileText(uri: vscode.Uri, text: string): Promise<void> {
+	private async writeCurrentFileText(uri: vscode.Uri, text: string, source: InternalWriteSource = 'plugin'): Promise<void> {
 		const openDocument = vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri.toString());
 		if (!openDocument) {
-			this.ordinaryEditorEdits.delete(uriKey(uri));
-			await this.writeFileText(uri, text);
+			this.humanEditBatches.delete(uriKey(uri));
+			await this.withInternalWrite(uri, source, () => this.writeFileText(uri, text));
 			return;
 		}
 
-		await this.withSuppressedDocumentChanges(uri, async () => {
+		await this.withInternalWrite(uri, source, async () => {
 			const edit = new vscode.WorkspaceEdit();
 			const fullRange = new vscode.Range(new vscode.Position(0, 0), openDocument.positionAt(openDocument.getText().length));
 			edit.replace(uri, fullRange, text);
@@ -1154,9 +1222,9 @@ export class ReviewController implements vscode.Disposable {
 		const watcher = vscode.workspace.createFileSystemWatcher('**/*');
 		const disposable = new vscode.Disposable(() => watcher.dispose());
 		this.disposables.push(
-			watcher.onDidChange((uri) => this.scheduleRefresh(uri)),
-			watcher.onDidCreate((uri) => this.scheduleRefresh(uri)),
-			watcher.onDidDelete((uri) => this.scheduleRefresh(uri)),
+			watcher.onDidChange((uri) => this.handleFileSystemChange(uri)),
+			watcher.onDidCreate((uri) => this.handleFileSystemChange(uri)),
+			watcher.onDidDelete((uri) => this.handleFileSystemChange(uri)),
 		);
 		return disposable;
 	}

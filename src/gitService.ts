@@ -34,7 +34,7 @@ export class GitService {
 		return pairs;
 	}
 
-	public async createFilePairForUri(uri: vscode.Uri, root?: vscode.WorkspaceFolder): Promise<FilePair | undefined> {
+	public async createFilePairForUri(uri: vscode.Uri, root?: vscode.WorkspaceFolder, options: { preferDisk?: boolean } = {}): Promise<FilePair | undefined> {
 		const rootPath = root?.uri.fsPath ?? await this.findGitRoot(uri);
 		if (!rootPath) {
 			return undefined;
@@ -43,7 +43,7 @@ export class GitService {
 		const relativePath = pathRelative(rootPath, uri.fsPath).replace(/\\/g, '/');
 		const hasHead = await this.hasHeadPath(rootPath);
 		const head = hasHead ? await this.readHeadTextPath(rootPath, relativePath) : { exists: false, text: '' };
-		const current = await readCurrentText(uri);
+		const current = await readCurrentText(uri, { preferDisk: options.preferDisk });
 
 		if (!head.exists && !current.exists) {
 			return undefined;
@@ -115,9 +115,9 @@ export class GitService {
 	}
 }
 
-async function readCurrentText(uri: vscode.Uri): Promise<{ exists: boolean; text: string }> {
+async function readCurrentText(uri: vscode.Uri, options: { preferDisk?: boolean } = {}): Promise<{ exists: boolean; text: string }> {
 	const openDocument = vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri.toString());
-	if (openDocument) {
+	if (openDocument && (!options.preferDisk || openDocument.isDirty)) {
 		return { exists: true, text: openDocument.getText() };
 	}
 
