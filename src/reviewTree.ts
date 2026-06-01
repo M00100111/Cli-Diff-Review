@@ -15,7 +15,7 @@ export class ReviewTreeProvider implements vscode.TreeDataProvider<ReviewFileSta
 		item.description = pending > 0 && reviewed > 0
 			? `${pending} pending, ${reviewed} reviewed`
 			: pending > 0 ? `${pending} pending` : `${reviewed} reviewed`;
-		item.contextValue = 'cliDiffFile';
+		item.contextValue = pending > 0 ? 'cliDiffFilePending' : reviewed > 0 ? 'cliDiffFileReviewed' : 'cliDiffFile';
 		item.command = {
 			command: 'cli-diff.openReviewView',
 			title: 'Open Review',

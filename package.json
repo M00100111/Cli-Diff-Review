@@ -3,6 +3,7 @@
   "displayName": "cli-diff",
   "description": "cli-diff is a lightweight CLI diff tool that brings Cursor-like code review to the terminal.",
   "version": "0.0.1",
+  "icon": "resources/icon.png",
   "publisher": "local",
   "engines": {
     "vscode": "^1.117.0"
@@ -99,12 +100,17 @@
       "view/item/context": [
         {
           "command": "cli-diff.acceptFile",
-          "when": "view == cli-diff.review && viewItem == cliDiffFile",
+          "when": "view == cli-diff.review && viewItem == cliDiffFilePending",
           "group": "inline@1"
         },
         {
           "command": "cli-diff.rejectFile",
-          "when": "view == cli-diff.review && viewItem == cliDiffFile",
+          "when": "view == cli-diff.review && viewItem == cliDiffFilePending",
+          "group": "inline@2"
+        },
+        {
+          "command": "cli-diff.rejectFile",
+          "when": "view == cli-diff.review && viewItem == cliDiffFileReviewed",
           "group": "inline@2"
         }
       ],

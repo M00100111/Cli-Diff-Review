@@ -21,6 +21,7 @@ export class ReviewController implements vscode.Disposable {
 	private readonly humanSaveIntents = new Map<string, number>();
 	private readonly internalWriteDepth = new Map<string, number>();
 	private readonly writeGraceUntil = new Map<string, { source: InternalWriteSource; until: number }>();
+	private readonly hunkOperationKeys = new Set<string>();
 	private activeSession: ReviewSession | undefined;
 
 	public constructor(private readonly context: vscode.ExtensionContext) {
@@ -313,6 +314,13 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private async acceptChange(uriString?: string, hunkId?: string): Promise<void> {
+		const operationKey = this.hunkOperationKey(uriString, hunkId);
+		if (operationKey && this.hunkOperationKeys.has(operationKey)) {
+			return;
+		}
+		if (operationKey) {
+			this.hunkOperationKeys.add(operationKey);
+		}
 		try {
 			const preflightFile = this.resolveFile(uriString);
 			if (preflightFile) {
@@ -333,10 +341,21 @@ export class ReviewController implements vscode.Disposable {
 			await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 		} catch (error) {
 			this.showError(error);
+		} finally {
+			if (operationKey) {
+				this.hunkOperationKeys.delete(operationKey);
+			}
 		}
 	}
 
 	private async rejectChange(uriString?: string, hunkId?: string): Promise<void> {
+		const operationKey = this.hunkOperationKey(uriString, hunkId);
+		if (operationKey && this.hunkOperationKeys.has(operationKey)) {
+			return;
+		}
+		if (operationKey) {
+			this.hunkOperationKeys.add(operationKey);
+		}
 		try {
 			const preflightFile = this.resolveFile(uriString);
 			if (preflightFile) {
@@ -374,10 +393,21 @@ export class ReviewController implements vscode.Disposable {
 			await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 		} catch (error) {
 			this.showError(error);
+		} finally {
+			if (operationKey) {
+				this.hunkOperationKeys.delete(operationKey);
+			}
 		}
 	}
 
 	private async restoreChange(uriString?: string, hunkId?: string): Promise<void> {
+		const operationKey = this.hunkOperationKey(uriString, hunkId);
+		if (operationKey && this.hunkOperationKeys.has(operationKey)) {
+			return;
+		}
+		if (operationKey) {
+			this.hunkOperationKeys.add(operationKey);
+		}
 		try {
 			const target = this.resolveDecisionHunk(uriString, hunkId);
 			if (!target) {
@@ -403,6 +433,10 @@ export class ReviewController implements vscode.Disposable {
 			await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 		} catch (error) {
 			this.showError(error);
+		} finally {
+			if (operationKey) {
+				this.hunkOperationKeys.delete(operationKey);
+			}
 		}
 	}
 
@@ -915,6 +949,13 @@ export class ReviewController implements vscode.Disposable {
 		return activeUri ? this.activeSession.files.get(uriKey(activeUri)) : undefined;
 	}
 
+	private hunkOperationKey(uriString?: string, hunkId?: string): string | undefined {
+		if (!hunkId) {
+			return undefined;
+		}
+		return `${uriString ?? 'active'}::${hunkId}`;
+	}
+
 	private flattenHunks(): Array<{ file: ReviewFileState; hunk: ReviewHunk }> {
 		if (!this.activeSession) {
 			return [];
@@ -929,10 +970,28 @@ export class ReviewController implements vscode.Disposable {
 		const displayLines = reviewSource === 'reject' ? hunk.oldLines : hunk.newLines;
 		const decision = this.createDecisionHunk(hunk, reviewSource, hunk.newStart, displayLines);
 		if (reviewSource === 'reject') {
+			if (file.rejectedHunks.some((item) => this.isSameDecision(item, hunk, reviewSource))) {
+				return;
+			}
 			file.rejectedHunks.push(decision);
 		} else {
+			if (file.acceptedHunks.some((item) => this.isSameDecision(item, hunk, reviewSource))) {
+				return;
+			}
 			file.acceptedHunks.push(decision);
 		}
+	}
+
+	private isSameDecision(decision: ReviewedHunk, hunk: ReviewHunk, reviewSource: ReviewSource): boolean {
+		return decision.reviewSource === reviewSource
+			&& decision.fileUri === hunk.fileUri
+			&& decision.kind === hunk.kind
+			&& decision.oldStart === hunk.oldStart
+			&& decision.oldLines === hunk.oldLines
+			&& decision.newStart === hunk.newStart
+			&& decision.newLines === hunk.newLines
+			&& decision.oldText === hunk.oldText
+			&& decision.newText === hunk.newText;
 	}
 
 	private createDecisionHunk(hunk: ReviewHunk, reviewSource: ReviewSource, displayStart: number, displayLines: number): ReviewedHunk {

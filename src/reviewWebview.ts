@@ -31,6 +31,7 @@ export class ReviewWebviewManager implements vscode.Disposable {
 	private activeUri: vscode.Uri | undefined;
 	private ready = false;
 	private readonly disposables: vscode.Disposable[] = [];
+	private readonly pendingMutations = new Set<string>();
 
 	public constructor(
 		private readonly context: vscode.ExtensionContext,
@@ -85,12 +86,24 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			return;
 		}
 
-		if (message.type === 'accept') {
-			await vscode.commands.executeCommand('cli-diff.acceptChange', message.uri, message.hunkId);
-		} else if (message.type === 'reject') {
-			await vscode.commands.executeCommand('cli-diff.rejectChange', message.uri, message.hunkId);
-		} else if (message.type === 'restore') {
-			await vscode.commands.executeCommand('cli-diff.restoreChange', message.uri, message.hunkId);
+		if (message.type === 'accept' || message.type === 'reject' || message.type === 'restore') {
+			const mutationKey = `${message.uri}::${message.hunkId}`;
+			if (this.pendingMutations.has(mutationKey)) {
+				return;
+			}
+
+			this.pendingMutations.add(mutationKey);
+			try {
+				if (message.type === 'accept') {
+					await vscode.commands.executeCommand('cli-diff.acceptChange', message.uri, message.hunkId);
+				} else if (message.type === 'reject') {
+					await vscode.commands.executeCommand('cli-diff.rejectChange', message.uri, message.hunkId);
+				} else {
+					await vscode.commands.executeCommand('cli-diff.restoreChange', message.uri, message.hunkId);
+				}
+			} finally {
+				this.pendingMutations.delete(mutationKey);
+			}
 		} else if (message.type === 'saveEditedCurrent') {
 			await this.saveEditedCurrent(message.uri, message.text, message.ranges);
 		}
@@ -142,7 +155,7 @@ export class ReviewWebviewManager implements vscode.Disposable {
 		const cspSource = webview.cspSource;
 
 		return `<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 	<meta charset="UTF-8">
 	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${cspSource} data:; font-src ${cspSource}; style-src ${cspSource} 'unsafe-inline'; script-src ${cspSource} 'nonce-${nonce}'; worker-src blob: data:;">
@@ -159,6 +172,15 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			--zone-bg: color-mix(in srgb, var(--vscode-editor-background) 84%, var(--vscode-editor-foreground) 16%);
 			--button-bg: color-mix(in srgb, var(--vscode-editor-background) 72%, var(--vscode-editor-foreground) 28%);
 			--button-hover: color-mix(in srgb, var(--vscode-editor-background) 58%, var(--vscode-editor-foreground) 42%);
+			--reject-bg: rgba(248, 81, 73, 0.14);
+			--reject-border: rgba(248, 81, 73, 0.38);
+			--reject-fg: #ff938a;
+			--accept-bg: rgba(46, 160, 67, 0.16);
+			--accept-border: rgba(46, 160, 67, 0.42);
+			--accept-fg: #7ee787;
+			--undo-bg: rgba(88, 166, 255, 0.14);
+			--undo-border: rgba(88, 166, 255, 0.40);
+			--undo-fg: #79c0ff;
 			--add-bg: rgba(46, 160, 67, 0.16);
 			--add-line: rgba(46, 160, 67, 0.82);
 			--delete-bg: rgba(248, 81, 73, 0.18);
@@ -176,6 +198,15 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			--delete-bg: rgba(209, 36, 47, 0.13);
 			--modify-bg: var(--add-bg);
 			--reviewed-bg: rgba(96, 96, 96, 0.12);
+			--reject-bg: rgba(209, 36, 47, 0.11);
+			--reject-border: rgba(209, 36, 47, 0.35);
+			--reject-fg: #b4232f;
+			--accept-bg: rgba(46, 160, 67, 0.12);
+			--accept-border: rgba(46, 160, 67, 0.35);
+			--accept-fg: #1f7a3d;
+			--undo-bg: rgba(9, 105, 218, 0.12);
+			--undo-border: rgba(9, 105, 218, 0.35);
+			--undo-fg: #0969da;
 		}
 		* { box-sizing: border-box; }
 		html, body {
@@ -189,27 +220,7 @@ export class ReviewWebviewManager implements vscode.Disposable {
 		}
 		body {
 			display: grid;
-			grid-template-rows: 40px 1fr 24px;
-		}
-		header {
-			display: flex;
-			align-items: center;
-			gap: 12px;
-			padding: 0 14px;
-			border-bottom: 1px solid var(--border);
-			background: var(--bg);
-		}
-		.title {
-			min-width: 0;
-			overflow: hidden;
-			text-overflow: ellipsis;
-			white-space: nowrap;
-			font-weight: 600;
-		}
-		.meta {
-			margin-left: auto;
-			color: var(--muted);
-			white-space: nowrap;
+			grid-template-rows: 1fr 24px;
 		}
 		#editor {
 			min-height: 0;
@@ -245,7 +256,7 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			font-family: var(--vscode-editor-font-family);
 			font-size: var(--vscode-editor-font-size);
 			line-height: var(--vscode-editor-line-height, 20px);
-			overflow: hidden;
+			overflow: visible;
 		}
 		.cli-hunk-header {
 			position: relative;
@@ -258,7 +269,7 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			border: 1px solid var(--border);
 			border-radius: 5px;
 			background: var(--zone-bg);
-			overflow: hidden;
+			overflow: visible;
 		}
 		.cli-hunk-zone.active .cli-hunk-header {
 			outline: 1px solid var(--vscode-focusBorder);
@@ -284,11 +295,16 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			color: var(--muted);
 			margin-right: auto;
 			font-size: 12px;
+			padding-right: 12px;
 		}
 		.cli-actions {
 			display: flex;
 			gap: 6px;
 			flex: none;
+			position: relative;
+			z-index: 8;
+			transform: translateX(var(--cli-action-shift, 0px));
+			will-change: transform;
 		}
 		button {
 			position: relative;
@@ -304,12 +320,36 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			font-size: 12px;
 			line-height: 18px;
 		}
-		button.primary {
-			background: color-mix(in srgb, var(--vscode-button-background) 62%, var(--button-bg) 38%);
-			color: var(--vscode-button-foreground);
-		}
 		button:hover {
 			background: var(--button-hover);
+		}
+		button:disabled {
+			cursor: default;
+			opacity: 0.55;
+		}
+		button.action-reject {
+			background: var(--reject-bg);
+			border-color: var(--reject-border);
+			color: var(--reject-fg);
+		}
+		button.action-reject:hover {
+			background: color-mix(in srgb, var(--reject-bg) 70%, var(--reject-fg) 30%);
+		}
+		button.action-accept {
+			background: var(--accept-bg);
+			border-color: var(--accept-border);
+			color: var(--accept-fg);
+		}
+		button.action-accept:hover {
+			background: color-mix(in srgb, var(--accept-bg) 70%, var(--accept-fg) 30%);
+		}
+		button.action-undo {
+			background: var(--undo-bg);
+			border-color: var(--undo-border);
+			color: var(--undo-fg);
+		}
+		button.action-undo:hover {
+			background: color-mix(in srgb, var(--undo-bg) 70%, var(--undo-fg) 30%);
 		}
 		.cli-old-lines {
 			margin-top: 4px;
@@ -341,29 +381,24 @@ export class ReviewWebviewManager implements vscode.Disposable {
 	</style>
 </head>
 <body>
-	<header>
-		<div class="title" id="title">CLI Diff Review</div>
-		<div class="meta" id="meta"></div>
-	</header>
 	<div id="editor"></div>
-	<div id="status">Loading Monaco...</div>
+	<div id="status">0 pending &middot; 0 reviewed</div>
 	<script nonce="${nonce}" src="${loaderUri}"></script>
 	<script nonce="${nonce}">
 		const vscode = acquireVsCodeApi();
 		const monacoBaseUri = ${JSON.stringify(monacoBaseUri)};
 		const labels = {
-			accept: '\\u63a5\\u53d7',
-			reject: '\\u64a4\\u9500',
-			previous: '\\u4e0a\\u4e00\\u4e2a',
-			next: '\\u4e0b\\u4e00\\u4e2a',
-			accepted: '\\u5df2\\u91c7\\u7eb3',
-			rejected: '\\u5df2\\u64a4\\u9500',
-			noData: '\\u6ca1\\u6709\\u53ef\\u5ba1\\u6821\\u7684\\u6587\\u4ef6\\u6570\\u636e\\u3002',
-			ready: 'Ctrl+S \\u4fdd\\u5b58 Review \\u9875\\u7f16\\u8f91\\uff1b\\u5f85\\u5ba1 hunk \\u5185\\u7f16\\u8f91\\u4e0d\\u4f1a\\u81ea\\u52a8\\u5ba1\\u6821\\u3002',
-			dirty: 'Review \\u9875\\u6709\\u672a\\u4fdd\\u5b58\\u7f16\\u8f91\\u3002Ctrl+S \\u4fdd\\u5b58\\u3002',
-			saveFirst: '\\u8bf7\\u5148 Ctrl+S \\u4fdd\\u5b58 Review \\u9875\\u7f16\\u8f91\\uff0c\\u518d\\u63a5\\u53d7\\u6216\\u64a4\\u9500\\u5f85\\u5ba1 hunk\\u3002',
-			saving: '\\u6b63\\u5728\\u4fdd\\u5b58 Review \\u9875\\u7f16\\u8f91...',
-			saved: '\\u5df2\\u4fdd\\u5b58\\u3002',
+			accept: 'Accept',
+			reject: 'Reject',
+			undo: 'Undo',
+			previous: 'Prev',
+			next: 'Next',
+			add: 'Add',
+			delete: 'Delete',
+			modify: 'modify',
+			accepted: 'Accepted',
+			rejected: 'Rejected',
+			noData: '0 pending \\u00b7 0 reviewed',
 		};
 
 		let editor;
@@ -378,9 +413,8 @@ export class ReviewWebviewManager implements vscode.Disposable {
 		let zoneIds = [];
 		let hunkEntries = [];
 		let activeHunkId;
+		let pendingMutationKey;
 
-		const titleNode = document.getElementById('title');
-		const metaNode = document.getElementById('meta');
 		const statusNode = document.getElementById('status');
 		const editorNode = document.getElementById('editor');
 
@@ -442,6 +476,8 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			});
 
 			editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveCurrent);
+			editor.onDidScrollChange(updateActionOffset);
+			editor.onDidLayoutChange(updateActionOffset);
 			applyState();
 		}
 
@@ -478,6 +514,7 @@ export class ReviewWebviewManager implements vscode.Disposable {
 
 		function setState(nextState) {
 			state = nextState;
+			pendingMutationKey = undefined;
 			if (!ready) {
 				return;
 			}
@@ -486,16 +523,11 @@ export class ReviewWebviewManager implements vscode.Disposable {
 
 		function applyState() {
 			if (!editor || !state) {
-				titleNode.textContent = 'CLI Diff Review';
-				metaNode.textContent = '';
 				statusNode.textContent = labels.noData;
 				return;
 			}
 
-			titleNode.textContent = state.relativePath;
-			const reviewedCount = state.acceptedHunks.length + state.rejectedHunks.length;
-			metaNode.textContent = state.pendingHunks.length + ' pending \\u00b7 ' + reviewedCount + ' reviewed';
-			statusNode.textContent = state.skippedReason || labels.ready;
+			updateFooter();
 
 			if (!model) {
 				model = monaco.editor.createModel(state.newText, state.languageId || 'plaintext', monaco.Uri.parse('cli-diff-review-current:///' + encodeURIComponent(state.relativePath)));
@@ -527,7 +559,7 @@ export class ReviewWebviewManager implements vscode.Disposable {
 				const endLine = Math.max(change.range.endLineNumber, startLine + insertedLines);
 				dirtyRanges.push({ startLine, endLine: Math.max(startLine + 1, endLine) });
 			}
-			statusNode.textContent = labels.dirty;
+			updateFooter();
 		}
 
 		function renderInlineDiff() {
@@ -573,6 +605,32 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			}
 			lineDecorations = editor.deltaDecorations(lineDecorations, nextDecorations);
 			updateActiveZone();
+			updateActionOffset();
+		}
+
+		function updateFooter() {
+			if (!state) {
+				statusNode.textContent = labels.noData;
+				return;
+			}
+			if (state.skippedReason) {
+				statusNode.textContent = 'Skipped: ' + state.skippedReason;
+				return;
+			}
+			const reviewedCount = state.acceptedHunks.length + state.rejectedHunks.length;
+			statusNode.textContent = state.pendingHunks.length + ' pending \\u00b7 ' + reviewedCount + ' reviewed';
+		}
+
+		function updateActionOffset() {
+			if (!editor) {
+				return;
+			}
+			const layout = editor.getLayoutInfo();
+			const visibleWidth = layout.contentWidth || layout.width || 0;
+			const scrollWidth = editor.getScrollWidth ? editor.getScrollWidth() : visibleWidth;
+			const scrollLeft = editor.getScrollLeft() || 0;
+			const shift = Math.min(0, scrollLeft + visibleWidth - scrollWidth - 12);
+			editorNode.style.setProperty('--cli-action-shift', shift + 'px');
 		}
 
 		function buildHunkEntries() {
@@ -642,8 +700,8 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			const summary = document.createElement('span');
 			summary.className = 'cli-summary';
 			summary.textContent = entry.decided
-				? reviewedLabel(entry.source) + ' \\u00b7 ' + entry.kind + ' ' + entry.oldLines + '->' + entry.newLines + ' lines'
-				: entry.kind + ' ' + entry.oldLines + '->' + entry.newLines + ' lines';
+				? reviewedLabel(entry.source) + ' \\u00b7 ' + kindLabel(entry.kind) + ' ' + entry.oldLines + '->' + entry.newLines + ' lines'
+				: kindLabel(entry.kind) + ' ' + entry.oldLines + '->' + entry.newLines + ' lines';
 			header.appendChild(summary);
 
 			const actions = document.createElement('div');
@@ -652,9 +710,9 @@ export class ReviewWebviewManager implements vscode.Disposable {
 
 			if (!entry.decided) {
 				actions.appendChild(createButton(labels.reject, 'reject', entry));
-				actions.appendChild(createButton(labels.accept, 'accept', entry, true));
+				actions.appendChild(createButton(labels.accept, 'accept', entry));
 			} else if (entry.source === 'accept' || entry.source === 'reject') {
-				actions.appendChild(createButton(labels.reject, 'restore', entry));
+				actions.appendChild(createButton(labels.undo, 'restore', entry));
 			}
 			actions.appendChild(createButton(labels.previous, 'previous', entry));
 			actions.appendChild(createButton(labels.next, 'next', entry));
@@ -694,15 +752,14 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			return row;
 		}
 
-		function createButton(label, command, entry, primary) {
+		function createButton(label, command, entry) {
 			const button = document.createElement('button');
 			button.textContent = label;
 			button.type = 'button';
 			button.dataset.command = command;
 			button.dataset.hunkId = entry.id;
-			if (primary) {
-				button.className = 'primary';
-			}
+			button.className = buttonClass(command);
+			button.disabled = Boolean(pendingMutationKey && isMutationCommand(command));
 			return button;
 		}
 
@@ -736,8 +793,18 @@ export class ReviewWebviewManager implements vscode.Disposable {
 				moveHunk(-1, hunkId);
 				return;
 			}
+			if (isMutationCommand(command)) {
+				const mutationKey = command + '::' + hunkId;
+				if (pendingMutationKey) {
+					return;
+				}
+				pendingMutationKey = mutationKey;
+				setMutationButtonsDisabled(true);
+			}
 			if (dirty) {
-				statusNode.textContent = labels.saveFirst;
+				pendingMutationKey = undefined;
+				setMutationButtonsDisabled(false);
+				updateFooter();
 				return;
 			}
 			vscode.postMessage({ type: command, uri: state.uri, hunkId });
@@ -763,9 +830,9 @@ export class ReviewWebviewManager implements vscode.Disposable {
 				text: model.getValue(),
 				ranges: mergeRanges(dirtyRanges),
 			});
-			statusNode.textContent = labels.saving;
 			dirty = false;
 			dirtyRanges = [];
+			updateFooter();
 		}
 
 		function moveHunk(direction, fromId) {
@@ -838,6 +905,41 @@ export class ReviewWebviewManager implements vscode.Disposable {
 				return labels.rejected;
 			}
 			return labels.accepted;
+		}
+
+		function kindLabel(kind) {
+			if (kind === 'add') {
+				return labels.add;
+			}
+			if (kind === 'delete') {
+				return labels.delete;
+			}
+			return labels.modify;
+		}
+
+		function buttonClass(command) {
+			if (command === 'reject') {
+				return 'action-reject';
+			}
+			if (command === 'accept') {
+				return 'action-accept';
+			}
+			if (command === 'restore') {
+				return 'action-undo';
+			}
+			return 'action-nav';
+		}
+
+		function isMutationCommand(command) {
+			return command === 'accept' || command === 'reject' || command === 'restore';
+		}
+
+		function setMutationButtonsDisabled(disabled) {
+			for (const button of document.querySelectorAll('button[data-command]')) {
+				if (isMutationCommand(button.dataset.command)) {
+					button.disabled = disabled;
+				}
+			}
 		}
 
 		function cssVar(name) {
