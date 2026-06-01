@@ -20,6 +20,7 @@
     "onCommand:cli-diff.rejectChange",
     "onCommand:cli-diff.acceptFile",
     "onCommand:cli-diff.rejectFile",
+    "onCommand:cli-diff.undoFile",
     "onCommand:cli-diff.nextChange",
     "onCommand:cli-diff.previousChange",
     "onCommand:cli-diff.openReviewView",
@@ -64,6 +65,12 @@
         "command": "cli-diff.rejectFile",
         "title": "Reject File",
         "category": "CLI Diff",
+        "icon": "$(close)"
+      },
+      {
+        "command": "cli-diff.undoFile",
+        "title": "Undo File",
+        "category": "CLI Diff",
         "icon": "$(discard)"
       },
       {
@@ -104,14 +111,34 @@
           "group": "inline@1"
         },
         {
+          "command": "cli-diff.acceptFile",
+          "when": "view == cli-diff.review && viewItem == cliDiffFilePendingReviewed",
+          "group": "inline@1"
+        },
+        {
           "command": "cli-diff.rejectFile",
           "when": "view == cli-diff.review && viewItem == cliDiffFilePending",
           "group": "inline@2"
         },
         {
           "command": "cli-diff.rejectFile",
-          "when": "view == cli-diff.review && viewItem == cliDiffFileReviewed",
+          "when": "view == cli-diff.review && viewItem == cliDiffFilePendingReviewed",
           "group": "inline@2"
+        },
+        {
+          "command": "cli-diff.undoFile",
+          "when": "view == cli-diff.review && viewItem == cliDiffFilePending",
+          "group": "inline@3"
+        },
+        {
+          "command": "cli-diff.undoFile",
+          "when": "view == cli-diff.review && viewItem == cliDiffFileReviewed",
+          "group": "inline@3"
+        },
+        {
+          "command": "cli-diff.undoFile",
+          "when": "view == cli-diff.review && viewItem == cliDiffFilePendingReviewed",
+          "group": "inline@3"
         }
       ],
       "view/title": [

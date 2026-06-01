@@ -57,6 +57,7 @@ export class ReviewController implements vscode.Disposable {
 			this.registerCommand('cli-diff.restoreChange', (uri?: string, hunkId?: string) => this.restoreChange(uri, hunkId)),
 			this.registerCommand('cli-diff.acceptFile', (uri?: string | ReviewFileState) => this.acceptFile(uri)),
 			this.registerCommand('cli-diff.rejectFile', (uri?: string | ReviewFileState) => this.rejectFile(uri)),
+			this.registerCommand('cli-diff.undoFile', (uri?: string | ReviewFileState) => this.undoFile(uri)),
 			this.registerCommand('cli-diff.nextChange', (uri?: string, hunkId?: string) => this.navigateChange(1, uri, hunkId)),
 			this.registerCommand('cli-diff.previousChange', (uri?: string, hunkId?: string) => this.navigateChange(-1, uri, hunkId)),
 			this.registerCommand('cli-diff.openReviewView', (uri?: string) => this.openReviewView(uri)),
@@ -465,6 +466,43 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private async rejectFile(uriString?: string | ReviewFileState): Promise<void> {
+		try {
+			const file = this.resolveFile(uriString);
+			if (!file) {
+				vscode.window.showInformationMessage('No CLI Diff file selected.');
+				return;
+			}
+
+			await this.refreshFile(file.uri);
+			const refreshedFile = this.resolveFile(file.uri.toString()) ?? file;
+			const pendingHunks = [...refreshedFile.hunks];
+			if (pendingHunks.length === 0) {
+				return;
+			}
+
+			let currentText = refreshedFile.newText;
+			for (const hunk of [...pendingHunks].sort((left, right) => right.newStart - left.newStart)) {
+				currentText = replaceLineBlock(currentText, hunk.newStart, hunk.newLines, hunk.oldText);
+			}
+
+			refreshedFile.newText = currentText;
+			refreshedFile.currentExists = refreshedFile.baselineExists || currentText.length > 0;
+			for (const hunk of pendingHunks) {
+				this.recordDecisionHunk(refreshedFile, hunk, 'reject', hunk.oldStart, hunk.oldLines);
+			}
+
+			if (!refreshedFile.baselineExists && currentText.length === 0 && refreshedFile.acceptedHunks.length === 0) {
+				await this.deleteCurrentFile(refreshedFile.uri);
+			} else {
+				await this.writeCurrentFileText(refreshedFile.uri, currentText);
+			}
+			await this.refreshFile(refreshedFile.uri, { reconcileExternalChanges: false });
+		} catch (error) {
+			this.showError(error);
+		}
+	}
+
+	private async undoFile(uriString?: string | ReviewFileState): Promise<void> {
 		try {
 			const file = this.resolveFile(uriString);
 			if (!file) {
@@ -966,9 +1004,14 @@ export class ReviewController implements vscode.Disposable {
 			.flatMap((file) => file.hunks.map((hunk) => ({ file, hunk })));
 	}
 
-	private recordDecisionHunk(file: ReviewFileState, hunk: ReviewHunk, reviewSource: ReviewSource): void {
-		const displayLines = reviewSource === 'reject' ? hunk.oldLines : hunk.newLines;
-		const decision = this.createDecisionHunk(hunk, reviewSource, hunk.newStart, displayLines);
+	private recordDecisionHunk(
+		file: ReviewFileState,
+		hunk: ReviewHunk,
+		reviewSource: ReviewSource,
+		displayStart = hunk.newStart,
+		displayLines = reviewSource === 'reject' ? hunk.oldLines : hunk.newLines,
+	): void {
+		const decision = this.createDecisionHunk(hunk, reviewSource, displayStart, displayLines);
 		if (reviewSource === 'reject') {
 			if (file.rejectedHunks.some((item) => this.isSameDecision(item, hunk, reviewSource))) {
 				return;
@@ -1255,6 +1298,18 @@ export class ReviewController implements vscode.Disposable {
 				throw new Error('VS Code rejected the workspace edit.');
 			}
 			await openDocument.save();
+		});
+	}
+
+	private async deleteCurrentFile(uri: vscode.Uri): Promise<void> {
+		this.humanEditBatches.delete(uriKey(uri));
+		await this.withInternalWrite(uri, 'plugin', async () => {
+			try {
+				await vscode.workspace.fs.stat(uri);
+			} catch {
+				return;
+			}
+			await vscode.workspace.fs.delete(uri);
 		});
 	}
 
