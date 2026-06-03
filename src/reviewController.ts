@@ -3,12 +3,24 @@ import * as vscode from 'vscode';
 import { acceptHunkInBaseline, computeLineDiff } from './diffEngine';
 import { GitService } from './gitService';
 import { ReviewTreeProvider } from './reviewTree';
-import { EditedRange, ReviewWebviewManager } from './reviewWebview';
+import {
+	EditedRange,
+	ReviewNavigationAction,
+	ReviewNavigationRequestType,
+	ReviewNavigationResponse,
+	ReviewNavigationTargetPayload,
+	ReviewWebviewManager,
+} from './reviewWebview';
 import { SnapshotStore } from './snapshotStore';
 import { decodeUtf8, encodeUtf8, isProbablyBinary, lineRange, relativePath, replaceLineBlock, splitLines } from './text';
 import { FilePair, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewSession, ReviewSource, uriKey } from './types';
 
 type InternalWriteSource = 'plugin' | 'human';
+
+interface ReviewNavigationTarget extends vscode.QuickPickItem {
+	uri: vscode.Uri;
+	range: vscode.Range;
+}
 
 export class ReviewController implements vscode.Disposable {
 	private readonly snapshotStore: SnapshotStore;
@@ -27,7 +39,13 @@ export class ReviewController implements vscode.Disposable {
 	public constructor(private readonly context: vscode.ExtensionContext) {
 		this.snapshotStore = new SnapshotStore(context);
 		this.treeProvider = new ReviewTreeProvider(() => this.activeSession);
-		this.reviewWebview = new ReviewWebviewManager(context, () => this.activeSession, (uri, text, ranges) => this.saveEditedCurrent(uri, text, ranges));
+		this.reviewWebview = new ReviewWebviewManager(
+			context,
+			() => this.activeSession,
+			(uri, text, ranges) => this.saveEditedCurrent(uri, text, ranges),
+			(type, uri, line, column, requestId) => this.navigateFromReview(type, uri, line, column, requestId),
+			(uri, line, column) => this.openNavigationTarget(uri, line, column),
+		);
 
 		this.disposables.push(
 			this.reviewWebview,
@@ -638,6 +656,283 @@ export class ReviewController implements vscode.Disposable {
 		this.reviewWebview.open(uri);
 	}
 
+	private async navigateFromReview(
+		type: ReviewNavigationRequestType,
+		uriString: string,
+		line: number,
+		column: number,
+		requestId?: number,
+	): Promise<ReviewNavigationResponse | undefined> {
+		const sourceUri = vscode.Uri.parse(uriString);
+		const sourceDocument = await vscode.workspace.openTextDocument(sourceUri);
+		const position = this.providerPosition(sourceDocument, line, column);
+
+		if (type === 'resolveNavigationAction') {
+			const action = await this.resolveReviewNavigationAction(sourceUri, sourceDocument, position);
+			return {
+				type: 'navigationAction',
+				requestId: requestId ?? 0,
+				action,
+				label: this.navigationActionLabel(action),
+			};
+		}
+
+		const action = type === 'smartNavigate'
+			? await this.resolveReviewNavigationAction(sourceUri, sourceDocument, position)
+			: type;
+
+		return this.navigateFromResolvedAction(action, sourceUri, position);
+	}
+
+	private async navigateFromResolvedAction(
+		action: ReviewNavigationAction,
+		sourceUri: vscode.Uri,
+		position: vscode.Position,
+	): Promise<ReviewNavigationResponse | undefined> {
+		if (action === 'findReferences') {
+			const targets = await this.referenceTargets(sourceUri, position);
+			if (targets.length === 0) {
+				vscode.window.showInformationMessage('No references found.');
+			}
+			return {
+				type: 'references',
+				title: 'References',
+				sourceUri: sourceUri.toString(),
+				targets: await this.navigationTargetPayloads(targets, sourceUri),
+			};
+		}
+
+		const targets = await this.definitionTargets(sourceUri, position);
+		if (targets.length === 0) {
+			vscode.window.showInformationMessage('No definition found.');
+			return undefined;
+		}
+		if (targets.length === 1) {
+			await this.openResolvedLocation(targets[0].uri, targets[0].range);
+			return undefined;
+		}
+		const picked = await vscode.window.showQuickPick(targets, {
+			placeHolder: 'Select a definition',
+			matchOnDescription: true,
+			matchOnDetail: true,
+		});
+		if (picked) {
+			await this.openResolvedLocation(picked.uri, picked.range);
+		}
+		return undefined;
+	}
+
+	private async resolveReviewNavigationAction(
+		sourceUri: vscode.Uri,
+		sourceDocument: vscode.TextDocument,
+		position: vscode.Position,
+	): Promise<ReviewNavigationAction> {
+		try {
+			if (await this.isDefinitionPosition(sourceUri, sourceDocument, position)) {
+				return 'findReferences';
+			}
+		} catch {
+			// Hover and smart-click should remain usable even if one provider fails.
+		}
+		return 'goToDefinition';
+	}
+
+	private navigationActionLabel(action: ReviewNavigationAction): string {
+		return action === 'findReferences' ? 'Find References' : 'Go to Definition';
+	}
+
+	private async definitionTargets(uri: vscode.Uri, position: vscode.Position): Promise<ReviewNavigationTarget[]> {
+		const locations = await vscode.commands.executeCommand<Array<vscode.Location | vscode.LocationLink>>(
+			'vscode.executeDefinitionProvider',
+			uri,
+			position,
+		);
+		return this.navigationTargets(locations ?? []);
+	}
+
+	private async referenceTargets(uri: vscode.Uri, position: vscode.Position): Promise<ReviewNavigationTarget[]> {
+		const locations = await vscode.commands.executeCommand<vscode.Location[]>(
+			'vscode.executeReferenceProvider',
+			uri,
+			position,
+		);
+		return this.navigationTargets(locations ?? []);
+	}
+
+	private navigationTargets(locations: Array<vscode.Location | vscode.LocationLink>): ReviewNavigationTarget[] {
+		const rootUri = this.activeSession?.rootUri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
+		const seen = new Set<string>();
+		const targets: ReviewNavigationTarget[] = [];
+		for (const location of locations) {
+			const normalized = this.normalizeLocation(location);
+			const key = `${normalized.uri.toString()}::${normalized.range.start.line}:${normalized.range.start.character}:${normalized.range.end.line}:${normalized.range.end.character}`;
+			if (seen.has(key)) {
+				continue;
+			}
+			seen.add(key);
+			const labelPath = rootUri && normalized.uri.scheme === 'file'
+				? relativePath(rootUri, normalized.uri)
+				: normalized.uri.toString();
+			const line = normalized.range.start.line + 1;
+			const column = normalized.range.start.character + 1;
+			targets.push({
+				label: `${labelPath}:${line}:${column}`,
+				description: normalized.uri.scheme === 'file' ? normalized.uri.fsPath : normalized.uri.toString(),
+				uri: normalized.uri,
+				range: normalized.range,
+			});
+		}
+		return targets;
+	}
+
+	private async navigationTargetPayloads(targets: ReviewNavigationTarget[], sourceUri: vscode.Uri): Promise<ReviewNavigationTargetPayload[]> {
+		const documents = new Map<string, vscode.TextDocument>();
+		const payloads: ReviewNavigationTargetPayload[] = [];
+		for (const target of targets) {
+			const targetKey = uriKey(target.uri);
+			let preview = '';
+			try {
+				let document = documents.get(targetKey);
+				if (!document) {
+					document = await vscode.workspace.openTextDocument(target.uri);
+					documents.set(targetKey, document);
+				}
+				if (target.range.start.line >= 0 && target.range.start.line < document.lineCount) {
+					preview = document.lineAt(target.range.start.line).text.trim();
+				}
+			} catch {
+				preview = '';
+			}
+
+			const file = this.activeSession?.files.get(targetKey);
+			payloads.push({
+				id: `${target.uri.toString()}::${target.range.start.line}:${target.range.start.character}:${target.range.end.line}:${target.range.end.character}`,
+				uri: target.uri.toString(),
+				label: target.label,
+				description: target.description ?? '',
+				preview,
+				line: target.range.start.line,
+				column: target.range.start.character,
+				reviewable: this.isReviewableFile(file),
+				currentFile: targetKey === uriKey(sourceUri),
+			});
+		}
+		return payloads;
+	}
+
+	private async isDefinitionPosition(sourceUri: vscode.Uri, sourceDocument: vscode.TextDocument, position: vscode.Position): Promise<boolean> {
+		const definitions = await this.definitionTargets(sourceUri, position);
+		const wordRange = this.wordRangeAtPosition(sourceDocument, position);
+		if (definitions.some((target) => uriKey(target.uri) === uriKey(sourceUri)
+			&& this.rangeTouchesPositionOrWord(target.range, position, wordRange))) {
+			return true;
+		}
+
+		return this.documentSymbolsContainPosition(sourceUri, position);
+	}
+
+	private async documentSymbolsContainPosition(uri: vscode.Uri, position: vscode.Position): Promise<boolean> {
+		const symbols = await vscode.commands.executeCommand<Array<vscode.DocumentSymbol | vscode.SymbolInformation>>(
+			'vscode.executeDocumentSymbolProvider',
+			uri,
+		);
+		for (const range of this.symbolSelectionRanges(symbols ?? [])) {
+			if (range.contains(position)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private symbolSelectionRanges(symbols: Array<vscode.DocumentSymbol | vscode.SymbolInformation>): vscode.Range[] {
+		const ranges: vscode.Range[] = [];
+		for (const symbol of symbols) {
+			if ('selectionRange' in symbol) {
+				ranges.push(symbol.selectionRange);
+				ranges.push(...this.symbolSelectionRanges(symbol.children));
+			} else {
+				ranges.push(symbol.location.range);
+			}
+		}
+		return ranges;
+	}
+
+	private rangeTouchesPositionOrWord(range: vscode.Range, position: vscode.Position, wordRange: vscode.Range | undefined): boolean {
+		return range.contains(position) || Boolean(wordRange && this.rangesOverlap(range, wordRange));
+	}
+
+	private rangesOverlap(left: vscode.Range, right: vscode.Range): boolean {
+		return left.start.isBeforeOrEqual(right.end) && right.start.isBeforeOrEqual(left.end);
+	}
+
+	private providerPosition(document: vscode.TextDocument, line: number, column: number): vscode.Position {
+		const safeLine = Math.max(0, Math.min(line, document.lineCount - 1));
+		const safeColumn = Math.max(0, Math.min(column, document.lineAt(safeLine).text.length));
+		const position = document.validatePosition(new vscode.Position(safeLine, safeColumn));
+		return this.positionInsideWord(document, position);
+	}
+
+	private positionInsideWord(document: vscode.TextDocument, position: vscode.Position): vscode.Position {
+		const wordRange = this.wordRangeAtPosition(document, position);
+		if (!wordRange) {
+			return position;
+		}
+
+		const character = Math.min(
+			Math.max(position.character, wordRange.start.character),
+			Math.max(wordRange.start.character, wordRange.end.character - 1),
+		);
+		return new vscode.Position(wordRange.start.line, character);
+	}
+
+	private wordRangeAtPosition(document: vscode.TextDocument, position: vscode.Position): vscode.Range | undefined {
+		const wordRange = document.getWordRangeAtPosition(position);
+		if (wordRange || position.character === 0) {
+			return wordRange;
+		}
+		return document.getWordRangeAtPosition(position.translate(0, -1));
+	}
+
+	private normalizeLocation(location: vscode.Location | vscode.LocationLink): { uri: vscode.Uri; range: vscode.Range } {
+		if ('targetUri' in location) {
+			return {
+				uri: location.targetUri,
+				range: location.targetSelectionRange ?? location.targetRange,
+			};
+		}
+
+		return {
+			uri: location.uri,
+			range: location.range,
+		};
+	}
+
+	private async openResolvedLocation(uri: vscode.Uri, range: vscode.Range): Promise<void> {
+		if (this.activeSession?.mode === 'git') {
+			await this.refreshFile(uri, { preferDisk: true });
+		}
+
+		const file = this.activeSession?.files.get(uriKey(uri));
+		if (this.isReviewableFile(file)) {
+			this.reviewWebview.open(uri, { line: range.start.line, column: range.start.character });
+			return;
+		}
+
+		const document = await vscode.workspace.openTextDocument(uri);
+		const editor = await vscode.window.showTextDocument(document);
+		editor.selection = new vscode.Selection(range.start, range.start);
+		editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+	}
+
+	private async openNavigationTarget(uriString: string, line: number, column: number): Promise<void> {
+		const uri = vscode.Uri.parse(uriString);
+		const document = await vscode.workspace.openTextDocument(uri);
+		const safeLine = Math.max(0, Math.min(line, document.lineCount - 1));
+		const safeColumn = Math.max(0, Math.min(column, document.lineAt(safeLine).text.length));
+		const position = document.validatePosition(new vscode.Position(safeLine, safeColumn));
+		await this.openResolvedLocation(uri, new vscode.Range(position, position));
+	}
+
 	private async openFileAtChange(uriString: string, hunkId: string): Promise<void> {
 		const file = this.resolveFile(uriString);
 		const hunk = file?.hunks.find((item) => item.id === hunkId);
@@ -765,6 +1060,15 @@ export class ReviewController implements vscode.Disposable {
 		}
 
 		return { hunks: computeLineDiff(uri.toString(), oldText, newText) };
+	}
+
+	private isReviewableFile(file: ReviewFileState | undefined): file is ReviewFileState {
+		return Boolean(file && (
+			file.hunks.length > 0
+			|| file.acceptedHunks.length > 0
+			|| file.rejectedHunks.length > 0
+			|| file.skippedReason
+		));
 	}
 
 	private refreshUi(): void {

@@ -12,7 +12,32 @@ type WebviewMessage =
 	| { type: 'accept'; uri: string; hunkId: string }
 	| { type: 'reject'; uri: string; hunkId: string }
 	| { type: 'restore'; uri: string; hunkId: string }
+	| { type: 'goToDefinition'; uri: string; line: number; column: number; dirty: boolean; text?: string; ranges: EditedRange[] }
+	| { type: 'findReferences'; uri: string; line: number; column: number; dirty: boolean; text?: string; ranges: EditedRange[] }
+	| { type: 'smartNavigate'; uri: string; line: number; column: number; dirty: boolean; text?: string; ranges: EditedRange[] }
+	| { type: 'resolveNavigationAction'; uri: string; line: number; column: number; requestId: number }
+	| { type: 'openNavigationTarget'; uri: string; line: number; column: number }
 	| { type: 'saveEditedCurrent'; uri: string; text: string; ranges: EditedRange[] };
+
+export type ReviewNavigationRequestType = 'goToDefinition' | 'findReferences' | 'smartNavigate' | 'resolveNavigationAction';
+
+export type ReviewNavigationAction = 'goToDefinition' | 'findReferences';
+
+export interface ReviewNavigationTargetPayload {
+	id: string;
+	uri: string;
+	label: string;
+	description: string;
+	preview: string;
+	line: number;
+	column: number;
+	reviewable: boolean;
+	currentFile: boolean;
+}
+
+export type ReviewNavigationResponse =
+	| { type: 'navigationAction'; requestId: number; action: ReviewNavigationAction; label: string }
+	| { type: 'references'; title: string; sourceUri: string; targets: ReviewNavigationTargetPayload[] };
 
 interface ReviewWebviewPayload {
 	uri: string;
@@ -24,11 +49,14 @@ interface ReviewWebviewPayload {
 	acceptedHunks: ReviewedHunk[];
 	rejectedHunks: ReviewedHunk[];
 	skippedReason?: string;
+	revealLine?: number;
+	revealColumn?: number;
 }
 
 export class ReviewWebviewManager implements vscode.Disposable {
 	private panel: vscode.WebviewPanel | undefined;
 	private activeUri: vscode.Uri | undefined;
+	private revealPosition: { line: number; column: number } | undefined;
 	private ready = false;
 	private readonly disposables: vscode.Disposable[] = [];
 	private readonly pendingMutations = new Set<string>();
@@ -37,10 +65,13 @@ export class ReviewWebviewManager implements vscode.Disposable {
 		private readonly context: vscode.ExtensionContext,
 		private readonly getSession: () => ReviewSession | undefined,
 		private readonly saveEditedCurrent: (uri: string, text: string, ranges: EditedRange[]) => Promise<void>,
+		private readonly navigateFromReview: (type: ReviewNavigationRequestType, uri: string, line: number, column: number, requestId?: number) => Promise<ReviewNavigationResponse | undefined>,
+		private readonly openNavigationTarget: (uri: string, line: number, column: number) => Promise<void>,
 	) {}
 
-	public open(uri: vscode.Uri): void {
+	public open(uri: vscode.Uri, revealPosition?: { line: number; column: number }): void {
 		this.activeUri = uri;
+		this.revealPosition = revealPosition;
 		if (!this.panel) {
 			this.panel = vscode.window.createWebviewPanel(
 				'cliDiffReview',
@@ -106,6 +137,22 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			}
 		} else if (message.type === 'saveEditedCurrent') {
 			await this.saveEditedCurrent(message.uri, message.text, message.ranges);
+		} else if (message.type === 'resolveNavigationAction') {
+			const response = await this.navigateFromReview(message.type, message.uri, message.line, message.column, message.requestId);
+			if (response) {
+				await this.panel?.webview.postMessage(response);
+			}
+			return;
+		} else if (message.type === 'openNavigationTarget') {
+			await this.openNavigationTarget(message.uri, message.line, message.column);
+		} else if (message.type === 'goToDefinition' || message.type === 'findReferences' || message.type === 'smartNavigate') {
+			if (message.dirty && typeof message.text === 'string') {
+				await this.saveEditedCurrent(message.uri, message.text, message.ranges);
+			}
+			const response = await this.navigateFromReview(message.type, message.uri, message.line, message.column);
+			if (response) {
+				await this.panel?.webview.postMessage(response);
+			}
 		}
 
 		await this.postState();
@@ -125,6 +172,7 @@ export class ReviewWebviewManager implements vscode.Disposable {
 		this.panel.title = file ? `Review: ${file.relativePath}` : 'CLI Diff Review';
 		const payload = this.serialize(file);
 		await this.panel.webview.postMessage({ type: 'state', file: payload });
+		this.revealPosition = undefined;
 	}
 
 	private isReviewable(file: ReviewFileState): boolean {
@@ -145,6 +193,8 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			acceptedHunks: file.acceptedHunks,
 			rejectedHunks: file.rejectedHunks,
 			skippedReason: file.skippedReason,
+			revealLine: this.revealPosition?.line,
+			revealColumn: this.revealPosition?.column,
 		};
 	}
 
@@ -235,6 +285,96 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			color: var(--muted);
 			font-size: 12px;
 		}
+		.cli-references-zone {
+			height: 100%;
+			display: flex;
+			flex-direction: column;
+			border: 1px solid var(--border);
+			border-radius: 5px;
+			background: var(--bg);
+			box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+			overflow: hidden;
+		}
+		.cli-references-zone.above {
+			border-bottom-color: var(--vscode-focusBorder);
+		}
+		.cli-references-zone.below {
+			border-top-color: var(--vscode-focusBorder);
+		}
+		.cli-references-header {
+			height: 30px;
+			flex: none;
+			display: flex;
+			align-items: center;
+			gap: 8px;
+			padding: 0 12px;
+			border-bottom: 1px solid var(--border);
+			background: var(--zone-bg);
+			color: var(--fg);
+			font-size: 12px;
+		}
+		.cli-references-title {
+			font-weight: 600;
+			margin-right: auto;
+		}
+		.cli-references-count {
+			color: var(--muted);
+		}
+		.cli-references-list {
+			flex: 1;
+			min-height: 0;
+			overflow: auto;
+			padding: 4px 0;
+		}
+		.cli-reference-item {
+			width: 100%;
+			display: grid;
+			grid-template-columns: minmax(180px, 0.42fr) minmax(120px, 1fr) auto;
+			align-items: center;
+			gap: 12px;
+			padding: 4px 12px;
+			border: 0;
+			border-radius: 0;
+			background: transparent;
+			color: var(--fg);
+			text-align: left;
+			cursor: pointer;
+			font-family: var(--vscode-font-family);
+			line-height: 18px;
+		}
+		.cli-reference-item:hover {
+			background: var(--button-bg);
+		}
+		.cli-reference-location {
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+			color: var(--fg);
+		}
+		.cli-reference-preview {
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+			color: var(--muted);
+			font-family: var(--vscode-editor-font-family);
+		}
+		.cli-reference-badge {
+			border: 1px solid var(--border);
+			border-radius: 3px;
+			padding: 0 6px;
+			color: var(--muted);
+			font-size: 11px;
+			line-height: 16px;
+		}
+		.cli-reference-badge.review {
+			border-color: var(--accept-border);
+			color: var(--accept-fg);
+		}
+		.cli-references-empty {
+			padding: 10px 12px;
+			color: var(--muted);
+			font-size: 12px;
+		}
 		.monaco-editor .view-zones,
 		.monaco-editor .view-zone,
 		.cli-hunk-zone,
@@ -245,6 +385,10 @@ export class ReviewWebviewManager implements vscode.Disposable {
 		.cli-line-delete { background-color: var(--delete-bg) !important; }
 		.cli-line-modify { background-color: var(--modify-bg) !important; }
 		.cli-line-reviewed { background-color: var(--reviewed-bg) !important; }
+		.cli-link-hover {
+			text-decoration: underline;
+			cursor: pointer;
+		}
 		.monaco-editor .margin-view-overlays .cli-margin-add { border-left: 3px solid var(--add-line); }
 		.monaco-editor .margin-view-overlays .cli-margin-delete { border-left: 3px solid var(--delete-line); }
 		.monaco-editor .margin-view-overlays .cli-margin-modify { border-left: 3px solid var(--modify-line); }
@@ -327,6 +471,9 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			cursor: default;
 			opacity: 0.55;
 		}
+		button:disabled:hover {
+			background: var(--button-bg);
+		}
 		button.action-reject {
 			background: var(--reject-bg);
 			border-color: var(--reject-border);
@@ -399,6 +546,10 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			accepted: 'Accepted',
 			rejected: 'Rejected',
 			noData: '0 pending \\u00b7 0 reviewed',
+			goToDefinition: 'Go to Definition',
+			findReferences: 'Find References',
+			references: 'References',
+			noReferences: 'No references found.',
 		};
 
 		let editor;
@@ -414,6 +565,16 @@ export class ReviewWebviewManager implements vscode.Disposable {
 		let hunkEntries = [];
 		let activeHunkId;
 		let pendingMutationKey;
+		let navigationModifierDown = false;
+		let lastMousePosition;
+		let linkDecorationIds = [];
+		let navigationHoverRequestId = 0;
+		let navigationHoverKey;
+		let navigationHoverRange;
+		let navigationHoverAction = 'goToDefinition';
+		let navigationHoverTimer;
+		let referencesZoneId;
+		let referencesAnchorPosition;
 
 		const statusNode = document.getElementById('status');
 		const editorNode = document.getElementById('editor');
@@ -434,10 +595,17 @@ export class ReviewWebviewManager implements vscode.Disposable {
 		});
 
 		window.addEventListener('message', function (event) {
-			if (event.data.type !== 'state') {
+			if (event.data.type === 'state') {
+				setState(event.data.file);
 				return;
 			}
-			setState(event.data.file);
+			if (event.data.type === 'navigationAction') {
+				applyNavigationAction(event.data);
+				return;
+			}
+			if (event.data.type === 'references') {
+				renderReferences(event.data);
+			}
 		});
 
 		window.addEventListener('resize', function () {
@@ -445,9 +613,13 @@ export class ReviewWebviewManager implements vscode.Disposable {
 				editor.layout();
 			}
 		});
+		window.addEventListener('keydown', onWindowKeyDown);
+		window.addEventListener('keyup', onWindowKeyUp);
+		window.addEventListener('blur', clearNavigationHover);
 		document.addEventListener('pointerdown', stopToolbarPointer, true);
 		document.addEventListener('mousedown', stopToolbarPointer, true);
 		document.addEventListener('click', onToolbarClick, true);
+		document.addEventListener('click', onReferencesClick, true);
 
 		function createEditor() {
 			defineTheme();
@@ -476,6 +648,56 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			});
 
 			editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveCurrent);
+			editor.addCommand(monaco.KeyCode.F12, function () { requestNavigation('goToDefinition'); });
+			editor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.F12, function () { requestNavigation('findReferences'); });
+			editor.addAction({
+				id: 'cli-diff-go-to-definition',
+				label: 'Go to Definition',
+				contextMenuGroupId: 'navigation',
+				contextMenuOrder: 1,
+				run: function () { requestNavigation('goToDefinition'); },
+			});
+			editor.addAction({
+				id: 'cli-diff-find-references',
+				label: 'Find References',
+				contextMenuGroupId: 'navigation',
+				contextMenuOrder: 2,
+				run: function () { requestNavigation('findReferences'); },
+			});
+			editor.onMouseDown(function (event) {
+				if (!event.target.position || event.target.type !== monaco.editor.MouseTargetType.CONTENT_TEXT) {
+					return;
+				}
+				if (event.event.ctrlKey || event.event.metaKey) {
+					const wordRange = wordRangeAt(event.target.position);
+					if (!wordRange) {
+						return;
+					}
+					if (event.event.preventDefault) {
+						event.event.preventDefault();
+					}
+					requestNavigation('smartNavigate', event.target.position);
+				}
+			});
+			editor.onContextMenu(function (event) {
+				const position = contentTextPosition(event);
+				if (position) {
+					editor.setPosition(position);
+				}
+			});
+			editor.onMouseMove(function (event) {
+				const position = contentTextPosition(event);
+				lastMousePosition = position;
+				if (isNavigationModifierActive(event.event)) {
+					updateNavigationHover(position);
+				} else {
+					clearNavigationHover();
+				}
+			});
+			editor.onMouseLeave(function () {
+				lastMousePosition = undefined;
+				clearNavigationHover();
+			});
 			editor.onDidScrollChange(updateActionOffset);
 			editor.onDidLayoutChange(updateActionOffset);
 			applyState();
@@ -493,7 +715,9 @@ export class ReviewWebviewManager implements vscode.Disposable {
 					'editor.foreground': foreground,
 					'editorLineNumber.foreground': cssVar('--vscode-editorLineNumber-foreground') || '#858585',
 					'editorCursor.foreground': cssVar('--vscode-editorCursor-foreground') || foreground,
-					'editor.selectionBackground': cssVar('--vscode-editor-selectionBackground') || '#264f78',
+					'editor.selectionBackground': '#8b949e55',
+					'editor.inactiveSelectionBackground': '#8b949e33',
+					'editor.selectionHighlightBackground': '#8b949e22',
 					'editor.lineHighlightBackground': cssVar('--vscode-editor-lineHighlightBackground') || '#2a2d2e',
 				},
 			});
@@ -506,13 +730,18 @@ export class ReviewWebviewManager implements vscode.Disposable {
 					'editor.foreground': foreground,
 					'editorLineNumber.foreground': cssVar('--vscode-editorLineNumber-foreground') || '#237893',
 					'editorCursor.foreground': cssVar('--vscode-editorCursor-foreground') || foreground,
-					'editor.selectionBackground': cssVar('--vscode-editor-selectionBackground') || '#add6ff',
+					'editor.selectionBackground': '#8c8c8c44',
+					'editor.inactiveSelectionBackground': '#8c8c8c24',
+					'editor.selectionHighlightBackground': '#8c8c8c1f',
 					'editor.lineHighlightBackground': cssVar('--vscode-editor-lineHighlightBackground') || '#f0f0f0',
 				},
 			});
 		}
 
 		function setState(nextState) {
+			if (state?.uri && state.uri !== nextState.uri) {
+				hideReferences();
+			}
 			state = nextState;
 			pendingMutationKey = undefined;
 			if (!ready) {
@@ -546,6 +775,7 @@ export class ReviewWebviewManager implements vscode.Disposable {
 				dirtyRanges = [];
 			}
 			renderInlineDiff();
+			revealStatePosition();
 		}
 
 		function onModelChanged(event) {
@@ -606,6 +836,17 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			lineDecorations = editor.deltaDecorations(lineDecorations, nextDecorations);
 			updateActiveZone();
 			updateActionOffset();
+		}
+
+		function revealStatePosition() {
+			if (!editor || !state || typeof state.revealLine !== 'number') {
+				return;
+			}
+			const lineNumber = Math.max(1, state.revealLine + 1);
+			const column = Math.max(1, (state.revealColumn ?? 0) + 1);
+			editor.revealLineInCenter(lineNumber);
+			editor.setPosition({ lineNumber, column });
+			editor.focus();
 		}
 
 		function updateFooter() {
@@ -759,12 +1000,12 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			button.dataset.command = command;
 			button.dataset.hunkId = entry.id;
 			button.className = buttonClass(command);
-			button.disabled = Boolean(pendingMutationKey && isMutationCommand(command));
+			button.disabled = Boolean((pendingMutationKey && isMutationCommand(command)) || (isNavigationCommand(command) && hunkEntries.length <= 1));
 			return button;
 		}
 
 		function stopToolbarPointer(event) {
-			if (closestElement(event.target, '.cli-hunk-zone button')) {
+			if (closestElement(event.target, '.cli-hunk-zone button') || closestElement(event.target, '.cli-references-zone button')) {
 				event.stopPropagation();
 			}
 		}
@@ -785,6 +1026,9 @@ export class ReviewWebviewManager implements vscode.Disposable {
 				return;
 			}
 
+			if (isNavigationCommand(command) && hunkEntries.length <= 1) {
+				return;
+			}
 			if (command === 'next') {
 				moveHunk(1, hunkId);
 				return;
@@ -808,6 +1052,302 @@ export class ReviewWebviewManager implements vscode.Disposable {
 				return;
 			}
 			vscode.postMessage({ type: command, uri: state.uri, hunkId });
+		}
+
+		function renderReferences(message) {
+			if (!editor) {
+				return;
+			}
+			const targets = message.targets || [];
+			const anchor = referencesAnchorPosition || editor.getPosition() || { lineNumber: 1, column: 1 };
+			const placement = referencesPlacement(anchor);
+			const lineHeight = editor.getOption(monaco.editor.EditorOption.lineHeight) || 20;
+			const visibleRows = Math.min(Math.max(targets.length, 1), 8);
+			const heightInPx = Math.min(320, Math.max(118, 36 + (visibleRows * Math.max(24, lineHeight + 4))));
+			const node = createReferencesZone(message, targets, placement);
+
+			editor.changeViewZones(function (accessor) {
+				if (referencesZoneId) {
+					accessor.removeZone(referencesZoneId);
+				}
+				const afterLineNumber = placement === 'above'
+					? Math.max(0, anchor.lineNumber - 1)
+					: Math.max(0, anchor.lineNumber);
+				referencesZoneId = accessor.addZone({
+					afterLineNumber,
+					heightInPx,
+					domNode: node,
+				});
+			});
+			editor.revealLineInCenter(anchor.lineNumber);
+			editor.layout();
+		}
+
+		function createReferencesZone(message, targets, placement) {
+			const node = document.createElement('section');
+			node.className = 'cli-references-zone ' + placement;
+			node.setAttribute('aria-label', 'References');
+
+			const header = document.createElement('div');
+			header.className = 'cli-references-header';
+			node.appendChild(header);
+
+			const title = document.createElement('span');
+			title.className = 'cli-references-title';
+			title.textContent = message.title || labels.references;
+			header.appendChild(title);
+
+			const count = document.createElement('span');
+			count.className = 'cli-references-count';
+			count.textContent = targets.length + (targets.length === 1 ? ' result' : ' results');
+			header.appendChild(count);
+
+			const close = document.createElement('button');
+			close.type = 'button';
+			close.dataset.referenceClose = 'true';
+			close.textContent = 'Close';
+			header.appendChild(close);
+
+			const list = document.createElement('div');
+			list.className = 'cli-references-list';
+			node.appendChild(list);
+
+			if (targets.length === 0) {
+				const empty = document.createElement('div');
+				empty.className = 'cli-references-empty';
+				empty.textContent = labels.noReferences;
+				list.appendChild(empty);
+			} else {
+				for (const target of targets) {
+					list.appendChild(createReferenceItem(target));
+				}
+			}
+			return node;
+		}
+
+		function referencesPlacement(anchor) {
+			const visibleRanges = editor.getVisibleRanges();
+			const visible = visibleRanges.length > 0 ? visibleRanges[0] : undefined;
+			if (!visible) {
+				return 'below';
+			}
+			const middle = (visible.startLineNumber + visible.endLineNumber) / 2;
+			return anchor.lineNumber > middle ? 'above' : 'below';
+		}
+
+		function createReferenceItem(target) {
+			const item = document.createElement('button');
+			item.type = 'button';
+			item.className = 'cli-reference-item';
+			item.dataset.uri = target.uri;
+			item.dataset.line = String(target.line);
+			item.dataset.column = String(target.column);
+
+			const location = document.createElement('span');
+			location.className = 'cli-reference-location';
+			location.textContent = target.label;
+			item.appendChild(location);
+
+			const preview = document.createElement('span');
+			preview.className = 'cli-reference-preview';
+			preview.textContent = target.preview || target.description || '';
+			item.appendChild(preview);
+
+			const badge = document.createElement('span');
+			badge.className = 'cli-reference-badge' + (target.reviewable ? ' review' : '');
+			badge.textContent = target.currentFile || target.reviewable ? 'Review' : 'Editor';
+			item.appendChild(badge);
+
+			return item;
+		}
+
+		function onReferencesClick(event) {
+			if (closestElement(event.target, '[data-reference-close]')) {
+				event.preventDefault();
+				event.stopPropagation();
+				hideReferences();
+				return;
+			}
+
+			const item = closestElement(event.target, '.cli-reference-item[data-uri]');
+			if (!item) {
+				return;
+			}
+
+			event.preventDefault();
+			event.stopPropagation();
+			vscode.postMessage({
+				type: 'openNavigationTarget',
+				uri: item.dataset.uri,
+				line: Number(item.dataset.line) || 0,
+				column: Number(item.dataset.column) || 0,
+			});
+		}
+
+		function hideReferences() {
+			if (!editor || !referencesZoneId) {
+				referencesZoneId = undefined;
+				return;
+			}
+			editor.changeViewZones(function (accessor) {
+				if (referencesZoneId) {
+					accessor.removeZone(referencesZoneId);
+				}
+				referencesZoneId = undefined;
+			});
+			editor.layout();
+		}
+
+		function requestNavigation(type, position) {
+			if (!state || !model || !editor) {
+				return;
+			}
+			const target = position || editor.getPosition();
+			if (!target) {
+				return;
+			}
+			const wasDirty = dirty;
+			const ranges = wasDirty ? mergeRanges(dirtyRanges) : [];
+			if (type === 'findReferences' || type === 'smartNavigate') {
+				referencesAnchorPosition = target;
+			}
+			vscode.postMessage({
+				type,
+				uri: state.uri,
+				line: Math.max(0, target.lineNumber - 1),
+				column: Math.max(0, target.column - 1),
+				dirty: wasDirty,
+				text: wasDirty ? model.getValue() : undefined,
+				ranges,
+			});
+			if (wasDirty) {
+				dirty = false;
+				dirtyRanges = [];
+				updateFooter();
+			}
+		}
+
+		function requestNavigationAction(position) {
+			if (!state || !model || dirty) {
+				return;
+			}
+			const target = position || editor?.getPosition();
+			if (!target) {
+				return;
+			}
+			const requestId = ++navigationHoverRequestId;
+			window.clearTimeout(navigationHoverTimer);
+			navigationHoverTimer = window.setTimeout(function () {
+				vscode.postMessage({
+					type: 'resolveNavigationAction',
+					uri: state.uri,
+					line: Math.max(0, target.lineNumber - 1),
+					column: Math.max(0, target.column - 1),
+					requestId,
+				});
+			}, 180);
+		}
+
+		function applyNavigationAction(message) {
+			if (message.requestId !== navigationHoverRequestId) {
+				return;
+			}
+			navigationHoverAction = message.action || 'goToDefinition';
+			applyNavigationHoverDecoration(message.label || navigationActionLabel(navigationHoverAction));
+		}
+
+		function onWindowKeyDown(event) {
+			if (event.key === 'Control' || event.key === 'Meta') {
+				navigationModifierDown = true;
+				updateNavigationHover(lastMousePosition);
+			}
+		}
+
+		function onWindowKeyUp(event) {
+			if (event.key === 'Control' || event.key === 'Meta') {
+				navigationModifierDown = Boolean(event.ctrlKey || event.metaKey);
+				if (navigationModifierDown) {
+					updateNavigationHover(lastMousePosition);
+				} else {
+					clearNavigationHover(true);
+				}
+			}
+		}
+
+		function isNavigationModifierActive(event) {
+			return Boolean(navigationModifierDown || event?.ctrlKey || event?.metaKey);
+		}
+
+		function contentTextPosition(event) {
+			if (!event.target.position || event.target.type !== monaco.editor.MouseTargetType.CONTENT_TEXT) {
+				return undefined;
+			}
+			return event.target.position;
+		}
+
+		function wordRangeAt(position) {
+			if (!model || !position) {
+				return undefined;
+			}
+			const word = model.getWordAtPosition(position);
+			if (!word) {
+				return undefined;
+			}
+			return new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn);
+		}
+
+		function updateNavigationHover(position) {
+			if (!editor || !state || !position) {
+				clearNavigationHover();
+				return;
+			}
+			const range = wordRangeAt(position);
+			if (!range) {
+				clearNavigationHover();
+				return;
+			}
+			const key = state.uri + ':' + range.startLineNumber + ':' + range.startColumn + ':' + range.endColumn;
+			if (key !== navigationHoverKey) {
+				navigationHoverKey = key;
+				navigationHoverRange = range;
+				navigationHoverAction = 'goToDefinition';
+				requestNavigationAction(position);
+			} else {
+				navigationHoverRange = range;
+			}
+			applyNavigationHoverDecoration(navigationActionLabel(navigationHoverAction));
+		}
+
+		function applyNavigationHoverDecoration(label) {
+			if (!editor || !navigationHoverRange) {
+				return;
+			}
+			linkDecorationIds = editor.deltaDecorations(linkDecorationIds, [{
+				range: navigationHoverRange,
+				options: {
+					inlineClassName: 'cli-link-hover',
+					hoverMessage: { value: label },
+				},
+			}]);
+		}
+
+		function navigationActionLabel(action) {
+			return action === 'findReferences' ? labels.findReferences : labels.goToDefinition;
+		}
+
+		function clearNavigationHover(resetModifier) {
+			window.clearTimeout(navigationHoverTimer);
+			if (editor && linkDecorationIds.length > 0) {
+				linkDecorationIds = editor.deltaDecorations(linkDecorationIds, []);
+			} else {
+				linkDecorationIds = [];
+			}
+			navigationHoverKey = undefined;
+			navigationHoverRange = undefined;
+			navigationHoverAction = 'goToDefinition';
+			if (resetModifier) {
+				navigationModifierDown = false;
+			}
 		}
 
 		function closestElement(target, selector) {
@@ -932,6 +1472,10 @@ export class ReviewWebviewManager implements vscode.Disposable {
 
 		function isMutationCommand(command) {
 			return command === 'accept' || command === 'reject' || command === 'restore';
+		}
+
+		function isNavigationCommand(command) {
+			return command === 'previous' || command === 'next';
 		}
 
 		function setMutationButtonsDisabled(disabled) {
