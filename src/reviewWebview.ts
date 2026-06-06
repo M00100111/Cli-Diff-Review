@@ -9,15 +9,28 @@ export interface EditedRange {
 
 type WebviewMessage =
 	| { type: 'ready' }
-	| { type: 'accept'; uri: string; hunkId: string }
-	| { type: 'reject'; uri: string; hunkId: string }
-	| { type: 'restore'; uri: string; hunkId: string }
-	| { type: 'goToDefinition'; uri: string; line: number; column: number; dirty: boolean; text?: string; ranges: EditedRange[] }
-	| { type: 'findReferences'; uri: string; line: number; column: number; dirty: boolean; text?: string; ranges: EditedRange[] }
-	| { type: 'smartNavigate'; uri: string; line: number; column: number; dirty: boolean; text?: string; ranges: EditedRange[] }
+	| { type: 'accept'; uri: string; hunkId: string; revision: number }
+	| { type: 'reject'; uri: string; hunkId: string; revision: number }
+	| { type: 'restore'; uri: string; hunkId: string; revision: number }
+	| { type: 'goToDefinition'; uri: string; line: number; column: number }
+	| { type: 'findReferences'; uri: string; line: number; column: number }
+	| { type: 'smartNavigate'; uri: string; line: number; column: number }
 	| { type: 'resolveNavigationAction'; uri: string; line: number; column: number; requestId: number }
 	| { type: 'openNavigationTarget'; uri: string; line: number; column: number }
-	| { type: 'saveEditedCurrent'; uri: string; text: string; ranges: EditedRange[] };
+	| { type: 'applyTextEdits'; uri: string; edits: WebviewTextEdit[]; text: string }
+	| { type: 'saveCurrentDocument'; uri: string }
+	| { type: 'clipboardRead'; requestId: number }
+	| { type: 'clipboardWrite'; requestId: number; text: string };
+
+interface WebviewTextEdit {
+	range: {
+		startLine: number;
+		startColumn: number;
+		endLine: number;
+		endColumn: number;
+	};
+	text: string;
+}
 
 export type ReviewNavigationRequestType = 'goToDefinition' | 'findReferences' | 'smartNavigate' | 'resolveNavigationAction';
 
@@ -44,6 +57,8 @@ interface ReviewWebviewPayload {
 	relativePath: string;
 	oldText: string;
 	newText: string;
+	revision: number;
+	dirty: boolean;
 	languageId: string;
 	pendingHunks: ReviewHunk[];
 	acceptedHunks: ReviewedHunk[];
@@ -53,67 +68,137 @@ interface ReviewWebviewPayload {
 	revealColumn?: number;
 }
 
-export class ReviewWebviewManager implements vscode.Disposable {
-	private panel: vscode.WebviewPanel | undefined;
-	private activeUri: vscode.Uri | undefined;
-	private revealPosition: { line: number; column: number } | undefined;
-	private ready = false;
+interface ReviewEditorHost {
+	key: string;
+	uri: vscode.Uri;
+	document: vscode.TextDocument;
+	panel: vscode.WebviewPanel;
+	ready: boolean;
+	stateSequence: number;
+	revealPosition?: { line: number; column: number };
+	disposables: vscode.Disposable[];
+}
+
+export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vscode.Disposable {
+	public static readonly viewType = 'cli-diff.reviewEditor';
+
+	private readonly hosts = new Map<string, ReviewEditorHost>();
+	private readonly pendingRevealPositions = new Map<string, { line: number; column: number }>();
+	private readonly textEditQueues = new Map<string, Promise<void>>();
+	private readonly refreshTimers = new Map<string, NodeJS.Timeout>();
 	private readonly disposables: vscode.Disposable[] = [];
 	private readonly pendingMutations = new Set<string>();
 
 	public constructor(
 		private readonly context: vscode.ExtensionContext,
 		private readonly getSession: () => ReviewSession | undefined,
-		private readonly saveEditedCurrent: (uri: string, text: string, ranges: EditedRange[]) => Promise<void>,
 		private readonly navigateFromReview: (type: ReviewNavigationRequestType, uri: string, line: number, column: number, requestId?: number) => Promise<ReviewNavigationResponse | undefined>,
 		private readonly openNavigationTarget: (uri: string, line: number, column: number) => Promise<void>,
-	) {}
-
-	public open(uri: vscode.Uri, revealPosition?: { line: number; column: number }): void {
-		this.activeUri = uri;
-		this.revealPosition = revealPosition;
-		if (!this.panel) {
-			this.panel = vscode.window.createWebviewPanel(
-				'cliDiffReview',
-				'CLI Diff Review',
-				vscode.ViewColumn.Active,
-				{
-					enableScripts: true,
-					localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'dist')],
-				},
-			);
-			this.panel.webview.html = this.renderShell(this.panel.webview);
-			this.disposables.push(
-				this.panel.onDidDispose(() => {
-					this.panel = undefined;
-					this.activeUri = undefined;
-					this.ready = false;
-				}),
-				this.panel.webview.onDidReceiveMessage((message: WebviewMessage) => {
-					void this.handleMessage(message);
-				}),
-			);
-		}
-
-		this.panel.reveal(vscode.ViewColumn.Active);
-		void this.postState();
+	) {
+		this.disposables.push(
+			vscode.window.registerCustomEditorProvider(ReviewWebviewManager.viewType, this),
+			vscode.workspace.onDidChangeTextDocument((event) => this.scheduleRefresh(event.document.uri)),
+			vscode.workspace.onDidSaveTextDocument((document) => this.scheduleRefresh(document.uri)),
+		);
 	}
 
-	public refresh(): void {
-		void this.postState();
+	public resolveCustomTextEditor(document: vscode.TextDocument, panel: vscode.WebviewPanel): void {
+		const key = uriKey(document.uri);
+		const host: ReviewEditorHost = {
+			key,
+			uri: document.uri,
+			document,
+			panel,
+			ready: false,
+			stateSequence: 0,
+			revealPosition: this.pendingRevealPositions.get(key),
+			disposables: [],
+		};
+		this.pendingRevealPositions.delete(key);
+		this.hosts.set(key, host);
+		panel.webview.options = {
+			enableScripts: true,
+			localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'dist')],
+		};
+		panel.webview.html = this.renderShell(panel.webview);
+		host.disposables.push(
+			panel.onDidDispose(() => {
+				for (const disposable of host.disposables) {
+					disposable.dispose();
+				}
+				if (this.hosts.get(key) === host) {
+					this.hosts.delete(key);
+				}
+			}),
+			panel.webview.onDidReceiveMessage((message: WebviewMessage) => {
+				void this.handleMessage(host, message);
+			}),
+		);
+	}
+
+	public async open(uri: vscode.Uri, revealPosition?: { line: number; column: number }): Promise<void> {
+		const key = uriKey(uri);
+		if (revealPosition) {
+			this.pendingRevealPositions.set(key, revealPosition);
+		}
+
+		await vscode.commands.executeCommand('vscode.openWith', uri, ReviewWebviewManager.viewType, vscode.ViewColumn.Active);
+		const host = this.hosts.get(key);
+		if (host) {
+			host.revealPosition = revealPosition;
+			await this.postState(host);
+		}
+	}
+
+	public refresh(uri?: vscode.Uri): void {
+		if (uri) {
+			const host = this.hosts.get(uriKey(uri));
+			if (host) {
+				void this.postState(host);
+			}
+			return;
+		}
+
+		for (const host of this.hosts.values()) {
+			void this.postState(host);
+		}
+	}
+
+	private scheduleRefresh(uri: vscode.Uri): void {
+		const key = uriKey(uri);
+		if (!this.hosts.has(key)) {
+			return;
+		}
+
+		const existing = this.refreshTimers.get(key);
+		if (existing) {
+			clearTimeout(existing);
+		}
+
+		this.refreshTimers.set(key, setTimeout(() => {
+			this.refreshTimers.delete(key);
+			this.refresh(uri);
+		}, 50));
 	}
 
 	public dispose(): void {
+		for (const timer of this.refreshTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.refreshTimers.clear();
 		for (const disposable of this.disposables) {
 			disposable.dispose();
 		}
-		this.panel?.dispose();
+		for (const host of this.hosts.values()) {
+			host.panel.dispose();
+		}
+		this.hosts.clear();
 	}
 
-	private async handleMessage(message: WebviewMessage): Promise<void> {
+	private async handleMessage(host: ReviewEditorHost, message: WebviewMessage): Promise<void> {
 		if (message.type === 'ready') {
-			this.ready = true;
-			await this.postState();
+			host.ready = true;
+			await this.postState(host);
 			return;
 		}
 
@@ -126,76 +211,133 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			this.pendingMutations.add(mutationKey);
 			try {
 				if (message.type === 'accept') {
-					await vscode.commands.executeCommand('cli-diff.acceptChange', message.uri, message.hunkId);
+					await vscode.commands.executeCommand('cli-diff.acceptChange', message.uri, message.hunkId, message.revision);
 				} else if (message.type === 'reject') {
-					await vscode.commands.executeCommand('cli-diff.rejectChange', message.uri, message.hunkId);
+					await vscode.commands.executeCommand('cli-diff.rejectChange', message.uri, message.hunkId, message.revision);
 				} else {
-					await vscode.commands.executeCommand('cli-diff.restoreChange', message.uri, message.hunkId);
+					await vscode.commands.executeCommand('cli-diff.restoreChange', message.uri, message.hunkId, message.revision);
 				}
 			} finally {
 				this.pendingMutations.delete(mutationKey);
 			}
-		} else if (message.type === 'saveEditedCurrent') {
-			await this.saveEditedCurrent(message.uri, message.text, message.ranges);
+		} else if (message.type === 'applyTextEdits') {
+			await this.enqueueTextEdit(host.key, () => this.applyTextEdits(host, message));
+			return;
+		} else if (message.type === 'saveCurrentDocument') {
+			await this.saveDocument(host, message.uri);
+			return;
+		} else if (message.type === 'clipboardRead') {
+			await host.panel.webview.postMessage({
+				type: 'clipboardReadResult',
+				requestId: message.requestId,
+				text: await vscode.env.clipboard.readText(),
+			});
+			return;
+		} else if (message.type === 'clipboardWrite') {
+			await vscode.env.clipboard.writeText(message.text);
+			await host.panel.webview.postMessage({
+				type: 'clipboardWriteResult',
+				requestId: message.requestId,
+			});
+			return;
 		} else if (message.type === 'resolveNavigationAction') {
 			const response = await this.navigateFromReview(message.type, message.uri, message.line, message.column, message.requestId);
 			if (response) {
-				await this.panel?.webview.postMessage(response);
+				await host.panel.webview.postMessage(response);
 			}
 			return;
 		} else if (message.type === 'openNavigationTarget') {
 			await this.openNavigationTarget(message.uri, message.line, message.column);
 		} else if (message.type === 'goToDefinition' || message.type === 'findReferences' || message.type === 'smartNavigate') {
-			if (message.dirty && typeof message.text === 'string') {
-				await this.saveEditedCurrent(message.uri, message.text, message.ranges);
-			}
 			const response = await this.navigateFromReview(message.type, message.uri, message.line, message.column);
 			if (response) {
-				await this.panel?.webview.postMessage(response);
+				await host.panel.webview.postMessage(response);
 			}
 		}
 
-		await this.postState();
+		await this.postState(host);
 	}
 
-	private async postState(): Promise<void> {
-		if (!this.panel || !this.activeUri || !this.ready) {
+	private async postState(host: ReviewEditorHost): Promise<void> {
+		if (!host.ready) {
 			return;
 		}
 
-		const file = this.getSession()?.files.get(uriKey(this.activeUri));
-		if (!file || !this.isReviewable(file)) {
-			this.panel.dispose();
+		const file = this.getSession()?.files.get(host.key);
+		if (!file) {
 			return;
 		}
 
-		this.panel.title = file ? `Review: ${file.relativePath}` : 'CLI Diff Review';
-		const payload = this.serialize(file);
-		await this.panel.webview.postMessage({ type: 'state', file: payload });
-		this.revealPosition = undefined;
+		host.panel.title = `Review: ${file.relativePath}`;
+		const payload = this.serialize(file, host.document, host.revealPosition);
+		const sequence = ++host.stateSequence;
+		const delivered = await host.panel.webview.postMessage({ type: 'state', sequence, file: payload });
+		if (delivered) {
+			host.revealPosition = undefined;
+		}
 	}
 
-	private isReviewable(file: ReviewFileState): boolean {
-		return file.hunks.length > 0
-			|| file.acceptedHunks.length > 0
-			|| file.rejectedHunks.length > 0
-			|| Boolean(file.skippedReason);
-	}
-
-	private serialize(file: ReviewFileState): ReviewWebviewPayload {
+	private serialize(file: ReviewFileState, document: vscode.TextDocument, revealPosition?: { line: number; column: number }): ReviewWebviewPayload {
 		return {
 			uri: file.uri.toString(),
 			relativePath: file.relativePath,
 			oldText: file.oldText,
-			newText: file.newText,
+			newText: document.getText(),
+			revision: file.revision,
+			dirty: document.isDirty,
 			languageId: languageIdFromPath(file.relativePath),
 			pendingHunks: file.hunks,
 			acceptedHunks: file.acceptedHunks,
 			rejectedHunks: file.rejectedHunks,
 			skippedReason: file.skippedReason,
-			revealLine: this.revealPosition?.line,
-			revealColumn: this.revealPosition?.column,
+			revealLine: revealPosition?.line,
+			revealColumn: revealPosition?.column,
 		};
+	}
+
+	private async applyTextEdits(host: ReviewEditorHost, message: Extract<WebviewMessage, { type: 'applyTextEdits' }>): Promise<void> {
+		const document = this.documentForUri(message.uri) ?? host.document;
+		const uri = document.uri;
+		const edit = new vscode.WorkspaceEdit();
+		for (const change of message.edits) {
+			edit.replace(uri, new vscode.Range(
+				new vscode.Position(Math.max(0, change.range.startLine), Math.max(0, change.range.startColumn)),
+				new vscode.Position(Math.max(0, change.range.endLine), Math.max(0, change.range.endColumn)),
+			), change.text);
+		}
+
+		const applied = await vscode.workspace.applyEdit(edit);
+		if (!applied || document.getText() !== message.text) {
+			const fallback = new vscode.WorkspaceEdit();
+			const fullRange = new vscode.Range(new vscode.Position(0, 0), document.positionAt(document.getText().length));
+			fallback.replace(uri, fullRange, message.text);
+			const fallbackApplied = await vscode.workspace.applyEdit(fallback);
+			if (!fallbackApplied) {
+				throw new Error('VS Code rejected the review editor edit.');
+			}
+		}
+	}
+
+	private async saveDocument(host: ReviewEditorHost, uriString: string): Promise<void> {
+		const document = this.documentForUri(uriString) ?? host.document;
+		await document.save();
+	}
+
+	private async enqueueTextEdit(key: string, operation: () => Promise<void>): Promise<void> {
+		const previous = this.textEditQueues.get(key) ?? Promise.resolve();
+		const current = previous.catch(() => undefined).then(operation);
+		this.textEditQueues.set(key, current);
+		try {
+			await current;
+		} finally {
+			if (this.textEditQueues.get(key) === current) {
+				this.textEditQueues.delete(key);
+			}
+		}
+	}
+
+	private documentForUri(uriString: string): vscode.TextDocument | undefined {
+		return vscode.workspace.textDocuments.find((document) => document.uri.toString() === uriString);
 	}
 
 	private renderShell(webview: vscode.Webview): string {
@@ -324,15 +466,16 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			flex: 1;
 			min-height: 0;
 			overflow: auto;
-			padding: 4px 0;
+			padding: 0;
 		}
 		.cli-reference-item {
 			width: 100%;
+			height: 26px;
 			display: grid;
 			grid-template-columns: minmax(180px, 0.42fr) minmax(120px, 1fr) auto;
 			align-items: center;
 			gap: 12px;
-			padding: 4px 12px;
+			padding: 0 12px;
 			border: 0;
 			border-radius: 0;
 			background: transparent;
@@ -550,6 +693,9 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			findReferences: 'Find References',
 			references: 'References',
 			noReferences: 'No references found.',
+			copy: 'Copy',
+			cut: 'Cut',
+			paste: 'Paste',
 		};
 
 		let editor;
@@ -559,7 +705,6 @@ export class ReviewWebviewManager implements vscode.Disposable {
 		let ready = false;
 		let dirty = false;
 		let applyingState = false;
-		let dirtyRanges = [];
 		let lineDecorations = [];
 		let zoneIds = [];
 		let hunkEntries = [];
@@ -575,6 +720,9 @@ export class ReviewWebviewManager implements vscode.Disposable {
 		let navigationHoverTimer;
 		let referencesZoneId;
 		let referencesAnchorPosition;
+		let clipboardRequestId = 0;
+		let lastStateSequence = 0;
+		const clipboardRequests = new Map();
 
 		const statusNode = document.getElementById('status');
 		const editorNode = document.getElementById('editor');
@@ -596,6 +744,11 @@ export class ReviewWebviewManager implements vscode.Disposable {
 
 		window.addEventListener('message', function (event) {
 			if (event.data.type === 'state') {
+				const sequence = Number(event.data.sequence) || 0;
+				if (sequence && sequence < lastStateSequence) {
+					return;
+				}
+				lastStateSequence = Math.max(lastStateSequence, sequence);
 				setState(event.data.file);
 				return;
 			}
@@ -605,6 +758,10 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			}
 			if (event.data.type === 'references') {
 				renderReferences(event.data);
+				return;
+			}
+			if (event.data.type === 'clipboardReadResult' || event.data.type === 'clipboardWriteResult') {
+				resolveClipboardRequest(event.data);
 			}
 		});
 
@@ -648,8 +805,32 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			});
 
 			editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveCurrent);
+			editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyC, function () { void copySelection(); });
+			editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyX, function () { void cutSelection(); });
+			editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, function () { void pasteSelection(); });
 			editor.addCommand(monaco.KeyCode.F12, function () { requestNavigation('goToDefinition'); });
 			editor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.F12, function () { requestNavigation('findReferences'); });
+			editor.addAction({
+				id: 'cli-diff-copy',
+				label: labels.copy,
+				contextMenuGroupId: '9_cutcopypaste',
+				contextMenuOrder: 1,
+				run: copySelection,
+			});
+			editor.addAction({
+				id: 'cli-diff-cut',
+				label: labels.cut,
+				contextMenuGroupId: '9_cutcopypaste',
+				contextMenuOrder: 2,
+				run: cutSelection,
+			});
+			editor.addAction({
+				id: 'cli-diff-paste',
+				label: labels.paste,
+				contextMenuGroupId: '9_cutcopypaste',
+				contextMenuOrder: 3,
+				run: pasteSelection,
+			});
 			editor.addAction({
 				id: 'cli-diff-go-to-definition',
 				label: 'Go to Definition',
@@ -743,6 +924,7 @@ export class ReviewWebviewManager implements vscode.Disposable {
 				hideReferences();
 			}
 			state = nextState;
+			dirty = Boolean(state.dirty);
 			pendingMutationKey = undefined;
 			if (!ready) {
 				return;
@@ -764,16 +946,13 @@ export class ReviewWebviewManager implements vscode.Disposable {
 				changeDisposable = model.onDidChangeContent(onModelChanged);
 			} else {
 				monaco.editor.setModelLanguage(model, state.languageId || 'plaintext');
-				if (!dirty && model.getValue() !== state.newText) {
+				if (model.getValue() !== state.newText) {
 					applyingState = true;
 					model.setValue(state.newText);
 					applyingState = false;
 				}
 			}
 
-			if (!dirty) {
-				dirtyRanges = [];
-			}
 			renderInlineDiff();
 			revealStatePosition();
 		}
@@ -783,12 +962,23 @@ export class ReviewWebviewManager implements vscode.Disposable {
 				return;
 			}
 			dirty = true;
-			for (const change of event.changes) {
-				const startLine = Math.max(0, change.range.startLineNumber - 1);
-				const insertedLines = countInsertedLines(change.text);
-				const endLine = Math.max(change.range.endLineNumber, startLine + insertedLines);
-				dirtyRanges.push({ startLine, endLine: Math.max(startLine + 1, endLine) });
-			}
+			vscode.postMessage({
+				type: 'applyTextEdits',
+				uri: state.uri,
+				edits: event.changes.map(function (change) {
+					return {
+						range: {
+							startLine: Math.max(0, change.range.startLineNumber - 1),
+							startColumn: Math.max(0, change.range.startColumn - 1),
+							endLine: Math.max(0, change.range.endLineNumber - 1),
+							endColumn: Math.max(0, change.range.endColumn - 1),
+						},
+						text: change.text,
+					};
+				}),
+				text: model.getValue(),
+			});
+			setMutationButtonsDisabled(true);
 			updateFooter();
 		}
 
@@ -1000,7 +1190,7 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			button.dataset.command = command;
 			button.dataset.hunkId = entry.id;
 			button.className = buttonClass(command);
-			button.disabled = Boolean((pendingMutationKey && isMutationCommand(command)) || (isNavigationCommand(command) && hunkEntries.length <= 1));
+			button.disabled = Boolean((isMutationCommand(command) && (dirty || pendingMutationKey)) || (isNavigationCommand(command) && hunkEntries.length <= 1));
 			return button;
 		}
 
@@ -1047,11 +1237,11 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			}
 			if (dirty) {
 				pendingMutationKey = undefined;
-				setMutationButtonsDisabled(false);
+				setMutationButtonsDisabled(true);
 				updateFooter();
 				return;
 			}
-			vscode.postMessage({ type: command, uri: state.uri, hunkId });
+			vscode.postMessage({ type: command, uri: state.uri, hunkId, revision: state.revision });
 		}
 
 		function renderReferences(message) {
@@ -1061,9 +1251,11 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			const targets = message.targets || [];
 			const anchor = referencesAnchorPosition || editor.getPosition() || { lineNumber: 1, column: 1 };
 			const placement = referencesPlacement(anchor);
-			const lineHeight = editor.getOption(monaco.editor.EditorOption.lineHeight) || 20;
 			const visibleRows = Math.min(Math.max(targets.length, 1), 8);
-			const heightInPx = Math.min(320, Math.max(118, 36 + (visibleRows * Math.max(24, lineHeight + 4))));
+			const headerHeight = 30;
+			const listVerticalPadding = 0;
+			const rowHeight = 26;
+			const heightInPx = Math.min(320, headerHeight + listVerticalPadding + (visibleRows * rowHeight) + 2);
 			const node = createReferencesZone(message, targets, placement);
 
 			editor.changeViewZones(function (accessor) {
@@ -1206,8 +1398,6 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			if (!target) {
 				return;
 			}
-			const wasDirty = dirty;
-			const ranges = wasDirty ? mergeRanges(dirtyRanges) : [];
 			if (type === 'findReferences' || type === 'smartNavigate') {
 				referencesAnchorPosition = target;
 			}
@@ -1216,19 +1406,11 @@ export class ReviewWebviewManager implements vscode.Disposable {
 				uri: state.uri,
 				line: Math.max(0, target.lineNumber - 1),
 				column: Math.max(0, target.column - 1),
-				dirty: wasDirty,
-				text: wasDirty ? model.getValue() : undefined,
-				ranges,
 			});
-			if (wasDirty) {
-				dirty = false;
-				dirtyRanges = [];
-				updateFooter();
-			}
 		}
 
 		function requestNavigationAction(position) {
-			if (!state || !model || dirty) {
+			if (!state || !model) {
 				return;
 			}
 			const target = position || editor?.getPosition();
@@ -1360,18 +1542,95 @@ export class ReviewWebviewManager implements vscode.Disposable {
 			return target.parentElement?.closest(selector);
 		}
 
+		function copySelection() {
+			if (!model || !editor) {
+				return Promise.resolve();
+			}
+			const text = selectedText();
+			if (!text) {
+				return Promise.resolve();
+			}
+			return writeClipboard(text);
+		}
+
+		async function cutSelection() {
+			if (!model || !editor) {
+				return;
+			}
+			const selections = editor.getSelections() || [];
+			if (selections.length === 0 || selections.every(function (selection) { return selection.isEmpty(); })) {
+				return;
+			}
+			await writeClipboard(selectedText());
+			editor.executeEdits('clipboard', selections.map(function (selection) {
+				return { range: selection, text: '', forceMoveMarkers: true };
+			}));
+			editor.pushUndoStop();
+		}
+
+		async function pasteSelection() {
+			if (!model || !editor) {
+				return;
+			}
+			const text = await readClipboard();
+			if (!text) {
+				return;
+			}
+			const selections = editor.getSelections() || [editor.getSelection()];
+			editor.executeEdits('clipboard', selections.filter(Boolean).map(function (selection) {
+				return { range: selection, text, forceMoveMarkers: true };
+			}));
+			editor.pushUndoStop();
+		}
+
+		function selectedText() {
+			if (!model || !editor) {
+				return '';
+			}
+			const selections = editor.getSelections() || [];
+			if (selections.length === 0 || selections.every(function (selection) { return selection.isEmpty(); })) {
+				return '';
+			}
+			return selections.map(function (selection) {
+				return model.getValueInRange(selection);
+			}).join(model.getEOL());
+		}
+
+		function readClipboard() {
+			return requestClipboard('clipboardRead').then(function (message) {
+				return message.text || '';
+			});
+		}
+
+		function writeClipboard(text) {
+			return requestClipboard('clipboardWrite', { text });
+		}
+
+		function requestClipboard(type, payload) {
+			const requestId = ++clipboardRequestId;
+			return new Promise(function (resolve) {
+				clipboardRequests.set(requestId, resolve);
+				vscode.postMessage(Object.assign({ type, requestId }, payload || {}));
+			});
+		}
+
+		function resolveClipboardRequest(message) {
+			const resolve = clipboardRequests.get(message.requestId);
+			if (!resolve) {
+				return;
+			}
+			clipboardRequests.delete(message.requestId);
+			resolve(message);
+		}
+
 		function saveCurrent() {
 			if (!state || !model) {
 				return;
 			}
 			vscode.postMessage({
-				type: 'saveEditedCurrent',
+				type: 'saveCurrentDocument',
 				uri: state.uri,
-				text: model.getValue(),
-				ranges: mergeRanges(dirtyRanges),
 			});
-			dirty = false;
-			dirtyRanges = [];
 			updateFooter();
 		}
 

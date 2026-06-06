@@ -25,6 +25,7 @@
     "onCommand:cli-diff.previousChange",
     "onCommand:cli-diff.openReviewView",
     "onCommand:cli-diff.refresh",
+    "onCustomEditor:cli-diff.reviewEditor",
     "onView:cli-diff.review"
   ],
   "main": "./dist/extension.js",
@@ -103,6 +104,18 @@
         }
       ]
     },
+    "customEditors": [
+      {
+        "viewType": "cli-diff.reviewEditor",
+        "displayName": "CLI Diff Review",
+        "selector": [
+          {
+            "filenamePattern": "**/*"
+          }
+        ],
+        "priority": "option"
+      }
+    ],
     "menus": {
       "view/item/context": [
         {
@@ -169,6 +182,12 @@
           "default": 5000,
           "minimum": 100,
           "description": "Maximum combined old and new line count diffed for one file."
+        },
+        "cliDiff.maxDiffCells": {
+          "type": "number",
+          "default": 4000000,
+          "minimum": 10000,
+          "description": "Maximum old-line by new-line comparison cells diffed for one file."
         },
         "cliDiff.autoStartGitReview": {
           "type": "boolean",

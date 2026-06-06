@@ -25,6 +25,8 @@ export interface ReviewedHunk extends ReviewHunk {
 	reviewSource: ReviewSource;
 	displayStart: number;
 	displayLines: number;
+	baselineStart: number;
+	currentStart: number;
 	reviewedAt: number;
 }
 
@@ -40,6 +42,7 @@ export interface ReviewFileState {
 	originalExists: boolean;
 	baselineExists: boolean;
 	currentExists: boolean;
+	revision: number;
 	skippedReason?: string;
 }
 
@@ -65,6 +68,7 @@ export interface FilePair {
 	newText: string;
 	baselineExists: boolean;
 	currentExists: boolean;
+	skippedReason?: string;
 }
 
 export function uriKey(uri: vscode.Uri): string {

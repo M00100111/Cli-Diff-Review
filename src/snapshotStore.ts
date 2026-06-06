@@ -19,6 +19,7 @@ interface SnapshotFileManifest {
 	relativePath: string;
 	storageName: string;
 	size: number;
+	exists?: boolean;
 }
 
 export class SnapshotStore {
@@ -68,6 +69,7 @@ export class SnapshotStore {
 					relativePath: relativePath(folder.uri, uri),
 					storageName,
 					size: data.length,
+					exists: true,
 				});
 				captured += 1;
 			}
@@ -85,12 +87,15 @@ export class SnapshotStore {
 
 		for (const root of manifest.roots) {
 			for (const file of root.files) {
-				const text = decodeUtf8(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(this.fileDirectory, file.storageName)));
+				const exists = file.exists !== false;
+				const text = exists
+					? decodeUtf8(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(this.fileDirectory, file.storageName)))
+					: '';
 				files.push({
 					uri: vscode.Uri.parse(file.uri),
 					relativePath: file.relativePath,
 					text,
-					exists: true,
+					exists,
 				});
 			}
 		}
@@ -98,7 +103,7 @@ export class SnapshotStore {
 		return files;
 	}
 
-	public async updateBaselineFile(uri: vscode.Uri, text: string): Promise<void> {
+	public async updateBaselineFile(uri: vscode.Uri, text: string, exists = true): Promise<void> {
 		const manifest = await this.readManifest();
 		const uriString = uriKey(uri);
 		let target: SnapshotFileManifest | undefined;
@@ -132,8 +137,18 @@ export class SnapshotStore {
 		}
 
 		target.size = Buffer.byteLength(text, 'utf8');
+		target.exists = exists;
 		await vscode.workspace.fs.createDirectory(this.fileDirectory);
-		await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(this.fileDirectory, target.storageName), encodeUtf8(text));
+		const targetUri = vscode.Uri.joinPath(this.fileDirectory, target.storageName);
+		if (exists) {
+			await vscode.workspace.fs.writeFile(targetUri, encodeUtf8(text));
+		} else {
+			try {
+				await vscode.workspace.fs.delete(targetUri);
+			} catch {
+				// Missing snapshot payloads are fine for deleted baselines.
+			}
+		}
 		await vscode.workspace.fs.writeFile(this.manifestUri, encodeUtf8(JSON.stringify(manifest, null, 2)));
 	}
 
