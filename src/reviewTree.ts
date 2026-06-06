@@ -12,12 +12,18 @@ export class ReviewTreeProvider implements vscode.TreeDataProvider<ReviewFileSta
 		const pending = element.hunks.length;
 		const reviewed = element.acceptedHunks.length + element.rejectedHunks.length;
 		item.resourceUri = element.uri;
-		item.description = pending > 0 && reviewed > 0
-			? `${pending} pending, ${reviewed} reviewed`
-			: pending > 0 ? `${pending} pending` : `${reviewed} reviewed`;
-		item.contextValue = pending > 0 && reviewed > 0
+		if (element.skippedReason) {
+			item.description = 'skipped';
+			item.tooltip = `${element.relativePath}\n${element.skippedReason}`;
+			item.contextValue = 'cliDiffFileSkipped';
+		} else {
+			item.description = pending > 0 && reviewed > 0
+				? `${pending} pending, ${reviewed} reviewed`
+				: pending > 0 ? `${pending} pending` : `${reviewed} reviewed`;
+			item.contextValue = pending > 0 && reviewed > 0
 			? 'cliDiffFilePendingReviewed'
 			: pending > 0 ? 'cliDiffFilePending' : reviewed > 0 ? 'cliDiffFileReviewed' : 'cliDiffFile';
+		}
 		item.command = {
 			command: 'cli-diff.openReviewView',
 			title: 'Open Review',
@@ -33,7 +39,7 @@ export class ReviewTreeProvider implements vscode.TreeDataProvider<ReviewFileSta
 		}
 
 		return [...session.files.values()]
-			.filter((file) => file.hunks.length > 0 || file.acceptedHunks.length > 0 || file.rejectedHunks.length > 0)
+			.filter((file) => file.hunks.length > 0 || file.acceptedHunks.length > 0 || file.rejectedHunks.length > 0 || file.skippedReason)
 			.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
 	}
 

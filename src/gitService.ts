@@ -8,11 +8,9 @@ import { decodeUtf8, isProbablyBinary, uriFromRelativePath } from './text';
 export class GitService {
 	public async createFilePairs(root: vscode.WorkspaceFolder): Promise<FilePair[]> {
 		await this.git(root, ['rev-parse', '--show-toplevel']);
-		const hasHead = await this.hasHead(root);
-		const tracked = hasHead
-			? await this.gitLines(root, ['diff', '--name-only', '--relative', 'HEAD', '--'])
-			: await this.gitLines(root, ['ls-files', '--cached']);
+		const tracked = await this.gitLines(root, ['diff', '--name-only', '--relative', '--']);
 		const untracked = await this.gitLines(root, ['ls-files', '--others', '--exclude-standard']);
+		const untrackedPaths = new Set(untracked.map((relativePath) => normalizeReviewPath(relativePath)));
 		const paths = [...new Set([...tracked, ...untracked])]
 			.map((relativePath) => normalizeReviewPath(relativePath))
 			.filter((relativePath) => relativePath.length > 0 && !shouldSkipReviewPath(relativePath));
@@ -25,16 +23,16 @@ export class GitService {
 			}
 
 			const uri = uriFromRelativePath(root.uri, relativePath);
-			const head = hasHead && !untracked.includes(relativePath)
-				? await this.readHeadText(root, relativePath)
+			const baseline = !untrackedPaths.has(relativePath)
+				? await this.readIndexText(root, relativePath)
 				: { exists: false, text: '' };
 			const current = await readCurrentText(uri);
 			pairs.push({
 				uri,
 				relativePath,
-				oldText: head.text,
+				oldText: baseline.text,
 				newText: current.text,
-				baselineExists: head.exists,
+				baselineExists: baseline.exists,
 				currentExists: current.exists,
 			});
 		}
@@ -53,22 +51,31 @@ export class GitService {
 			return undefined;
 		}
 
-		const hasHead = await this.hasHeadPath(rootPath);
-		const head = hasHead ? await this.readHeadTextPath(rootPath, relativePath) : { exists: false, text: '' };
+		const baseline = await this.readIndexTextPath(rootPath, relativePath);
 		const current = await readCurrentText(uri, { preferDisk: options.preferDisk });
 
-		if (!head.exists && !current.exists) {
+		if (!baseline.exists && !current.exists) {
 			return undefined;
 		}
 
 		return {
 			uri,
 			relativePath,
-			oldText: head.text,
+			oldText: baseline.text,
 			newText: current.text,
-			baselineExists: head.exists,
+			baselineExists: baseline.exists,
 			currentExists: current.exists,
 		};
+	}
+
+	public async indexStateSignature(root: vscode.WorkspaceFolder): Promise<string> {
+		return this.indexStateSignaturePath(root.uri.fsPath);
+	}
+
+	private async indexStateSignaturePath(rootPath: string): Promise<string> {
+		const head = await this.headOidPath(rootPath);
+		const index = await this.gitInPath(rootPath, ['ls-files', '-s']);
+		return `${head}\0${index}`;
 	}
 
 	private async findGitRoot(uri: vscode.Uri): Promise<string | undefined> {
@@ -79,26 +86,21 @@ export class GitService {
 		}
 	}
 
-	private async hasHead(root: vscode.WorkspaceFolder): Promise<boolean> {
-		return this.hasHeadPath(root.uri.fsPath);
-	}
-
-	private async hasHeadPath(rootPath: string): Promise<boolean> {
+	private async headOidPath(rootPath: string): Promise<string> {
 		try {
-			await this.gitInPath(rootPath, ['rev-parse', '--verify', 'HEAD']);
-			return true;
+			return (await this.gitInPath(rootPath, ['rev-parse', '--verify', 'HEAD'])).trim();
 		} catch {
-			return false;
+			return '';
 		}
 	}
 
-	private async readHeadText(root: vscode.WorkspaceFolder, relativePath: string): Promise<{ exists: boolean; text: string }> {
-		return this.readHeadTextPath(root.uri.fsPath, relativePath);
+	private async readIndexText(root: vscode.WorkspaceFolder, relativePath: string): Promise<{ exists: boolean; text: string }> {
+		return this.readIndexTextPath(root.uri.fsPath, relativePath);
 	}
 
-	private async readHeadTextPath(rootPath: string, relativePath: string): Promise<{ exists: boolean; text: string }> {
+	private async readIndexTextPath(rootPath: string, relativePath: string): Promise<{ exists: boolean; text: string }> {
 		try {
-			return { exists: true, text: await this.gitInPath(rootPath, ['show', `HEAD:${relativePath}`]) };
+			return { exists: true, text: await this.gitInPath(rootPath, ['show', `:${relativePath}`]) };
 		} catch {
 			return { exists: false, text: '' };
 		}

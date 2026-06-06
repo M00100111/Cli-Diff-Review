@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import { ReviewHunk } from './types';
 import { replaceLineBlock, splitLines } from './text';
+import { captureLineBlockContext } from './reviewState';
 
 type DiffOpKind = 'equal' | 'delete' | 'insert';
 
@@ -19,7 +20,7 @@ export function computeLineDiff(fileUri: string, oldText: string, newText: strin
 	const oldLines = splitLines(oldText);
 	const newLines = splitLines(newText);
 	const ops = buildDiffOps(oldLines, newLines);
-	return buildHunks(fileUri, ops);
+	return buildHunks(fileUri, ops, oldLines, newLines);
 }
 
 export function acceptHunkInBaseline(oldText: string, hunk: ReviewHunk): string {
@@ -62,7 +63,7 @@ function buildDiffOps(oldLines: string[], newLines: string[]): DiffOp[] {
 	return ops;
 }
 
-function buildHunks(fileUri: string, ops: DiffOp[]): ReviewHunk[] {
+function buildHunks(fileUri: string, ops: DiffOp[], oldFileLines: string[], newFileLines: string[]): ReviewHunk[] {
 	const hunks: ReviewHunk[] = [];
 	let oldCursor = 0;
 	let newCursor = 0;
@@ -85,6 +86,8 @@ function buildHunks(fileUri: string, ops: DiffOp[]): ReviewHunk[] {
 		const newText = pending.newParts.join('');
 		const kind = pending.oldLines === 0 ? 'add' : pending.newLines === 0 ? 'delete' : 'modify';
 		const fingerprint = hash(`${fileUri}\0${pending.oldStart}\0${pending.newStart}\0${oldText}\0${newText}`);
+		const oldContext = captureLineBlockContext(oldFileLines, pending.oldStart, pending.oldLines);
+		const newContext = captureLineBlockContext(newFileLines, pending.newStart, pending.newLines);
 		hunks.push({
 			id: `${fingerprint}-${pending.oldStart}-${pending.newStart}`,
 			fileUri,
@@ -95,6 +98,11 @@ function buildHunks(fileUri: string, ops: DiffOp[]): ReviewHunk[] {
 			oldText,
 			newText,
 			kind,
+			oldContextBefore: oldContext.before,
+			oldContextAfter: oldContext.after,
+			newContextBefore: newContext.before,
+			newContextAfter: newContext.after,
+			zoneAfterLineNumber: pending.newStart,
 		});
 		pending = undefined;
 	};

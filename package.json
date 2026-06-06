@@ -167,7 +167,7 @@
       "properties": {
         "cliDiff.maxFileBytes": {
           "type": "number",
-          "default": 524288,
+          "default": 2097152,
           "minimum": 1024,
           "description": "Maximum file size, in bytes, included in CLI Diff baselines and reviews."
         },
@@ -179,13 +179,13 @@
         },
         "cliDiff.maxDiffLines": {
           "type": "number",
-          "default": 5000,
+          "default": 12000,
           "minimum": 100,
           "description": "Maximum combined old and new line count diffed for one file."
         },
         "cliDiff.maxDiffCells": {
           "type": "number",
-          "default": 4000000,
+          "default": 16000000,
           "minimum": 10000,
           "description": "Maximum old-line by new-line comparison cells diffed for one file."
         },

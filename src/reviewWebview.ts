@@ -1001,7 +1001,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 					const node = createZoneNode(entry, lineHeight);
 					const heightInPx = 38 + (entry.oldLinesToShow.length * lineHeight);
 					zoneIds.push(accessor.addZone({
-						afterLineNumber: Math.max(0, entry.displayStart),
+						afterLineNumber: Math.max(0, entry.zoneAfterLineNumber),
 						heightInPx,
 						domNode: node,
 					}));
@@ -1074,6 +1074,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 					newLines: hunk.newLines,
 					displayStart: hunk.newStart,
 					displayLines: hunk.newLines,
+					zoneAfterLineNumber: hunk.zoneAfterLineNumber,
 					oldLinesToShow,
 					state: 'pending',
 					decided: false,
@@ -1089,6 +1090,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 					newLines: hunk.newLines,
 					displayStart: hunk.displayStart,
 					displayLines: hunk.displayLines,
+					zoneAfterLineNumber: hunk.zoneAfterLineNumber,
 					oldLinesToShow: [],
 					state: hunk.status || 'accepted',
 					decided: true,
@@ -1103,6 +1105,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 					newLines: hunk.newLines,
 					displayStart: hunk.displayStart,
 					displayLines: hunk.displayLines,
+					zoneAfterLineNumber: hunk.zoneAfterLineNumber,
 					oldLinesToShow: [],
 					state: 'rejected',
 					decided: true,
@@ -1111,10 +1114,10 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 			});
 
 			return pending.concat(accepted, rejected).sort(function (left, right) {
-				if (left.displayStart === right.displayStart) {
+				if (left.zoneAfterLineNumber === right.zoneAfterLineNumber) {
 					return Number(left.decided) - Number(right.decided);
 				}
-				return left.displayStart - right.displayStart;
+				return left.zoneAfterLineNumber - right.zoneAfterLineNumber;
 			});
 		}
 

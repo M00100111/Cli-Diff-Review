@@ -12,7 +12,16 @@ import {
 	ReviewWebviewManager,
 } from './reviewWebview';
 import { gitIgnoredReviewPaths, shouldSkipReviewPath } from './reviewFileFilter';
-import { CurrentTextState, isStaleRevision, mapLineAfterLineEdits, SerialOperationQueue, shouldDeleteRejectedCurrentFileOnRefresh, skippedCurrentFile } from './reviewState';
+import {
+	captureLineBlockContext,
+	CurrentTextState,
+	isStaleRevision,
+	lineBlockWithContextMatchesUniquely,
+	mapLineAfterLineEdits,
+	SerialOperationQueue,
+	shouldDeleteRejectedCurrentFileOnRefresh,
+	skippedCurrentFile,
+} from './reviewState';
 import { SnapshotStore } from './snapshotStore';
 import { decodeUtf8, encodeUtf8, isProbablyBinary, lineRange, relativePath, replaceLineBlock, splitLines } from './text';
 import { FilePair, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewSession, ReviewSource, uriKey } from './types';
@@ -36,6 +45,8 @@ export class ReviewController implements vscode.Disposable {
 	private readonly internalWriteDepth = new Map<string, number>();
 	private readonly writeGraceUntil = new Map<string, { source: InternalWriteSource; until: number }>();
 	private readonly fileOperationQueue = new SerialOperationQueue<string>();
+	private gitRefreshTimer: NodeJS.Timeout | undefined;
+	private gitIndexStateSignature: string | undefined;
 	private activeSession: ReviewSession | undefined;
 
 	public constructor(private readonly context: vscode.ExtensionContext) {
@@ -68,6 +79,8 @@ export class ReviewController implements vscode.Disposable {
 			}),
 			vscode.workspace.onDidChangeTextDocument((event) => this.handleChangedDocument(event)),
 			this.createFileWatcher(),
+			this.createGitMetadataWatcher(),
+			this.createGitExtensionStateWatcher(),
 			this.registerCommand('cli-diff.captureBaseline', () => this.captureBaseline()),
 			this.registerCommand('cli-diff.startSnapshotReview', () => this.startSnapshotReview()),
 			this.registerCommand('cli-diff.startGitReview', () => this.startGitReview()),
@@ -89,6 +102,10 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	public dispose(): void {
+		if (this.gitRefreshTimer) {
+			clearTimeout(this.gitRefreshTimer);
+			this.gitRefreshTimer = undefined;
+		}
 		for (const timer of this.refreshTimers.values()) {
 			clearTimeout(timer);
 		}
@@ -259,6 +276,11 @@ export class ReviewController implements vscode.Disposable {
 			createdAt: Date.now(),
 			files,
 		};
+		if (mode === 'git') {
+			await this.updateGitIndexStateSignature();
+		} else {
+			this.gitIndexStateSignature = undefined;
+		}
 
 		await vscode.commands.executeCommand('setContext', 'cliDiff:hasSession', true);
 		this.refreshUi();
@@ -353,6 +375,7 @@ export class ReviewController implements vscode.Disposable {
 			createdAt: Date.now(),
 			files: new Map<string, ReviewFileState>(),
 		};
+		await this.updateGitIndexStateSignature();
 		await vscode.commands.executeCommand('setContext', 'cliDiff:hasSession', true);
 	}
 
@@ -384,12 +407,17 @@ export class ReviewController implements vscode.Disposable {
 			if (!this.ensureFileCleanForReviewMutation(target.file)) {
 				return;
 			}
-			if (!this.lineBlockMatches(target.file.oldText, target.hunk.oldStart, target.hunk.oldLines, target.hunk.oldText)) {
+			if (!this.originalHunkSideMatches(target.file.oldText, target.hunk, 'old', target.hunk.oldStart)) {
 				await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 				return;
 			}
 
 			target.file.oldText = acceptHunkInBaseline(target.file.oldText, target.hunk);
+			this.mapAcceptedDecisionBaselineStarts(target.file, {
+				oldStart: target.hunk.oldStart,
+				oldLines: target.hunk.oldLines,
+				newLines: target.hunk.newLines,
+			});
 			this.recordDecisionHunk(target.file, target.hunk, 'accept', target.hunk.newStart, target.hunk.newLines, target.hunk.oldStart, target.hunk.newStart);
 			this.syncBaselineExistsAfterAccept(target.file);
 			this.touchFileRevision(target.file);
@@ -432,18 +460,26 @@ export class ReviewController implements vscode.Disposable {
 			}
 			if (!target.file.currentExists) {
 				await this.withInternalWrite(target.file.uri, 'plugin', () => this.writeFileText(target.file.uri, target.file.oldText));
-				this.recordDecisionHunk(target.file, target.hunk, 'reject', target.hunk.newStart, target.hunk.oldLines, target.hunk.oldStart, target.hunk.newStart);
+				target.file.newText = target.file.oldText;
+				target.file.currentExists = true;
+				this.mapRejectedDecisionCurrentStarts(target.file, {
+					oldStart: target.hunk.newStart,
+					oldLines: target.hunk.newLines,
+					newLines: target.hunk.oldLines,
+				});
+				this.recordDecisionHunk(target.file, target.hunk, 'reject', target.hunk.oldStart, target.hunk.oldLines, target.hunk.oldStart, target.hunk.oldStart);
 				this.touchFileRevision(target.file);
 				await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 				return;
 			}
 
 			const document = await vscode.workspace.openTextDocument(target.file.uri);
-			if (!this.lineBlockMatches(document.getText(), target.hunk.newStart, target.hunk.newLines, target.hunk.newText)) {
+			if (!this.originalHunkSideMatches(document.getText(), target.hunk, 'new', target.hunk.newStart)) {
 				await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 				return;
 			}
 
+			const rejectedText = replaceLineBlock(document.getText(), target.hunk.newStart, target.hunk.newLines, target.hunk.oldText);
 			const wasDirty = document.isDirty;
 			await this.withInternalWrite(target.file.uri, 'plugin', async () => {
 				const edit = new vscode.WorkspaceEdit();
@@ -456,6 +492,13 @@ export class ReviewController implements vscode.Disposable {
 				if (!wasDirty) {
 					await document.save();
 				}
+			});
+			target.file.newText = rejectedText;
+			target.file.currentExists = true;
+			this.mapRejectedDecisionCurrentStarts(target.file, {
+				oldStart: target.hunk.newStart,
+				oldLines: target.hunk.newLines,
+				newLines: target.hunk.oldLines,
 			});
 			this.recordDecisionHunk(target.file, target.hunk, 'reject', target.hunk.newStart, target.hunk.oldLines, target.hunk.oldStart, target.hunk.newStart);
 			this.touchFileRevision(target.file);
@@ -492,12 +535,17 @@ export class ReviewController implements vscode.Disposable {
 
 			if (target.list === 'accepted') {
 				const baselineStart = target.hunk.baselineStart;
-				if (!this.lineBlockMatches(target.file.oldText, baselineStart, target.hunk.newLines, target.hunk.newText)) {
+				if (!this.reviewedBaselineSideMatches(target.file.oldText, target.hunk, baselineStart, target.hunk.newLines, target.hunk.newText)) {
 					await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 					return;
 				}
 				target.file.oldText = replaceLineBlock(target.file.oldText, baselineStart, target.hunk.newLines, target.hunk.oldText);
 				target.file.acceptedHunks = target.file.acceptedHunks.filter((item) => item.id !== target.hunk.id);
+				this.mapAcceptedDecisionBaselineStarts(target.file, {
+					oldStart: baselineStart,
+					oldLines: target.hunk.newLines,
+					newLines: target.hunk.oldLines,
+				});
 				this.syncBaselineExistsForPending(target.file);
 				if (this.activeSession?.mode === 'snapshot') {
 					await this.updateSnapshotBaselineFile(target.file);
@@ -505,7 +553,7 @@ export class ReviewController implements vscode.Disposable {
 			} else {
 				const current = await this.readCurrentText(target.file.uri);
 				const currentStart = target.hunk.currentStart;
-				if (!this.lineBlockMatches(current.text, currentStart, target.hunk.displayLines, target.hunk.oldText)) {
+				if (!this.reviewedCurrentSideMatches(current.text, target.hunk, currentStart, target.hunk.displayLines, target.hunk.oldText)) {
 					await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 					return;
 				}
@@ -514,6 +562,11 @@ export class ReviewController implements vscode.Disposable {
 				target.file.newText = currentText;
 				target.file.currentExists = true;
 				target.file.rejectedHunks = target.file.rejectedHunks.filter((item) => item.id !== target.hunk.id);
+				this.mapRejectedDecisionCurrentStarts(target.file, {
+					oldStart: currentStart,
+					oldLines: target.hunk.displayLines,
+					newLines: target.hunk.newLines,
+				});
 			}
 
 			this.touchFileRevision(target.file);
@@ -541,11 +594,16 @@ export class ReviewController implements vscode.Disposable {
 			const current = await this.readCurrentText(file.uri);
 			file.newText = current.text;
 			file.currentExists = current.exists;
-			for (const hunk of file.hunks) {
-				this.recordDecisionHunk(file, hunk, 'accept', hunk.newStart, hunk.newLines, hunk.newStart, hunk.newStart);
+			const pendingHunks = [...file.hunks];
+			if (pendingHunks.some((hunk) => !this.originalHunkSideMatches(file.oldText, hunk, 'old', hunk.oldStart))) {
+				await this.refreshFile(file.uri, { reconcileExternalChanges: false });
+				return;
 			}
 			file.oldText = file.newText;
 			file.baselineExists = file.currentExists;
+			for (const hunk of pendingHunks) {
+				this.recordDecisionHunk(file, hunk, 'accept', hunk.newStart, hunk.newLines, hunk.newStart, hunk.newStart);
+			}
 			this.touchFileRevision(file);
 			if (this.activeSession?.mode === 'snapshot') {
 				await this.updateSnapshotBaselineFile(file);
@@ -579,6 +637,10 @@ export class ReviewController implements vscode.Disposable {
 			}
 
 			let currentText = refreshedFile.newText;
+			if (pendingHunks.some((hunk) => !this.originalHunkSideMatches(currentText, hunk, 'new', hunk.newStart))) {
+				await this.refreshFile(refreshedFile.uri, { reconcileExternalChanges: false });
+				return;
+			}
 			for (const hunk of [...pendingHunks].sort((left, right) => right.newStart - left.newStart)) {
 				currentText = replaceLineBlock(currentText, hunk.newStart, hunk.newLines, hunk.oldText);
 			}
@@ -695,7 +757,7 @@ export class ReviewController implements vscode.Disposable {
 			baselineText = replaceLineBlock(baselineText, baselineStart, manualHunk.oldLines, manualHunk.newText);
 		}
 
-		this.syncDecisionHunksAfterEdit(file, manualHunks, editedText, baselineManualHunks);
+		this.syncDecisionHunksAfterEdit(file, manualHunks, editedText, baselineManualHunks, baselineText);
 		file.oldText = baselineText;
 		file.newText = editedText;
 		file.currentExists = true;
@@ -1044,19 +1106,21 @@ export class ReviewController implements vscode.Disposable {
 		}
 
 		const files = [...this.activeSession.files.values()];
+		if (this.activeSession.mode === 'git') {
+			for (const file of files) {
+				await this.deleteRejectedCurrentFileOnRefresh(file);
+			}
+			await this.refreshGitSessionFiles();
+			return;
+		}
+
 		for (const file of files) {
 			await this.deleteRejectedCurrentFileOnRefresh(file);
 			file.acceptedHunks = [];
 			file.rejectedHunks = [];
 			this.touchFileRevision(file);
-			if (this.activeSession.mode === 'snapshot') {
-				await this.updateSnapshotBaselineFile(file);
-			}
+			await this.updateSnapshotBaselineFile(file);
 			await this.refreshFile(file.uri, { reconcileExternalChanges: false, preferDisk: true });
-		}
-
-		if (this.activeSession.mode === 'git') {
-			await this.refreshGitSessionFiles();
 		}
 	}
 
@@ -1075,29 +1139,32 @@ export class ReviewController implements vscode.Disposable {
 		file.currentExists = false;
 	}
 
-	private async refreshGitSessionFiles(): Promise<void> {
+	private async refreshGitSessionFiles(indexStateSignature?: string): Promise<void> {
 		if (!this.activeSession || this.activeSession.mode !== 'git') {
 			return;
 		}
 
-		const folder = vscode.workspace.getWorkspaceFolder(this.activeSession.rootUri)
-			?? vscode.workspace.workspaceFolders?.find((workspaceFolder) => uriKey(workspaceFolder.uri) === uriKey(this.activeSession?.rootUri ?? workspaceFolder.uri));
+		const folder = this.activeGitWorkspaceFolder();
 		if (!folder) {
 			return;
 		}
 
+		const previousFiles = this.activeSession.files;
 		const pairs = await this.gitService.createFilePairs(folder);
+		const nextFiles = new Map<string, ReviewFileState>();
 		for (const pair of pairs) {
 			const key = uriKey(pair.uri);
-			if (this.activeSession.files.has(key)) {
-				continue;
-			}
-
 			const file = this.createFileState(pair);
 			if (file.hunks.length > 0 || file.skippedReason) {
-				this.activeSession.files.set(key, file);
+				const previous = previousFiles.get(key);
+				if (previous) {
+					file.revision = previous.revision + 1;
+				}
+				nextFiles.set(key, file);
 			}
 		}
+		this.activeSession.files = nextFiles;
+		this.gitIndexStateSignature = indexStateSignature ?? await this.gitService.indexStateSignature(folder);
 		this.refreshUi();
 	}
 
@@ -1147,7 +1214,7 @@ export class ReviewController implements vscode.Disposable {
 		const diff = this.computeReviewHunks(file.uri, file.oldText, file.newText);
 		file.hunks = diff.hunks;
 		file.skippedReason = diff.skippedReason;
-		if (file.hunks.length === 0 && this.decisionHunks(file).length === 0 && !file.skippedReason && this.activeSession.mode !== 'git') {
+		if (file.hunks.length === 0 && this.decisionHunks(file).length === 0 && !file.skippedReason) {
 			this.activeSession.files.delete(key);
 		}
 		if (previousState !== this.fileStateFingerprint(file)) {
@@ -1158,9 +1225,9 @@ export class ReviewController implements vscode.Disposable {
 
 	private computeReviewHunks(uri: vscode.Uri, oldText: string, newText: string): { hunks: ReviewHunk[]; skippedReason?: string } {
 		const config = vscode.workspace.getConfiguration('cliDiff');
-		const maxFileBytes = config.get<number>('maxFileBytes', 524288);
-		const maxDiffLines = config.get<number>('maxDiffLines', 5000);
-		const maxDiffCells = config.get<number>('maxDiffCells', 4000000);
+		const maxFileBytes = config.get<number>('maxFileBytes', 2097152);
+		const maxDiffLines = config.get<number>('maxDiffLines', 12000);
+		const maxDiffCells = config.get<number>('maxDiffCells', 16000000);
 		if (Buffer.byteLength(oldText, 'utf8') > maxFileBytes || Buffer.byteLength(newText, 'utf8') > maxFileBytes) {
 			return { hunks: [], skippedReason: 'File exceeds cliDiff.maxFileBytes.' };
 		}
@@ -1190,6 +1257,66 @@ export class ReviewController implements vscode.Disposable {
 	private refreshUi(): void {
 		this.treeProvider.refresh();
 		this.reviewWebview.refresh();
+	}
+
+	private activeGitWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
+		if (!this.activeSession || this.activeSession.mode !== 'git') {
+			return undefined;
+		}
+
+		return vscode.workspace.getWorkspaceFolder(this.activeSession.rootUri)
+			?? vscode.workspace.workspaceFolders?.find((workspaceFolder) => uriKey(workspaceFolder.uri) === uriKey(this.activeSession?.rootUri ?? workspaceFolder.uri));
+	}
+
+	private async updateGitIndexStateSignature(): Promise<void> {
+		const folder = this.activeGitWorkspaceFolder();
+		if (!folder) {
+			this.gitIndexStateSignature = undefined;
+			return;
+		}
+
+		try {
+			this.gitIndexStateSignature = await this.gitService.indexStateSignature(folder);
+		} catch {
+			this.gitIndexStateSignature = undefined;
+		}
+	}
+
+	private scheduleGitSessionRefresh(): void {
+		if (!this.activeSession || this.activeSession.mode !== 'git') {
+			return;
+		}
+
+		if (this.gitRefreshTimer) {
+			clearTimeout(this.gitRefreshTimer);
+		}
+
+		this.gitRefreshTimer = setTimeout(() => {
+			this.gitRefreshTimer = undefined;
+			void this.refreshGitSessionIfIndexChanged();
+		}, 250);
+	}
+
+	private async refreshGitSessionIfIndexChanged(): Promise<void> {
+		if (!this.activeSession || this.activeSession.mode !== 'git') {
+			return;
+		}
+
+		const folder = this.activeGitWorkspaceFolder();
+		if (!folder) {
+			return;
+		}
+
+		try {
+			const signature = await this.gitService.indexStateSignature(folder);
+			if (signature === this.gitIndexStateSignature) {
+				return;
+			}
+
+			await this.refreshGitSessionFiles(signature);
+		} catch {
+			// Git may be unavailable briefly while the repository is changing.
+		}
 	}
 
 	private touchFileRevision(file: ReviewFileState): void {
@@ -1377,6 +1504,7 @@ export class ReviewController implements vscode.Disposable {
 				createdAt: Date.now(),
 				files: new Map<string, ReviewFileState>(),
 			};
+			await this.updateGitIndexStateSignature();
 			await vscode.commands.executeCommand('setContext', 'cliDiff:hasSession', true);
 		}
 
@@ -1488,7 +1616,7 @@ export class ReviewController implements vscode.Disposable {
 		baselineStart = hunk.oldStart,
 		currentStart = displayStart,
 	): void {
-		const decision = this.createDecisionHunk(hunk, reviewSource, displayStart, displayLines, baselineStart, currentStart);
+		const decision = this.createDecisionHunk(file, hunk, reviewSource, displayStart, displayLines, baselineStart, currentStart);
 		if (reviewSource === 'reject') {
 			if (file.rejectedHunks.some((item) => this.isSameDecision(item, hunk, reviewSource))) {
 				return;
@@ -1515,6 +1643,7 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private createDecisionHunk(
+		file: ReviewFileState,
 		hunk: ReviewHunk,
 		reviewSource: ReviewSource,
 		displayStart: number,
@@ -1522,6 +1651,10 @@ export class ReviewController implements vscode.Disposable {
 		baselineStart: number,
 		currentStart: number,
 	): ReviewedHunk {
+		const baselineLines = reviewSource === 'accept' ? hunk.newLines : hunk.oldLines;
+		const currentLines = reviewSource === 'reject' ? displayLines : hunk.newLines;
+		const baselineContext = captureLineBlockContext(file.oldText, baselineStart, baselineLines);
+		const currentContext = captureLineBlockContext(file.newText, currentStart, currentLines);
 		return {
 			...hunk,
 			id: `${reviewSource}-${Date.now()}-${hunk.id}`,
@@ -1531,6 +1664,11 @@ export class ReviewController implements vscode.Disposable {
 			displayLines,
 			baselineStart,
 			currentStart,
+			baselineContextBefore: baselineContext.before,
+			baselineContextAfter: baselineContext.after,
+			currentContextBefore: currentContext.before,
+			currentContextAfter: currentContext.after,
+			zoneAfterLineNumber: displayStart,
 			reviewedAt: Date.now(),
 		};
 	}
@@ -1604,20 +1742,24 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 
-		let baselineText = file.oldText;
 		for (const hunk of accepted) {
-			if (!this.lineBlockMatches(baselineText, hunk.baselineStart, hunk.newLines, hunk.newText)) {
+			if (!this.reviewedBaselineSideMatches(file.oldText, hunk, hunk.baselineStart, hunk.newLines, hunk.newText)) {
 				throw new Error('A reviewed CLI Diff change no longer matches the baseline. Refresh the review and try again.');
 			}
+		}
+		let baselineText = file.oldText;
+		for (const hunk of accepted) {
 			baselineText = replaceLineBlock(baselineText, hunk.baselineStart, hunk.newLines, hunk.oldText);
 		}
 
 		const current = await this.readCurrentText(file.uri);
-		let currentText = current.text;
 		for (const hunk of rejected) {
-			if (!this.lineBlockMatches(currentText, hunk.currentStart, hunk.displayLines, hunk.oldText)) {
+			if (!this.reviewedCurrentSideMatches(current.text, hunk, hunk.currentStart, hunk.displayLines, hunk.oldText)) {
 				throw new Error('A reviewed CLI Diff change no longer matches the current file. Refresh the review and try again.');
 			}
+		}
+		let currentText = current.text;
+		for (const hunk of rejected) {
 			currentText = replaceLineBlock(currentText, hunk.currentStart, hunk.displayLines, hunk.newText);
 		}
 
@@ -1633,16 +1775,28 @@ export class ReviewController implements vscode.Disposable {
 		}
 	}
 
-	private syncDecisionHunksAfterEdit(file: ReviewFileState, manualHunks: ReviewHunk[], editedText: string, baselineManualHunks: ReviewHunk[]): void {
+	private syncDecisionHunksAfterEdit(
+		file: ReviewFileState,
+		manualHunks: ReviewHunk[],
+		editedText: string,
+		baselineManualHunks: ReviewHunk[],
+		baselineText: string,
+	): void {
 		if (manualHunks.length === 0) {
 			return;
 		}
 
-		file.acceptedHunks = file.acceptedHunks.map((hunk) => this.syncDecisionHunkAfterEdit(hunk, manualHunks, baselineManualHunks, editedText));
-		file.rejectedHunks = file.rejectedHunks.map((hunk) => this.syncDecisionHunkAfterEdit(hunk, manualHunks, baselineManualHunks, editedText));
+		file.acceptedHunks = file.acceptedHunks.map((hunk) => this.syncDecisionHunkAfterEdit(hunk, manualHunks, baselineManualHunks, editedText, baselineText));
+		file.rejectedHunks = file.rejectedHunks.map((hunk) => this.syncDecisionHunkAfterEdit(hunk, manualHunks, baselineManualHunks, editedText, baselineText));
 	}
 
-	private syncDecisionHunkAfterEdit(hunk: ReviewedHunk, manualHunks: ReviewHunk[], baselineManualHunks: ReviewHunk[], editedText: string): ReviewedHunk {
+	private syncDecisionHunkAfterEdit(
+		hunk: ReviewedHunk,
+		manualHunks: ReviewHunk[],
+		baselineManualHunks: ReviewHunk[],
+		editedText: string,
+		baselineText: string,
+	): ReviewedHunk {
 		const baselineStart = mapLineAfterLineEdits(hunk.baselineStart, baselineManualHunks);
 		let displayStart = this.mapPreviousLineToEditedLine(hunk.displayStart, manualHunks);
 		let currentStart = this.mapPreviousLineToEditedLine(hunk.currentStart, manualHunks);
@@ -1668,12 +1822,12 @@ export class ReviewController implements vscode.Disposable {
 		currentStart = Math.max(0, currentStart);
 		displayLines = Math.max(0, displayLines);
 		if (!touched) {
-			return { ...hunk, baselineStart, displayStart, currentStart };
+			return this.refreshDecisionContexts({ ...hunk, baselineStart, displayStart, currentStart, zoneAfterLineNumber: displayStart }, baselineText, editedText);
 		}
 
 		const editedBlockText = this.lineBlock(editedText, displayStart, displayLines);
 		if (hunk.reviewSource === 'reject') {
-			return {
+			return this.refreshDecisionContexts({
 				...hunk,
 				oldLines: displayLines,
 				oldText: editedBlockText,
@@ -1681,10 +1835,11 @@ export class ReviewController implements vscode.Disposable {
 				displayStart,
 				displayLines,
 				currentStart,
-			};
+				zoneAfterLineNumber: displayStart,
+			}, baselineText, editedText);
 		}
 
-		return {
+		return this.refreshDecisionContexts({
 			...hunk,
 			newLines: displayLines,
 			newText: editedBlockText,
@@ -1692,7 +1847,43 @@ export class ReviewController implements vscode.Disposable {
 			displayStart,
 			displayLines,
 			currentStart,
+			zoneAfterLineNumber: displayStart,
+		}, baselineText, editedText);
+	}
+
+	private refreshDecisionContexts(hunk: ReviewedHunk, baselineText: string, currentText: string): ReviewedHunk {
+		const baselineLines = hunk.reviewSource === 'accept' ? hunk.newLines : hunk.oldLines;
+		const currentLines = hunk.reviewSource === 'reject' ? hunk.displayLines : hunk.newLines;
+		const baselineContext = captureLineBlockContext(baselineText, hunk.baselineStart, baselineLines);
+		const currentContext = captureLineBlockContext(currentText, hunk.currentStart, currentLines);
+		return {
+			...hunk,
+			baselineContextBefore: baselineContext.before,
+			baselineContextAfter: baselineContext.after,
+			currentContextBefore: currentContext.before,
+			currentContextAfter: currentContext.after,
+			zoneAfterLineNumber: hunk.displayStart,
 		};
+	}
+
+	private mapAcceptedDecisionBaselineStarts(file: ReviewFileState, edit: { oldStart: number; oldLines: number; newLines: number }): void {
+		file.acceptedHunks = file.acceptedHunks.map((hunk) => this.refreshDecisionContexts({
+			...hunk,
+			baselineStart: mapLineAfterLineEdits(hunk.baselineStart, [edit]),
+		}, file.oldText, file.newText));
+	}
+
+	private mapRejectedDecisionCurrentStarts(file: ReviewFileState, edit: { oldStart: number; oldLines: number; newLines: number }): void {
+		file.rejectedHunks = file.rejectedHunks.map((hunk) => {
+			const currentStart = mapLineAfterLineEdits(hunk.currentStart, [edit]);
+			const displayStart = hunk.displayStart === hunk.currentStart ? currentStart : hunk.displayStart;
+			return this.refreshDecisionContexts({
+				...hunk,
+				currentStart,
+				displayStart,
+				zoneAfterLineNumber: displayStart,
+			}, file.oldText, file.newText);
+		});
 	}
 
 	private mapPreviousLineToEditedLine(line: number, manualHunks: ReviewHunk[]): number {
@@ -1714,6 +1905,41 @@ export class ReviewController implements vscode.Disposable {
 
 	private lineBlockMatches(text: string, startLine: number, lineCount: number, expectedText: string): boolean {
 		return this.lineBlock(text, startLine, lineCount) === expectedText;
+	}
+
+	private originalHunkSideMatches(text: string, hunk: ReviewHunk, side: 'old' | 'new', startLine: number): boolean {
+		const context = side === 'old'
+			? { before: hunk.oldContextBefore, after: hunk.oldContextAfter }
+			: { before: hunk.newContextBefore, after: hunk.newContextAfter };
+		const lineCount = side === 'old' ? hunk.oldLines : hunk.newLines;
+		const expectedText = side === 'old' ? hunk.oldText : hunk.newText;
+		return lineBlockWithContextMatchesUniquely(text, startLine, lineCount, expectedText, context);
+	}
+
+	private reviewedBaselineSideMatches(
+		text: string,
+		hunk: ReviewedHunk,
+		startLine: number,
+		lineCount: number,
+		expectedText: string,
+	): boolean {
+		return lineBlockWithContextMatchesUniquely(text, startLine, lineCount, expectedText, {
+			before: hunk.baselineContextBefore,
+			after: hunk.baselineContextAfter,
+		});
+	}
+
+	private reviewedCurrentSideMatches(
+		text: string,
+		hunk: ReviewedHunk,
+		startLine: number,
+		lineCount: number,
+		expectedText: string,
+	): boolean {
+		return lineBlockWithContextMatchesUniquely(text, startLine, lineCount, expectedText, {
+			before: hunk.currentContextBefore,
+			after: hunk.currentContextAfter,
+		});
 	}
 
 	private manualHunkTouchesPending(manualHunk: ReviewHunk, pendingHunks: ReviewHunk[], editedRanges: EditedRange[]): boolean {
@@ -1751,7 +1977,7 @@ export class ReviewController implements vscode.Disposable {
 
 	private async readCurrentWorkspaceFiles(): Promise<Map<string, CurrentTextState & { uri: vscode.Uri; relativePath: string }>> {
 		const folders = vscode.workspace.workspaceFolders ?? [];
-		const maxFileBytes = vscode.workspace.getConfiguration('cliDiff').get<number>('maxFileBytes', 524288);
+		const maxFileBytes = vscode.workspace.getConfiguration('cliDiff').get<number>('maxFileBytes', 2097152);
 		const maxFiles = vscode.workspace.getConfiguration('cliDiff').get<number>('maxFiles', 2000);
 		const exclude = vscode.workspace.getConfiguration('cliDiff').get<string>('exclude', '**/{.git,node_modules,dist,out,.vscode-test}/**');
 		const files = new Map<string, CurrentTextState & { uri: vscode.Uri; relativePath: string }>();
@@ -1871,6 +2097,73 @@ export class ReviewController implements vscode.Disposable {
 			watcher.onDidDelete((uri) => this.handleFileSystemChange(uri)),
 		);
 		return disposable;
+	}
+
+	private createGitMetadataWatcher(): vscode.Disposable {
+		const watchers = [
+			vscode.workspace.createFileSystemWatcher('**/.git/index'),
+			vscode.workspace.createFileSystemWatcher('**/.git/HEAD'),
+			vscode.workspace.createFileSystemWatcher('**/.git/refs/**'),
+			vscode.workspace.createFileSystemWatcher('**/.git/packed-refs'),
+		];
+		const disposables: vscode.Disposable[] = [];
+		for (const watcher of watchers) {
+			disposables.push(
+				watcher,
+				watcher.onDidChange(() => this.scheduleGitSessionRefresh()),
+				watcher.onDidCreate(() => this.scheduleGitSessionRefresh()),
+				watcher.onDidDelete(() => this.scheduleGitSessionRefresh()),
+			);
+		}
+
+		return new vscode.Disposable(() => {
+			for (const disposable of disposables) {
+				disposable.dispose();
+			}
+		});
+	}
+
+	private createGitExtensionStateWatcher(): vscode.Disposable {
+		const disposables: vscode.Disposable[] = [];
+		let disposed = false;
+		const registerRepository = (repository: any): void => {
+			if (disposed) {
+				return;
+			}
+
+			const onDidChange = repository?.state?.onDidChange;
+			if (typeof onDidChange === 'function') {
+				disposables.push(onDidChange(() => this.scheduleGitSessionRefresh()));
+			}
+		};
+
+		const gitExtension = vscode.extensions.getExtension('vscode.git');
+		if (gitExtension) {
+			void Promise.resolve(gitExtension.activate()).then((api: any) => {
+				if (disposed) {
+					return;
+				}
+
+				const git = api?.getAPI?.(1);
+				if (!git) {
+					return;
+				}
+
+				for (const repository of git.repositories ?? []) {
+					registerRepository(repository);
+				}
+				if (typeof git.onDidOpenRepository === 'function') {
+					disposables.push(git.onDidOpenRepository(registerRepository));
+				}
+			}).catch(() => undefined);
+		}
+
+		return new vscode.Disposable(() => {
+			disposed = true;
+			for (const disposable of disposables) {
+				disposable.dispose();
+			}
+		});
 	}
 
 	private registerCommand(command: string, callback: (...args: any[]) => unknown): vscode.Disposable {

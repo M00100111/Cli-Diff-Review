@@ -1,9 +1,24 @@
 import * as assert from 'assert';
+import { execFileSync } from 'child_process';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import * as vscode from 'vscode';
 import { acceptHunkInBaseline, computeLineDiff } from '../diffEngine';
+import { GitService } from '../gitService';
 import { isDotReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
-import { isStaleRevision, mapLineAfterLineEdits, SerialOperationQueue, shouldDeleteRejectedCurrentFileOnRefresh, skippedCurrentFile } from '../reviewState';
+import { ReviewTreeProvider } from '../reviewTree';
+import {
+	captureLineBlockContext,
+	isStaleRevision,
+	lineBlockWithContextMatchesUniquely,
+	mapLineAfterLineEdits,
+	SerialOperationQueue,
+	shouldDeleteRejectedCurrentFileOnRefresh,
+	skippedCurrentFile,
+} from '../reviewState';
 import { replaceLineBlock, splitLines } from '../text';
-import { ReviewedHunk, ReviewHunk } from '../types';
+import { ReviewedHunk, ReviewFileState, ReviewHunk, ReviewSession } from '../types';
 
 suite('Diff engine', () => {
 	test('detects added lines', () => {
@@ -103,6 +118,29 @@ suite('Diff engine', () => {
 		assert.strictEqual(baseline, 'a\nb\nC\n');
 		assert.strictEqual(current, originalCurrent);
 	});
+
+	test('anchors a delete hunk before the following current line', () => {
+		const baseline = [
+			'func main() {\n',
+			'\thelloWorld()\n',
+			'\tgreet("Go")\n',
+			'\tgreetWithConfig(GreetingConfig{Name: "Agent", Age: 1})\n',
+			'}\n',
+		].join('');
+		const current = [
+			'func main() {\n',
+			'\thelloWorld()\n',
+			'}\n',
+		].join('');
+
+		const hunk = computeLineDiff('file:///main.go', baseline, current).find((item) => item.kind === 'delete');
+
+		assert.ok(hunk);
+		assert.strictEqual(hunk.newStart, 2);
+		assert.strictEqual(hunk.zoneAfterLineNumber, 2);
+		assert.deepStrictEqual(hunk.newContextBefore, ['func main() {\n', '\thelloWorld()\n']);
+		assert.deepStrictEqual(hunk.newContextAfter, ['}\n']);
+	});
 });
 
 suite('Review state', () => {
@@ -169,6 +207,170 @@ suite('Review state', () => {
 		assert.strictEqual(current.text, '');
 		assert.strictEqual(current.skippedReason, 'File exceeds cliDiff.maxFileBytes.');
 	});
+
+	test('shows skipped files in the review tree', () => {
+		const file: ReviewFileState = {
+			uri: vscode.Uri.file('D:/repo/src/reviewController.ts'),
+			relativePath: 'src/reviewController.ts',
+			oldText: '',
+			newText: '',
+			hunks: [],
+			acceptedHunks: [],
+			rejectedHunks: [],
+			originalText: '',
+			originalExists: true,
+			baselineExists: true,
+			currentExists: true,
+			revision: 0,
+			skippedReason: 'File diff exceeds cliDiff.maxDiffCells.',
+		};
+		const session: ReviewSession = {
+			id: 'git-test',
+			mode: 'git',
+			rootUri: vscode.Uri.file('D:/repo'),
+			createdAt: 1,
+			files: new Map([[file.uri.toString(), file]]),
+		};
+		const provider = new ReviewTreeProvider(() => session);
+		const [child] = provider.getChildren();
+		const item = provider.getTreeItem(child);
+
+		assert.strictEqual(child, file);
+		assert.strictEqual(item.description, 'skipped');
+		assert.strictEqual(item.contextValue, 'cliDiffFileSkipped');
+	});
+
+	test('requires delete insertion context to match uniquely', () => {
+		const text = 'a\n}\na\n}\n';
+		const context = captureLineBlockContext('a\n}\n', 1, 0);
+
+		assert.strictEqual(lineBlockWithContextMatchesUniquely(text, 1, 0, '', context), false);
+		assert.strictEqual(lineBlockWithContextMatchesUniquely('a\n}\n', 1, 0, '', context), true);
+		assert.strictEqual(lineBlockWithContextMatchesUniquely('a\n}\n', 2, 0, '', context), false);
+	});
+
+	test('keeps file-level accept undo coordinates in final baseline space', () => {
+		const baseline = 'a\nb\nkeep1\nc\nkeep2\nd\n';
+		const current = 'x\na\nB\nkeep1\nkeep2\nd\nz\n';
+		const hunks = computeLineDiff('file:///demo.ts', baseline, current);
+		const accepted = hunks.map((hunk) => reviewedHunk(hunk, 'accept', hunk.newStart, hunk.newLines, hunk.newStart, hunk.newStart));
+
+		const restored = accepted
+			.sort((left, right) => right.baselineStart - left.baselineStart)
+			.reduce((text, hunk) => replaceLineBlock(text, hunk.baselineStart, hunk.newLines, hunk.oldText), current);
+
+		assert.strictEqual(restored, baseline);
+	});
+
+	test('keeps file-level reject undo coordinates in final current space', () => {
+		const baseline = 'a\nb\nkeep1\nc\nkeep2\nd\n';
+		const current = 'x\na\nB\nkeep1\nkeep2\nd\nz\n';
+		const hunks = computeLineDiff('file:///demo.ts', baseline, current);
+		const rejectedCurrent = [...hunks]
+			.sort((left, right) => right.newStart - left.newStart)
+			.reduce((text, hunk) => replaceLineBlock(text, hunk.newStart, hunk.newLines, hunk.oldText), current);
+		const rejected = hunks.map((hunk) => reviewedHunk(hunk, 'reject', hunk.oldStart, hunk.oldLines, hunk.oldStart, hunk.oldStart));
+		const restored = rejected
+			.sort((left, right) => right.currentStart - left.currentStart)
+			.reduce((text, hunk) => replaceLineBlock(text, hunk.currentStart, hunk.displayLines, hunk.newText), rejectedCurrent);
+
+		assert.strictEqual(rejectedCurrent, baseline);
+		assert.strictEqual(restored, current);
+	});
+});
+
+suite('Git service', () => {
+	test('uses the index as the Git review baseline', async function (this: Mocha.Context) {
+		this.timeout(10000);
+		const root = createTempGitRepo();
+		try {
+			writeRepoFile(root, 'tracked.txt', 'base\n');
+			writeRepoFile(root, 'delete.txt', 'delete\n');
+			git(root, 'add', 'tracked.txt', 'delete.txt');
+			git(root, 'commit', '-m', 'initial');
+
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+
+			writeRepoFile(root, 'tracked.txt', 'base\nwork\n');
+			let pairs = await service.createFilePairs(folder);
+			let byPath = filePairsByPath(pairs);
+			assert.strictEqual(byPath.get('tracked.txt')?.oldText, 'base\n');
+			assert.strictEqual(byPath.get('tracked.txt')?.newText, 'base\nwork\n');
+
+			git(root, 'add', 'tracked.txt');
+			pairs = await service.createFilePairs(folder);
+			byPath = filePairsByPath(pairs);
+			assert.strictEqual(byPath.has('tracked.txt'), false);
+
+			writeRepoFile(root, 'tracked.txt', 'base\nwork\nunstaged\n');
+			pairs = await service.createFilePairs(folder);
+			byPath = filePairsByPath(pairs);
+			assert.strictEqual(byPath.get('tracked.txt')?.oldText, 'base\nwork\n');
+			assert.strictEqual(byPath.get('tracked.txt')?.newText, 'base\nwork\nunstaged\n');
+
+			writeRepoFile(root, 'loose.txt', 'loose\n');
+			pairs = await service.createFilePairs(folder);
+			byPath = filePairsByPath(pairs);
+			assert.strictEqual(byPath.get('loose.txt')?.baselineExists, false);
+			assert.strictEqual(byPath.get('loose.txt')?.currentExists, true);
+
+			git(root, 'add', 'loose.txt');
+			pairs = await service.createFilePairs(folder);
+			byPath = filePairsByPath(pairs);
+			assert.strictEqual(byPath.has('loose.txt'), false);
+
+			fs.unlinkSync(path.join(root, 'delete.txt'));
+			pairs = await service.createFilePairs(folder);
+			byPath = filePairsByPath(pairs);
+			assert.strictEqual(byPath.get('delete.txt')?.oldText, 'delete\n');
+			assert.strictEqual(byPath.get('delete.txt')?.currentExists, false);
+
+			git(root, 'add', 'delete.txt');
+			pairs = await service.createFilePairs(folder);
+			byPath = filePairsByPath(pairs);
+			assert.strictEqual(byPath.has('delete.txt'), false);
+
+			writeRepoFile(root, '.env', 'secret\n');
+			writeRepoFile(root, '.cache/output.txt', 'cache\n');
+			writeRepoFile(root, '.gitignore', 'ignored.txt\n');
+			writeRepoFile(root, 'ignored.txt', 'ignored\n');
+			pairs = await service.createFilePairs(folder);
+			byPath = filePairsByPath(pairs);
+			assert.strictEqual(byPath.has('.env'), false);
+			assert.strictEqual(byPath.has('.cache/output.txt'), false);
+			assert.strictEqual(byPath.has('.gitignore'), false);
+			assert.strictEqual(byPath.has('ignored.txt'), false);
+		} finally {
+			removeTempRepo(root);
+		}
+	});
+
+	test('changes the index signature only for index or HEAD changes', async function (this: Mocha.Context) {
+		this.timeout(10000);
+		const root = createTempGitRepo();
+		try {
+			writeRepoFile(root, 'tracked.txt', 'base\n');
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			const cleanSignature = await service.indexStateSignature(folder);
+
+			writeRepoFile(root, 'tracked.txt', 'base\nwork\n');
+			assert.strictEqual(await service.indexStateSignature(folder), cleanSignature);
+
+			git(root, 'add', 'tracked.txt');
+			const stagedSignature = await service.indexStateSignature(folder);
+			assert.notStrictEqual(stagedSignature, cleanSignature);
+
+			git(root, 'commit', '-m', 'second');
+			assert.notStrictEqual(await service.indexStateSignature(folder), stagedSignature);
+		} finally {
+			removeTempRepo(root);
+		}
+	});
 });
 
 suite('Text helpers', () => {
@@ -180,6 +382,46 @@ suite('Text helpers', () => {
 		assert.strictEqual(replaceLineBlock('a\nb\nc\n', 1, 1, 'B\n'), 'a\nB\nc\n');
 	});
 });
+
+function createTempGitRepo(): string {
+	const base = fs.existsSync('C:\\tmp') ? 'C:\\tmp' : os.tmpdir();
+	const root = fs.mkdtempSync(path.join(base, 'cli-diff-git-'));
+	git(root, 'init');
+	git(root, 'config', 'user.email', 'cli-diff@example.invalid');
+	git(root, 'config', 'user.name', 'CLI Diff Test');
+	git(root, 'config', 'core.autocrlf', 'false');
+	return root;
+}
+
+function removeTempRepo(root: string): void {
+	try {
+		fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+	} catch {
+		// Windows can briefly keep Git metadata handles open after extension-host tests.
+	}
+}
+
+function workspaceFolder(root: string): vscode.WorkspaceFolder {
+	return {
+		uri: vscode.Uri.file(root),
+		name: path.basename(root),
+		index: 0,
+	};
+}
+
+function writeRepoFile(root: string, relativePath: string, text: string): void {
+	const filePath = path.join(root, relativePath);
+	fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	fs.writeFileSync(filePath, text);
+}
+
+function git(root: string, ...args: string[]): string {
+	return execFileSync('git', args, { cwd: root, encoding: 'utf8' });
+}
+
+function filePairsByPath<T extends { relativePath: string }>(pairs: T[]): Map<string, T> {
+	return new Map(pairs.map((pair) => [pair.relativePath, pair]));
+}
 
 function shiftedModifyHunk(baseline: string, current: string): ReviewHunk {
 	const hunk = computeLineDiff('file:///demo.ts', baseline, current).find((item) => item.kind === 'modify');
@@ -205,6 +447,11 @@ function reviewedHunk(
 		displayLines,
 		baselineStart,
 		currentStart,
+		baselineContextBefore: [],
+		baselineContextAfter: [],
+		currentContextBefore: [],
+		currentContextAfter: [],
+		zoneAfterLineNumber: displayStart,
 		reviewedAt: 1,
 	};
 }

@@ -43,7 +43,7 @@ export class SnapshotStore {
 
 		await vscode.workspace.fs.createDirectory(this.fileDirectory);
 		const manifest: SnapshotManifest = { version: 1, capturedAt: Date.now(), roots: [] };
-		const maxFileBytes = getNumberConfig('maxFileBytes', 524288);
+		const maxFileBytes = getNumberConfig('maxFileBytes', 2097152);
 		const maxFiles = getNumberConfig('maxFiles', 2000);
 		const exclude = getStringConfig('exclude', '**/{.git,node_modules,dist,out,.vscode-test}/**');
 		let captured = 0;

@@ -1,3 +1,5 @@
+import { splitLines } from './text';
+
 export function isStaleRevision(currentRevision: number, expectedRevision?: number): boolean {
 	return typeof expectedRevision === 'number' && currentRevision !== expectedRevision;
 }
@@ -12,6 +14,11 @@ export interface LineEdit {
 	oldStart: number;
 	oldLines: number;
 	newLines: number;
+}
+
+export interface LineBlockContext {
+	before: string[];
+	after: string[];
 }
 
 export function skippedCurrentFile(skippedReason: string): CurrentTextState {
@@ -35,6 +42,77 @@ export function mapLineAfterLineEdits(line: number, edits: LineEdit[]): number {
 		}
 	}
 	return Math.max(0, mappedLine);
+}
+
+export function captureLineBlockContext(linesOrText: string[] | string, startLine: number, lineCount: number, radius = 3): LineBlockContext {
+	const lines = Array.isArray(linesOrText) ? linesOrText : splitLines(linesOrText);
+	const start = Math.max(0, Math.min(startLine, lines.length));
+	const count = Math.max(0, lineCount);
+	const end = Math.max(start, Math.min(start + count, lines.length));
+	return {
+		before: lines.slice(Math.max(0, start - radius), start),
+		after: lines.slice(end, Math.min(lines.length, end + radius)),
+	};
+}
+
+export function lineBlockWithContextMatches(
+	text: string,
+	startLine: number,
+	lineCount: number,
+	expectedText: string,
+	context: LineBlockContext,
+): boolean {
+	const lines = splitLines(text);
+	const expectedLines = splitLines(expectedText);
+	const start = Math.max(0, startLine);
+	const count = Math.max(0, lineCount);
+	if (start > lines.length || start + count > lines.length) {
+		return false;
+	}
+	if (expectedLines.length !== count) {
+		return false;
+	}
+	if (lines.slice(start, start + count).join('') !== expectedText) {
+		return false;
+	}
+	if (start < context.before.length) {
+		return false;
+	}
+	if (lines.slice(start - context.before.length, start).join('') !== context.before.join('')) {
+		return false;
+	}
+	if (lines.slice(start + count, start + count + context.after.length).join('') !== context.after.join('')) {
+		return false;
+	}
+	return true;
+}
+
+export function lineBlockWithContextMatchCount(
+	text: string,
+	lineCount: number,
+	expectedText: string,
+	context: LineBlockContext,
+): number {
+	const lines = splitLines(text);
+	const count = Math.max(0, lineCount);
+	let matches = 0;
+	for (let start = 0; start <= lines.length - count; start += 1) {
+		if (lineBlockWithContextMatches(text, start, count, expectedText, context)) {
+			matches += 1;
+		}
+	}
+	return matches;
+}
+
+export function lineBlockWithContextMatchesUniquely(
+	text: string,
+	startLine: number,
+	lineCount: number,
+	expectedText: string,
+	context: LineBlockContext,
+): boolean {
+	return lineBlockWithContextMatches(text, startLine, lineCount, expectedText, context)
+		&& lineBlockWithContextMatchCount(text, lineCount, expectedText, context) === 1;
 }
 
 export class SerialOperationQueue<TKey> {

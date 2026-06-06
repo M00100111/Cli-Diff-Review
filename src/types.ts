@@ -18,6 +18,11 @@ export interface ReviewHunk {
 	oldText: string;
 	newText: string;
 	kind: ChangeKind;
+	oldContextBefore: string[];
+	oldContextAfter: string[];
+	newContextBefore: string[];
+	newContextAfter: string[];
+	zoneAfterLineNumber: number;
 }
 
 export interface ReviewedHunk extends ReviewHunk {
@@ -27,6 +32,10 @@ export interface ReviewedHunk extends ReviewHunk {
 	displayLines: number;
 	baselineStart: number;
 	currentStart: number;
+	baselineContextBefore: string[];
+	baselineContextAfter: string[];
+	currentContextBefore: string[];
+	currentContextAfter: string[];
 	reviewedAt: number;
 }
 
