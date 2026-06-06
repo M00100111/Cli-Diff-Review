@@ -11,6 +11,7 @@ import {
 	ReviewNavigationTargetPayload,
 	ReviewWebviewManager,
 } from './reviewWebview';
+import { gitIgnoredReviewPaths, shouldSkipReviewPath } from './reviewFileFilter';
 import { CurrentTextState, isStaleRevision, mapLineAfterLineEdits, SerialOperationQueue, shouldDeleteRejectedCurrentFileOnRefresh, skippedCurrentFile } from './reviewState';
 import { SnapshotStore } from './snapshotStore';
 import { decodeUtf8, encodeUtf8, isProbablyBinary, lineRange, relativePath, replaceLineBlock, splitLines } from './text';
@@ -1757,9 +1758,14 @@ export class ReviewController implements vscode.Disposable {
 
 		for (const folder of folders) {
 			const uris = await vscode.workspace.findFiles(new vscode.RelativePattern(folder, '**/*'), exclude, maxFiles);
+			const relativePaths = new Map(uris.map((uri) => [uri.toString(), relativePath(folder.uri, uri)]));
+			const ignoredPaths = await gitIgnoredReviewPaths(folder, [...relativePaths.values()]);
 			for (const uri of uris) {
+				const currentRelativePath = relativePaths.get(uri.toString()) ?? relativePath(folder.uri, uri);
+				if (shouldSkipReviewPath(currentRelativePath) || ignoredPaths.has(currentRelativePath)) {
+					continue;
+				}
 				const data = await vscode.workspace.fs.readFile(uri);
-				const currentRelativePath = relativePath(folder.uri, uri);
 				if (data.length > maxFileBytes) {
 					files.set(uriKey(uri), {
 						uri,

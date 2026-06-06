@@ -1,5 +1,6 @@
 import * as assert from 'assert';
 import { acceptHunkInBaseline, computeLineDiff } from '../diffEngine';
+import { isDotReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
 import { isStaleRevision, mapLineAfterLineEdits, SerialOperationQueue, shouldDeleteRejectedCurrentFileOnRefresh, skippedCurrentFile } from '../reviewState';
 import { replaceLineBlock, splitLines } from '../text';
 import { ReviewedHunk, ReviewHunk } from '../types';
@@ -105,6 +106,14 @@ suite('Diff engine', () => {
 });
 
 suite('Review state', () => {
+	test('skips dot files and dot folders in review file discovery', () => {
+		assert.strictEqual(isDotReviewPath('.env'), true);
+		assert.strictEqual(isDotReviewPath('.github/workflows/release.yml'), true);
+		assert.strictEqual(isDotReviewPath('src/.cache/output.txt'), true);
+		assert.strictEqual(shouldSkipReviewPath('src/app.ts'), false);
+		assert.strictEqual(shouldSkipReviewPath('src/file.name.ts'), false);
+	});
+
 	test('treats mismatched expected revisions as stale', () => {
 		assert.strictEqual(isStaleRevision(3), false);
 		assert.strictEqual(isStaleRevision(3, 3), false);

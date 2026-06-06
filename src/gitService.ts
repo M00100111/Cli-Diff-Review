@@ -1,6 +1,7 @@
 import { execFile } from 'child_process';
 import { dirname as pathDirname, relative as pathRelative } from 'path';
 import * as vscode from 'vscode';
+import { gitIgnoredReviewPaths, isGitIgnoredReviewPath, normalizeReviewPath, shouldSkipReviewPath } from './reviewFileFilter';
 import { FilePair } from './types';
 import { decodeUtf8, isProbablyBinary, uriFromRelativePath } from './text';
 
@@ -12,10 +13,17 @@ export class GitService {
 			? await this.gitLines(root, ['diff', '--name-only', '--relative', 'HEAD', '--'])
 			: await this.gitLines(root, ['ls-files', '--cached']);
 		const untracked = await this.gitLines(root, ['ls-files', '--others', '--exclude-standard']);
-		const paths = [...new Set([...tracked, ...untracked])].filter(Boolean);
+		const paths = [...new Set([...tracked, ...untracked])]
+			.map((relativePath) => normalizeReviewPath(relativePath))
+			.filter((relativePath) => relativePath.length > 0 && !shouldSkipReviewPath(relativePath));
+		const ignoredPaths = await gitIgnoredReviewPaths(root, paths);
 		const pairs: FilePair[] = [];
 
 		for (const relativePath of paths) {
+			if (ignoredPaths.has(relativePath)) {
+				continue;
+			}
+
 			const uri = uriFromRelativePath(root.uri, relativePath);
 			const head = hasHead && !untracked.includes(relativePath)
 				? await this.readHeadText(root, relativePath)
@@ -41,6 +49,10 @@ export class GitService {
 		}
 
 		const relativePath = pathRelative(rootPath, uri.fsPath).replace(/\\/g, '/');
+		if (shouldSkipReviewPath(relativePath) || await isGitIgnoredReviewPath(rootPath, relativePath)) {
+			return undefined;
+		}
+
 		const hasHead = await this.hasHeadPath(rootPath);
 		const head = hasHead ? await this.readHeadTextPath(rootPath, relativePath) : { exists: false, text: '' };
 		const current = await readCurrentText(uri, { preferDisk: options.preferDisk });

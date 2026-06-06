@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import * as vscode from 'vscode';
+import { gitIgnoredReviewPaths, shouldSkipReviewPath } from './reviewFileFilter';
 import { BaselineFile, uriKey } from './types';
 import { decodeUtf8, encodeUtf8, isProbablyBinary, relativePath } from './text';
 
@@ -50,10 +51,17 @@ export class SnapshotStore {
 		for (const folder of folders) {
 			const rootManifest: SnapshotRootManifest = { rootUri: folder.uri.toString(), files: [] };
 			const uris = await vscode.workspace.findFiles(new vscode.RelativePattern(folder, '**/*'), exclude, maxFiles);
+			const relativePaths = new Map(uris.map((uri) => [uri.toString(), relativePath(folder.uri, uri)]));
+			const ignoredPaths = await gitIgnoredReviewPaths(folder, [...relativePaths.values()]);
 
 			for (const uri of uris) {
 				if (captured >= maxFiles) {
 					break;
+				}
+
+				const currentRelativePath = relativePaths.get(uri.toString()) ?? relativePath(folder.uri, uri);
+				if (shouldSkipReviewPath(currentRelativePath) || ignoredPaths.has(currentRelativePath)) {
+					continue;
 				}
 
 				const data = await vscode.workspace.fs.readFile(uri);
@@ -66,7 +74,7 @@ export class SnapshotStore {
 				await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(this.fileDirectory, storageName), encodeUtf8(text));
 				rootManifest.files.push({
 					uri: uri.toString(),
-					relativePath: relativePath(folder.uri, uri),
+					relativePath: currentRelativePath,
 					storageName,
 					size: data.length,
 					exists: true,
