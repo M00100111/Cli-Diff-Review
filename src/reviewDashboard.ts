@@ -312,10 +312,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 <body>
 	<div class="shell">
 		<div class="spacer" aria-hidden="true"></div>
-		<section class="review-tree" aria-label="CLI Diff Review">
+		<section class="review-tree" aria-label="Cli Diff Review">
 			<header class="tree-header">
 				<div class="header-left">
-					<button class="header-toggle" id="toggle" aria-expanded="true" title="Toggle CLI Diff Review">
+					<button class="header-toggle" id="toggle" aria-expanded="true" title="Toggle Cli Diff Review">
 						<span class="chevron" aria-hidden="true"></span>
 						<span class="tree-title">Cli Diff Review</span>
 					</button>

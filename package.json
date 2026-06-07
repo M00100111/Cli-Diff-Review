@@ -1,7 +1,7 @@
 {
-  "name": "cli-diff",
-  "displayName": "cli-diff",
-  "description": "cli-diff is a lightweight CLI diff tool that brings Cursor-like code review to the terminal.",
+  "name": "cli-diff-review",
+  "displayName": "Cli Diff Review",
+  "description": "Cli Diff Review brings lightweight code change review for CLI-assisted edits to VS Code.",
   "version": "0.0.1",
   "icon": "resources/icon.png",
   "publisher": "local",
@@ -35,65 +35,65 @@
       {
         "command": "cli-diff.captureBaseline",
         "title": "Capture Baseline",
-        "category": "CLI Diff"
+        "category": "Cli Diff Review"
       },
       {
         "command": "cli-diff.startSnapshotReview",
         "title": "Start Snapshot Review",
-        "category": "CLI Diff"
+        "category": "Cli Diff Review"
       },
       {
         "command": "cli-diff.startGitReview",
         "title": "Start Git Review",
-        "category": "CLI Diff"
+        "category": "Cli Diff Review"
       },
       {
         "command": "cli-diff.acceptChange",
         "title": "Accept Change",
-        "category": "CLI Diff"
+        "category": "Cli Diff Review"
       },
       {
         "command": "cli-diff.rejectChange",
         "title": "Reject Change",
-        "category": "CLI Diff"
+        "category": "Cli Diff Review"
       },
       {
         "command": "cli-diff.acceptFile",
         "title": "Accept File",
-        "category": "CLI Diff",
+        "category": "Cli Diff Review",
         "icon": "$(check)"
       },
       {
         "command": "cli-diff.rejectFile",
         "title": "Reject File",
-        "category": "CLI Diff",
+        "category": "Cli Diff Review",
         "icon": "$(close)"
       },
       {
         "command": "cli-diff.undoFile",
         "title": "Undo File",
-        "category": "CLI Diff",
+        "category": "Cli Diff Review",
         "icon": "$(discard)"
       },
       {
         "command": "cli-diff.nextChange",
         "title": "Next Change",
-        "category": "CLI Diff"
+        "category": "Cli Diff Review"
       },
       {
         "command": "cli-diff.previousChange",
         "title": "Previous Change",
-        "category": "CLI Diff"
+        "category": "Cli Diff Review"
       },
       {
         "command": "cli-diff.openReviewView",
         "title": "Open Review",
-        "category": "CLI Diff"
+        "category": "Cli Diff Review"
       },
       {
         "command": "cli-diff.refresh",
         "title": "Refresh Review",
-        "category": "CLI Diff",
+        "category": "Cli Diff Review",
         "icon": "$(refresh)"
       }
     ],
@@ -101,7 +101,7 @@
       "activitybar": [
         {
           "id": "cli-diff-activity",
-          "title": "CLI Diff Review",
+          "title": "Cli Diff Review",
           "icon": "resources/icon.svg"
         }
       ]
@@ -110,13 +110,13 @@
       "explorer": [
         {
           "id": "cli-diff.review",
-          "name": "CLI Diff Review"
+          "name": "Cli Diff Review"
         }
       ],
       "cli-diff-activity": [
         {
           "id": "cli-diff.dashboard",
-          "name": "CLI DIFF REVIEW",
+          "name": "Cli Diff Review",
           "type": "webview"
         }
       ]
@@ -124,7 +124,7 @@
     "customEditors": [
       {
         "viewType": "cli-diff.reviewEditor",
-        "displayName": "CLI Diff Review",
+        "displayName": "Cli Diff Review",
         "selector": [
           {
             "filenamePattern": "**/*"
@@ -180,13 +180,13 @@
       ]
     },
     "configuration": {
-      "title": "CLI Diff",
+      "title": "Cli Diff Review",
       "properties": {
         "cliDiff.maxFileBytes": {
           "type": "number",
           "default": 2097152,
           "minimum": 1024,
-          "description": "Maximum file size, in bytes, included in CLI Diff baselines and reviews."
+          "description": "Maximum file size, in bytes, included in Cli Diff Review baselines and reviews."
         },
         "cliDiff.maxFiles": {
           "type": "number",
@@ -209,7 +209,7 @@
         "cliDiff.autoStartGitReview": {
           "type": "boolean",
           "default": true,
-          "description": "Automatically start a lightweight Git review session so changed files appear in the CLI Diff Review view."
+          "description": "Automatically start a lightweight Git review session so changed files appear in the Cli Diff Review view."
         },
         "cliDiff.exclude": {
           "type": "string",

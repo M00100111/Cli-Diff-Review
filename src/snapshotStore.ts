@@ -165,7 +165,7 @@ export class SnapshotStore {
 			const data = await vscode.workspace.fs.readFile(this.manifestUri);
 			return JSON.parse(decodeUtf8(data)) as SnapshotManifest;
 		} catch {
-			throw new Error('No CLI Diff baseline found. Run "CLI Diff: Capture Baseline" first.');
+			throw new Error('No Cli Diff Review baseline found. Run "Cli Diff Review: Capture Baseline" first.');
 		}
 	}
 }

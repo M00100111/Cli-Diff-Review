@@ -362,7 +362,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 	<meta charset="UTF-8">
 	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${cspSource} data:; font-src ${cspSource}; style-src ${cspSource} 'unsafe-inline'; script-src ${cspSource} 'nonce-${nonce}'; worker-src blob: data:;">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>CLI Diff Review</title>
+	<title>Cli Diff Review</title>
 	<style>
 		:root {
 			color-scheme: dark;

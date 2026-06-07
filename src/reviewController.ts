@@ -196,10 +196,10 @@ export class ReviewController implements vscode.Disposable {
 		try {
 			const count = await vscode.window.withProgress({
 				location: vscode.ProgressLocation.Notification,
-				title: 'CLI Diff: capturing baseline',
+				title: 'Cli Diff Review: capturing baseline',
 				cancellable: false,
 			}, () => this.snapshotStore.captureWorkspaceBaseline());
-			vscode.window.showInformationMessage(`CLI Diff baseline captured (${count} files).`);
+			vscode.window.showInformationMessage(`Cli Diff Review baseline captured (${count} files).`);
 		} catch (error) {
 			this.showError(error);
 		}
@@ -308,7 +308,7 @@ export class ReviewController implements vscode.Disposable {
 		this.refreshUi();
 		const hunkCount = [...files.values()].reduce((total, file) => total + file.hunks.length, 0);
 		if (notify) {
-			vscode.window.showInformationMessage(`CLI Diff ${mode} review started (${files.size} files, ${hunkCount} changes).`);
+			vscode.window.showInformationMessage(`Cli Diff Review ${mode} review started (${files.size} files, ${hunkCount} changes).`);
 		}
 	}
 
@@ -419,7 +419,7 @@ export class ReviewController implements vscode.Disposable {
 
 			const target = this.resolveHunk(uriString, hunkId);
 			if (!target) {
-				vscode.window.showInformationMessage('No CLI Diff change selected.');
+				vscode.window.showInformationMessage('No Cli Diff Review change selected.');
 				return;
 			}
 
@@ -470,7 +470,7 @@ export class ReviewController implements vscode.Disposable {
 
 			const target = this.resolveHunk(uriString, hunkId);
 			if (!target) {
-				vscode.window.showInformationMessage('No CLI Diff change selected.');
+				vscode.window.showInformationMessage('No Cli Diff Review change selected.');
 				return;
 			}
 
@@ -545,7 +545,7 @@ export class ReviewController implements vscode.Disposable {
 
 			const target = this.resolveDecisionHunk(uriString, hunkId);
 			if (!target) {
-				vscode.window.showInformationMessage('No accepted or rejected CLI Diff change selected.');
+				vscode.window.showInformationMessage('No accepted or rejected Cli Diff Review change selected.');
 				return;
 			}
 			if (this.isStaleMutation(target.file, expectedRevision)) {
@@ -607,7 +607,7 @@ export class ReviewController implements vscode.Disposable {
 		try {
 			const file = this.resolveFile(uriString);
 			if (!file) {
-				vscode.window.showInformationMessage('No CLI Diff file selected.');
+				vscode.window.showInformationMessage('No Cli Diff Review file selected.');
 				return;
 			}
 			if (!this.ensureFileCleanForReviewMutation(file)) {
@@ -651,7 +651,7 @@ export class ReviewController implements vscode.Disposable {
 		try {
 			const file = this.resolveFile(uriString);
 			if (!file) {
-				vscode.window.showInformationMessage('No CLI Diff file selected.');
+				vscode.window.showInformationMessage('No Cli Diff Review file selected.');
 				return;
 			}
 			if (!this.ensureFileCleanForReviewMutation(file)) {
@@ -702,7 +702,7 @@ export class ReviewController implements vscode.Disposable {
 		try {
 			const file = this.resolveFile(uriString);
 			if (!file) {
-				vscode.window.showInformationMessage('No CLI Diff file selected.');
+				vscode.window.showInformationMessage('No Cli Diff Review file selected.');
 				return;
 			}
 			if (!this.ensureFileCleanForReviewMutation(file)) {
@@ -801,7 +801,7 @@ export class ReviewController implements vscode.Disposable {
 	private async navigateChange(direction: 1 | -1, uriString?: string, hunkId?: string): Promise<void> {
 		const hunks = this.flattenHunks();
 		if (hunks.length === 0) {
-			vscode.window.showInformationMessage('No CLI Diff changes to navigate.');
+			vscode.window.showInformationMessage('No Cli Diff Review changes to navigate.');
 			return;
 		}
 
@@ -1484,7 +1484,7 @@ export class ReviewController implements vscode.Disposable {
 			return true;
 		}
 
-		vscode.window.showInformationMessage('Save or revert this file before accepting, rejecting, or undoing CLI Diff changes.');
+		vscode.window.showInformationMessage('Save or revert this file before accepting, rejecting, or undoing Cli Diff Review changes.');
 		this.reviewWebview.refresh(file.uri);
 		return false;
 	}
@@ -1873,7 +1873,7 @@ export class ReviewController implements vscode.Disposable {
 
 		for (const hunk of accepted) {
 			if (!this.reviewedBaselineSideMatches(file.oldText, hunk, hunk.baselineStart, hunk.newLines, hunk.newText)) {
-				throw new Error('A reviewed CLI Diff change no longer matches the baseline. Refresh the review and try again.');
+				throw new Error('A reviewed Cli Diff Review change no longer matches the baseline. Refresh the review and try again.');
 			}
 		}
 		let baselineText = file.oldText;
@@ -1884,7 +1884,7 @@ export class ReviewController implements vscode.Disposable {
 		const current = await this.readCurrentText(file.uri);
 		for (const hunk of rejected) {
 			if (!this.reviewedCurrentSideMatches(current.text, hunk, hunk.currentStart, hunk.displayLines, hunk.oldText)) {
-				throw new Error('A reviewed CLI Diff change no longer matches the current file. Refresh the review and try again.');
+				throw new Error('A reviewed Cli Diff Review change no longer matches the current file. Refresh the review and try again.');
 			}
 		}
 		let currentText = current.text;
@@ -2313,6 +2313,6 @@ export class ReviewController implements vscode.Disposable {
 
 	private showError(error: unknown): void {
 		const message = error instanceof Error ? error.message : String(error);
-		vscode.window.showErrorMessage(`CLI Diff: ${message}`);
+		vscode.window.showErrorMessage(`Cli Diff Review: ${message}`);
 	}
 }

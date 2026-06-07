@@ -1,6 +1,6 @@
-# CLI Diff
+# Cli Diff Review
 
-CLI Diff brings Cursor-style code change review to VS Code for files modified by CLI coding agents.
+Cli Diff Review brings Cursor-style code change review to VS Code for files modified by CLI coding agents.
 
 ## Features
 
@@ -15,18 +15,18 @@ CLI Diff brings Cursor-style code change review to VS Code for files modified by
 
 ## Commands
 
-- `CLI Diff: Start Git Review`
-- `CLI Diff: Capture Baseline`
-- `CLI Diff: Start Snapshot Review`
-- `CLI Diff: Open Review`
-- `CLI Diff: Accept Change`
-- `CLI Diff: Reject Change`
-- `CLI Diff: Accept File`
-- `CLI Diff: Reject File`
-- `CLI Diff: Undo File`
-- `CLI Diff: Next Change`
-- `CLI Diff: Previous Change`
-- `CLI Diff: Refresh Review`
+- `Cli Diff Review: Start Git Review`
+- `Cli Diff Review: Capture Baseline`
+- `Cli Diff Review: Start Snapshot Review`
+- `Cli Diff Review: Open Review`
+- `Cli Diff Review: Accept Change`
+- `Cli Diff Review: Reject Change`
+- `Cli Diff Review: Accept File`
+- `Cli Diff Review: Reject File`
+- `Cli Diff Review: Undo File`
+- `Cli Diff Review: Next Change`
+- `Cli Diff Review: Previous Change`
+- `Cli Diff Review: Refresh Review`
 
 ## Settings
 
@@ -39,4 +39,4 @@ CLI Diff brings Cursor-style code change review to VS Code for files modified by
 
 ## Notes
 
-CLI Diff does not stage, commit, or rewrite Git history. Accepting a change marks it as reviewed in the current session; rejecting a change edits the working file back to the baseline content for that hunk.
+Cli Diff Review does not stage, commit, or rewrite Git history. Accepting a change marks it as reviewed in the current session; rejecting a change edits the working file back to the baseline content for that hunk.
