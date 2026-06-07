@@ -26,6 +26,7 @@
     "onCommand:cli-diff.openReviewView",
     "onCommand:cli-diff.refresh",
     "onCustomEditor:cli-diff.reviewEditor",
+    "onView:cli-diff.dashboard",
     "onView:cli-diff.review"
   ],
   "main": "./dist/extension.js",
@@ -96,11 +97,27 @@
         "icon": "$(refresh)"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cli-diff-activity",
+          "title": "CLI Diff Review",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
     "views": {
       "explorer": [
         {
           "id": "cli-diff.review",
           "name": "CLI Diff Review"
+        }
+      ],
+      "cli-diff-activity": [
+        {
+          "id": "cli-diff.dashboard",
+          "name": "CLI DIFF REVIEW",
+          "type": "webview"
         }
       ]
     },

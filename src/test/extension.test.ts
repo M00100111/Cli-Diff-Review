@@ -6,19 +6,24 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { acceptHunkInBaseline, computeLineDiff } from '../diffEngine';
 import { GitService } from '../gitService';
+import { buildReviewDashboardPayload, ReviewDashboardProvider } from '../reviewDashboard';
 import { isDotReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
 import { ReviewTreeProvider } from '../reviewTree';
 import {
+	applyManualGitBaselineToPair,
 	captureLineBlockContext,
 	isStaleRevision,
 	lineBlockWithContextMatchesUniquely,
+	mapLineAfterFileEdits,
 	mapLineAfterLineEdits,
+	manualGitBaselineFromReviewedFile,
 	SerialOperationQueue,
 	shouldDeleteRejectedCurrentFileOnRefresh,
+	shouldMergeReviewedFileOnRefresh,
 	skippedCurrentFile,
 } from '../reviewState';
 import { replaceLineBlock, splitLines } from '../text';
-import { ReviewedHunk, ReviewFileState, ReviewHunk, ReviewSession } from '../types';
+import { FilePair, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewSession } from '../types';
 
 suite('Diff engine', () => {
 	test('detects added lines', () => {
@@ -191,6 +196,97 @@ suite('Review state', () => {
 		assert.strictEqual(shouldDeleteRejectedCurrentFileOnRefresh(false, '', 0, 0), false);
 	});
 
+	test('merges only reviewed snapshot files without pending hunks on refresh', () => {
+		assert.strictEqual(shouldMergeReviewedFileOnRefresh(0, 1, 0), true);
+		assert.strictEqual(shouldMergeReviewedFileOnRefresh(0, 0, 1), true);
+		assert.strictEqual(shouldMergeReviewedFileOnRefresh(0, 1, 1), true);
+		assert.strictEqual(shouldMergeReviewedFileOnRefresh(1, 1, 0), false);
+		assert.strictEqual(shouldMergeReviewedFileOnRefresh(1, 0, 1), false);
+		assert.strictEqual(shouldMergeReviewedFileOnRefresh(0, 0, 0), false);
+		assert.strictEqual(shouldMergeReviewedFileOnRefresh(0, 1, 0, 'File exceeds cliDiff.maxFileBytes.'), false);
+	});
+
+	test('keeps manually merged Git baselines across repeated refresh pairs', () => {
+		const uri = vscode.Uri.file('D:/repo/tracked.txt');
+		const acceptedHunk = computeLineDiff(uri.toString(), 'base\n', 'base\naccepted\n')[0];
+		const reviewedFile = reviewFileState(uri, 'tracked.txt', {
+			oldText: 'base\naccepted\n',
+			newText: 'base\naccepted\n',
+			acceptedHunks: [reviewedHunkFrom(acceptedHunk, 'accept')],
+		});
+		const baseline = manualGitBaselineFromReviewedFile(reviewedFile);
+		assert.ok(baseline);
+
+		const indexPair: FilePair = {
+			uri,
+			relativePath: 'tracked.txt',
+			oldText: 'base\n',
+			newText: 'base\naccepted\n',
+			baselineExists: true,
+			currentExists: true,
+		};
+		const firstRefresh = applyManualGitBaselineToPair(indexPair, baseline);
+		const secondRefresh = applyManualGitBaselineToPair(indexPair, baseline);
+		const editedRefresh = applyManualGitBaselineToPair({
+			...indexPair,
+			newText: 'base\naccepted\nlater\n',
+		}, baseline);
+
+		assert.deepStrictEqual(computeLineDiff(uri.toString(), firstRefresh.oldText, firstRefresh.newText), []);
+		assert.deepStrictEqual(computeLineDiff(uri.toString(), secondRefresh.oldText, secondRefresh.newText), []);
+		const editedHunks = computeLineDiff(uri.toString(), editedRefresh.oldText, editedRefresh.newText);
+		assert.strictEqual(editedHunks.length, 1);
+		assert.strictEqual(editedHunks[0].newText, 'later\n');
+	});
+
+	test('does not apply manual Git baselines to skipped pairs', () => {
+		const uri = vscode.Uri.file('D:/repo/tracked.txt');
+		const baseline = { oldText: 'base\naccepted\n', baselineExists: true };
+		const pair: FilePair = {
+			uri,
+			relativePath: 'tracked.txt',
+			oldText: 'base\n',
+			newText: 'base\naccepted\n',
+			baselineExists: true,
+			currentExists: true,
+		};
+
+		assert.strictEqual(applyManualGitBaselineToPair({ ...pair, skippedReason: 'too large' }, baseline).oldText, 'base\n');
+		assert.strictEqual(applyManualGitBaselineToPair({ ...pair, currentExists: false }, baseline).oldText, 'base\naccepted\n');
+	});
+
+	test('captures accepted deletion as a manual Git baseline', () => {
+		const uri = vscode.Uri.file('D:/repo/tracked.txt');
+		const deleteHunk = computeLineDiff(uri.toString(), 'base\n', '')[0];
+		const acceptedDeletion = reviewFileState(uri, 'tracked.txt', {
+			oldText: '',
+			newText: '',
+			baselineExists: false,
+			currentExists: false,
+			acceptedHunks: [reviewedHunkFrom(deleteHunk, 'accept')],
+		});
+		const rejectedNewFile = reviewFileState(uri, 'tracked.txt', {
+			oldText: '',
+			newText: '',
+			baselineExists: false,
+			currentExists: false,
+			rejectedHunks: [reviewedHunkFrom(computeLineDiff(uri.toString(), '', 'new\n')[0], 'reject')],
+		});
+
+		const baseline = manualGitBaselineFromReviewedFile(acceptedDeletion);
+		assert.deepStrictEqual(baseline, { oldText: '', baselineExists: false });
+		const refreshedDeletion = applyManualGitBaselineToPair({
+			uri,
+			relativePath: 'tracked.txt',
+			oldText: 'base\n',
+			newText: '',
+			baselineExists: true,
+			currentExists: false,
+		}, baseline);
+		assert.deepStrictEqual(computeLineDiff(uri.toString(), refreshedDeletion.oldText, refreshedDeletion.newText), []);
+		assert.strictEqual(manualGitBaselineFromReviewedFile(rejectedNewFile), undefined);
+	});
+
 	test('maps reviewed baseline starts through manual edits before the hunk', () => {
 		const acceptedBaseline = 'a\nmanual\nb\nC\n';
 		const mappedBaselineStart = mapLineAfterLineEdits(2, [{ oldStart: 1, oldLines: 0, newLines: 1 }]);
@@ -238,6 +334,108 @@ suite('Review state', () => {
 		assert.strictEqual(child, file);
 		assert.strictEqual(item.description, 'skipped');
 		assert.strictEqual(item.contextValue, 'cliDiffFileSkipped');
+	});
+
+	test('builds dashboard payload with current review and action states', () => {
+		const pendingUri = vscode.Uri.file('D:/repo/src/pending.ts');
+		const reviewedUri = vscode.Uri.file('D:/repo/src/reviewed.ts');
+		const skippedUri = vscode.Uri.file('D:/repo/src/skipped.ts');
+		const pendingHunk = computeLineDiff(pendingUri.toString(), 'a\n', 'b\n')[0];
+		const reviewedHunk = computeLineDiff(reviewedUri.toString(), 'one\n', 'two\n')[0];
+		const session: ReviewSession = {
+			id: 'dashboard-test',
+			mode: 'git',
+			rootUri: vscode.Uri.file('D:/repo'),
+			createdAt: 1,
+			files: new Map([
+				[pendingUri.toString(), reviewFileState(pendingUri, 'src/pending.ts', { hunks: [pendingHunk] })],
+				[reviewedUri.toString(), reviewFileState(reviewedUri, 'src/reviewed.ts', {
+					acceptedHunks: [reviewedHunkFrom(reviewedHunk, 'accept')],
+				})],
+				[skippedUri.toString(), reviewFileState(skippedUri, 'src/skipped.ts', {
+					skippedReason: 'File diff exceeds cliDiff.maxDiffCells.',
+				})],
+			]),
+		};
+
+		const empty = buildReviewDashboardPayload(undefined, undefined, () => false);
+		const payload = buildReviewDashboardPayload(session, pendingUri, (uri) => uri.toString() === pendingUri.toString());
+		const pending = payload.files.find((file) => file.relativePath === 'src/pending.ts');
+		const reviewed = payload.files.find((file) => file.relativePath === 'src/reviewed.ts');
+		const skipped = payload.files.find((file) => file.relativePath === 'src/skipped.ts');
+
+		assert.deepStrictEqual(empty.files, []);
+		assert.strictEqual(payload.currentReviewLabel, 'pending.ts');
+		assert.strictEqual(payload.files.length, 3);
+		assert.strictEqual(pending?.active, true);
+		assert.strictEqual(pending?.dirty, true);
+		assert.strictEqual(pending?.acceptDisabled, true);
+		assert.strictEqual(reviewed?.undoDisabled, false);
+		assert.strictEqual(skipped?.acceptDisabled, true);
+		assert.strictEqual(skipped?.rejectDisabled, true);
+		assert.strictEqual(skipped?.undoDisabled, true);
+		assert.notStrictEqual(empty.changeSignature, payload.changeSignature);
+
+		session.files.set(pendingUri.toString(), reviewFileState(pendingUri, 'src/pending.ts'));
+		const changed = buildReviewDashboardPayload(session, pendingUri, () => false);
+		assert.notStrictEqual(changed.changeSignature, payload.changeSignature);
+	});
+
+	test('posts dashboard state after file-level commands', async () => {
+		const uri = vscode.Uri.file('D:/repo/src/pending.ts');
+		const posted: unknown[] = [];
+		let messageHandler: ((message: unknown) => void) | undefined;
+		const provider = new ReviewDashboardProvider(
+			() => ({ currentReviewLabel: 'pending.ts', changeSignature: String(posted.length), files: [] }),
+			async <T,>() => undefined as T,
+		);
+		const view = {
+			webview: {
+				options: {},
+				html: '',
+				onDidReceiveMessage: (handler: (message: unknown) => void) => {
+					messageHandler = handler;
+					return { dispose: () => undefined };
+				},
+				postMessage: (message: unknown) => {
+					posted.push(message);
+					return Promise.resolve(true);
+				},
+			},
+			title: '',
+		} as unknown as vscode.WebviewView;
+		provider.resolveWebviewView(view);
+
+		assert.ok(messageHandler);
+		assert.strictEqual(view.title, 'pending.ts');
+		const before = posted.length;
+		messageHandler({ type: 'acceptFile', uri: uri.toString() });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		assert.ok(posted.length > before);
+		provider.dispose();
+	});
+
+	test('maps reviewed contexts through file-level accept and reject edits', () => {
+		const acceptBaseline = 'keep\naccepted\nend\n';
+		const acceptFinalBaseline = 'insert\nkeep\naccepted\nend\n';
+		const acceptMappedStart = mapLineAfterFileEdits(1, [{ oldStart: 0, oldLines: 0, newLines: 1 }]);
+		const acceptContext = captureLineBlockContext(acceptFinalBaseline, acceptMappedStart, 1);
+
+		assert.strictEqual(acceptMappedStart, 2);
+		assert.strictEqual(lineBlockWithContextMatchesUniquely(acceptFinalBaseline, acceptMappedStart, 1, 'accepted\n', acceptContext), true);
+		assert.strictEqual(lineBlockWithContextMatchesUniquely(acceptFinalBaseline, 1, 1, 'accepted\n', acceptContext), false);
+		assert.strictEqual(acceptBaseline.includes('accepted\n'), true);
+
+		const rejectCurrent = 'remove\nkeep\nrejected\nend\n';
+		const rejectFinalCurrent = 'keep\nrejected\nend\n';
+		const rejectMappedStart = mapLineAfterFileEdits(2, [{ oldStart: 0, oldLines: 1, newLines: 0 }]);
+		const rejectContext = captureLineBlockContext(rejectFinalCurrent, rejectMappedStart, 1);
+
+		assert.strictEqual(rejectMappedStart, 1);
+		assert.strictEqual(lineBlockWithContextMatchesUniquely(rejectFinalCurrent, rejectMappedStart, 1, 'rejected\n', rejectContext), true);
+		assert.strictEqual(lineBlockWithContextMatchesUniquely(rejectFinalCurrent, 2, 1, 'rejected\n', rejectContext), false);
+		assert.strictEqual(rejectCurrent.includes('rejected\n'), true);
 	});
 
 	test('requires delete insertion context to match uniquely', () => {
@@ -421,6 +619,39 @@ function git(root: string, ...args: string[]): string {
 
 function filePairsByPath<T extends { relativePath: string }>(pairs: T[]): Map<string, T> {
 	return new Map(pairs.map((pair) => [pair.relativePath, pair]));
+}
+
+function reviewFileState(
+	uri: vscode.Uri,
+	relativePath: string,
+	overrides: Partial<ReviewFileState> = {},
+): ReviewFileState {
+	return {
+		uri,
+		relativePath,
+		oldText: '',
+		newText: '',
+		hunks: [],
+		acceptedHunks: [],
+		rejectedHunks: [],
+		originalText: '',
+		originalExists: true,
+		baselineExists: true,
+		currentExists: true,
+		revision: 0,
+		...overrides,
+	};
+}
+
+function reviewedHunkFrom(hunk: ReviewHunk, reviewSource: 'accept' | 'reject'): ReviewedHunk {
+	return reviewedHunk(
+		hunk,
+		reviewSource,
+		hunk.newStart,
+		reviewSource === 'reject' ? hunk.oldLines : hunk.newLines,
+		hunk.oldStart,
+		hunk.newStart,
+	);
 }
 
 function shiftedModifyHunk(baseline: string, current: string): ReviewHunk {

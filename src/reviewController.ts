@@ -2,6 +2,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { acceptHunkInBaseline, computeLineDiff } from './diffEngine';
 import { GitService } from './gitService';
+import { buildReviewDashboardPayload, ReviewDashboardProvider } from './reviewDashboard';
 import { ReviewTreeProvider } from './reviewTree';
 import {
 	EditedRange,
@@ -13,13 +14,18 @@ import {
 } from './reviewWebview';
 import { gitIgnoredReviewPaths, shouldSkipReviewPath } from './reviewFileFilter';
 import {
+	applyManualGitBaselineToPair,
 	captureLineBlockContext,
 	CurrentTextState,
+	GitManualBaseline,
 	isStaleRevision,
 	lineBlockWithContextMatchesUniquely,
+	mapLineAfterFileEdits,
 	mapLineAfterLineEdits,
+	manualGitBaselineFromReviewedFile,
 	SerialOperationQueue,
 	shouldDeleteRejectedCurrentFileOnRefresh,
+	shouldMergeReviewedFileOnRefresh,
 	skippedCurrentFile,
 } from './reviewState';
 import { SnapshotStore } from './snapshotStore';
@@ -27,6 +33,10 @@ import { decodeUtf8, encodeUtf8, isProbablyBinary, lineRange, relativePath, repl
 import { FilePair, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewSession, ReviewSource, uriKey } from './types';
 
 type InternalWriteSource = 'plugin' | 'human';
+
+type GitSessionRefreshRequest =
+	| { source: 'manual' }
+	| { source: 'gitIndexChanged'; indexStateSignature: string };
 
 interface ReviewNavigationTarget extends vscode.QuickPickItem {
 	uri: vscode.Uri;
@@ -38,6 +48,7 @@ export class ReviewController implements vscode.Disposable {
 	private readonly gitService = new GitService();
 	private readonly disposables: vscode.Disposable[] = [];
 	private readonly treeProvider: ReviewTreeProvider;
+	private readonly dashboardProvider: ReviewDashboardProvider;
 	private readonly reviewWebview: ReviewWebviewManager;
 	private readonly refreshTimers = new Map<string, NodeJS.Timeout>();
 	private readonly humanEditBatches = new Map<string, EditedRange[]>();
@@ -45,23 +56,33 @@ export class ReviewController implements vscode.Disposable {
 	private readonly internalWriteDepth = new Map<string, number>();
 	private readonly writeGraceUntil = new Map<string, { source: InternalWriteSource; until: number }>();
 	private readonly fileOperationQueue = new SerialOperationQueue<string>();
+	private readonly manualGitBaselines = new Map<string, GitManualBaseline>();
 	private gitRefreshTimer: NodeJS.Timeout | undefined;
 	private gitIndexStateSignature: string | undefined;
+	private currentReviewUri: vscode.Uri | undefined;
 	private activeSession: ReviewSession | undefined;
 
 	public constructor(private readonly context: vscode.ExtensionContext) {
 		this.snapshotStore = new SnapshotStore(context);
 		this.treeProvider = new ReviewTreeProvider(() => this.activeSession);
+		this.dashboardProvider = new ReviewDashboardProvider(() => buildReviewDashboardPayload(
+			this.activeSession,
+			this.currentReviewUri,
+			(uri) => this.isOpenDocumentDirty(uri),
+		));
 		this.reviewWebview = new ReviewWebviewManager(
 			context,
 			() => this.activeSession,
 			(type, uri, line, column, requestId) => this.navigateFromReview(type, uri, line, column, requestId),
 			(uri, line, column) => this.openNavigationTarget(uri, line, column),
+			(uri) => this.setCurrentReviewUri(uri),
 		);
 
 		this.disposables.push(
 			this.reviewWebview,
+			this.dashboardProvider,
 			vscode.window.registerTreeDataProvider('cli-diff.review', this.treeProvider),
+			vscode.window.registerWebviewViewProvider(ReviewDashboardProvider.viewType, this.dashboardProvider),
 			vscode.window.onDidChangeActiveTextEditor((editor) => {
 				if (editor) {
 					void this.ensureGitReviewForUri(editor.document.uri);
@@ -261,6 +282,7 @@ export class ReviewController implements vscode.Disposable {
 			throw new Error('Open a workspace folder before starting a review.');
 		}
 
+		this.manualGitBaselines.clear();
 		const files = new Map<string, ReviewFileState>();
 		for (const pair of pairs) {
 			const file = this.createFileState(pair);
@@ -368,6 +390,7 @@ export class ReviewController implements vscode.Disposable {
 		}
 
 		const folder = vscode.workspace.getWorkspaceFolder(uri);
+		this.manualGitBaselines.clear();
 		this.activeSession = {
 			id: `git-${Date.now()}`,
 			mode: 'git',
@@ -413,11 +436,11 @@ export class ReviewController implements vscode.Disposable {
 			}
 
 			target.file.oldText = acceptHunkInBaseline(target.file.oldText, target.hunk);
-			this.mapAcceptedDecisionBaselineStarts(target.file, {
+			this.mapDecisionBaselineStarts(target.file, [{
 				oldStart: target.hunk.oldStart,
 				oldLines: target.hunk.oldLines,
 				newLines: target.hunk.newLines,
-			});
+			}]);
 			this.recordDecisionHunk(target.file, target.hunk, 'accept', target.hunk.newStart, target.hunk.newLines, target.hunk.oldStart, target.hunk.newStart);
 			this.syncBaselineExistsAfterAccept(target.file);
 			this.touchFileRevision(target.file);
@@ -462,11 +485,11 @@ export class ReviewController implements vscode.Disposable {
 				await this.withInternalWrite(target.file.uri, 'plugin', () => this.writeFileText(target.file.uri, target.file.oldText));
 				target.file.newText = target.file.oldText;
 				target.file.currentExists = true;
-				this.mapRejectedDecisionCurrentStarts(target.file, {
+				this.mapDecisionCurrentStarts(target.file, [{
 					oldStart: target.hunk.newStart,
 					oldLines: target.hunk.newLines,
 					newLines: target.hunk.oldLines,
-				});
+				}]);
 				this.recordDecisionHunk(target.file, target.hunk, 'reject', target.hunk.oldStart, target.hunk.oldLines, target.hunk.oldStart, target.hunk.oldStart);
 				this.touchFileRevision(target.file);
 				await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
@@ -495,11 +518,11 @@ export class ReviewController implements vscode.Disposable {
 			});
 			target.file.newText = rejectedText;
 			target.file.currentExists = true;
-			this.mapRejectedDecisionCurrentStarts(target.file, {
+			this.mapDecisionCurrentStarts(target.file, [{
 				oldStart: target.hunk.newStart,
 				oldLines: target.hunk.newLines,
 				newLines: target.hunk.oldLines,
-			});
+			}]);
 			this.recordDecisionHunk(target.file, target.hunk, 'reject', target.hunk.newStart, target.hunk.oldLines, target.hunk.oldStart, target.hunk.newStart);
 			this.touchFileRevision(target.file);
 			await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
@@ -541,11 +564,11 @@ export class ReviewController implements vscode.Disposable {
 				}
 				target.file.oldText = replaceLineBlock(target.file.oldText, baselineStart, target.hunk.newLines, target.hunk.oldText);
 				target.file.acceptedHunks = target.file.acceptedHunks.filter((item) => item.id !== target.hunk.id);
-				this.mapAcceptedDecisionBaselineStarts(target.file, {
+				this.mapDecisionBaselineStarts(target.file, [{
 					oldStart: baselineStart,
 					oldLines: target.hunk.newLines,
 					newLines: target.hunk.oldLines,
-				});
+				}]);
 				this.syncBaselineExistsForPending(target.file);
 				if (this.activeSession?.mode === 'snapshot') {
 					await this.updateSnapshotBaselineFile(target.file);
@@ -562,11 +585,11 @@ export class ReviewController implements vscode.Disposable {
 				target.file.newText = currentText;
 				target.file.currentExists = true;
 				target.file.rejectedHunks = target.file.rejectedHunks.filter((item) => item.id !== target.hunk.id);
-				this.mapRejectedDecisionCurrentStarts(target.file, {
+				this.mapDecisionCurrentStarts(target.file, [{
 					oldStart: currentStart,
 					oldLines: target.hunk.displayLines,
 					newLines: target.hunk.newLines,
-				});
+				}]);
 			}
 
 			this.touchFileRevision(target.file);
@@ -599,8 +622,14 @@ export class ReviewController implements vscode.Disposable {
 				await this.refreshFile(file.uri, { reconcileExternalChanges: false });
 				return;
 			}
+			const baselineEdits = pendingHunks.map((hunk) => ({
+				oldStart: hunk.oldStart,
+				oldLines: hunk.oldLines,
+				newLines: hunk.newLines,
+			}));
 			file.oldText = file.newText;
 			file.baselineExists = file.currentExists;
+			this.mapDecisionBaselineStarts(file, baselineEdits);
 			for (const hunk of pendingHunks) {
 				this.recordDecisionHunk(file, hunk, 'accept', hunk.newStart, hunk.newLines, hunk.newStart, hunk.newStart);
 			}
@@ -644,9 +673,15 @@ export class ReviewController implements vscode.Disposable {
 			for (const hunk of [...pendingHunks].sort((left, right) => right.newStart - left.newStart)) {
 				currentText = replaceLineBlock(currentText, hunk.newStart, hunk.newLines, hunk.oldText);
 			}
+			const currentEdits = pendingHunks.map((hunk) => ({
+				oldStart: hunk.newStart,
+				oldLines: hunk.newLines,
+				newLines: hunk.oldLines,
+			}));
 
 			refreshedFile.newText = currentText;
 			refreshedFile.currentExists = true;
+			this.mapDecisionCurrentStarts(refreshedFile, currentEdits);
 			for (const hunk of pendingHunks) {
 				this.recordDecisionHunk(refreshedFile, hunk, 'reject', hunk.oldStart, hunk.oldLines, hunk.oldStart, hunk.oldStart);
 			}
@@ -805,6 +840,7 @@ export class ReviewController implements vscode.Disposable {
 
 		await this.ensureGitReviewForUri(uri);
 		await this.reviewWebview.open(uri);
+		this.setCurrentReviewUri(uri);
 	}
 
 	private async navigateFromReview(
@@ -1110,18 +1146,31 @@ export class ReviewController implements vscode.Disposable {
 			for (const file of files) {
 				await this.deleteRejectedCurrentFileOnRefresh(file);
 			}
-			await this.refreshGitSessionFiles();
+			await this.refreshGitSessionFiles({ source: 'manual' });
 			return;
 		}
 
 		for (const file of files) {
 			await this.deleteRejectedCurrentFileOnRefresh(file);
-			file.acceptedHunks = [];
-			file.rejectedHunks = [];
-			this.touchFileRevision(file);
-			await this.updateSnapshotBaselineFile(file);
-			await this.refreshFile(file.uri, { reconcileExternalChanges: false, preferDisk: true });
+			await this.refreshFile(file.uri, { preferDisk: true });
+			const refreshedFile = this.activeSession?.files.get(uriKey(file.uri));
+			if (refreshedFile && shouldMergeReviewedFileOnRefresh(
+				refreshedFile.hunks.length,
+				refreshedFile.acceptedHunks.length,
+				refreshedFile.rejectedHunks.length,
+				refreshedFile.skippedReason,
+			)) {
+				await this.mergeReviewedSnapshotFileOnRefresh(refreshedFile);
+			}
 		}
+	}
+
+	private async mergeReviewedSnapshotFileOnRefresh(file: ReviewFileState): Promise<void> {
+		file.acceptedHunks = [];
+		file.rejectedHunks = [];
+		this.touchFileRevision(file);
+		await this.updateSnapshotBaselineFile(file);
+		await this.refreshFile(file.uri, { reconcileExternalChanges: false, preferDisk: true });
 	}
 
 	private async deleteRejectedCurrentFileOnRefresh(file: ReviewFileState): Promise<void> {
@@ -1139,7 +1188,7 @@ export class ReviewController implements vscode.Disposable {
 		file.currentExists = false;
 	}
 
-	private async refreshGitSessionFiles(indexStateSignature?: string): Promise<void> {
+	private async refreshGitSessionFiles(request: GitSessionRefreshRequest): Promise<void> {
 		if (!this.activeSession || this.activeSession.mode !== 'git') {
 			return;
 		}
@@ -1150,12 +1199,28 @@ export class ReviewController implements vscode.Disposable {
 		}
 
 		const previousFiles = this.activeSession.files;
+		if (request.source === 'manual') {
+			this.captureManualGitBaselines(previousFiles);
+		} else {
+			this.manualGitBaselines.clear();
+		}
 		const pairs = await this.gitService.createFilePairs(folder);
 		const nextFiles = new Map<string, ReviewFileState>();
+		const seenKeys = new Set<string>();
 		for (const pair of pairs) {
 			const key = uriKey(pair.uri);
-			const file = this.createFileState(pair);
+			seenKeys.add(key);
+			const manualBaseline = request.source === 'manual'
+				? this.manualGitBaselineForPair(pair)
+				: undefined;
+			const file = this.createFileState(applyManualGitBaselineToPair(pair, manualBaseline));
 			if (file.hunks.length > 0 || file.skippedReason) {
+				const previous = previousFiles.get(key);
+				if (previous) {
+					file.revision = previous.revision + 1;
+				}
+				nextFiles.set(key, file);
+			} else if (manualBaseline) {
 				const previous = previousFiles.get(key);
 				if (previous) {
 					file.revision = previous.revision + 1;
@@ -1163,9 +1228,46 @@ export class ReviewController implements vscode.Disposable {
 				nextFiles.set(key, file);
 			}
 		}
+		if (request.source === 'manual') {
+			this.pruneManualGitBaselines(seenKeys);
+		}
 		this.activeSession.files = nextFiles;
-		this.gitIndexStateSignature = indexStateSignature ?? await this.gitService.indexStateSignature(folder);
+		this.gitIndexStateSignature = request.source === 'gitIndexChanged'
+			? request.indexStateSignature
+			: await this.gitService.indexStateSignature(folder);
 		this.refreshUi();
+	}
+
+	private captureManualGitBaselines(files: Map<string, ReviewFileState>): void {
+		for (const [key, file] of files) {
+			const baseline = manualGitBaselineFromReviewedFile(file);
+			if (baseline) {
+				this.manualGitBaselines.set(key, baseline);
+			}
+		}
+	}
+
+	private manualGitBaselineForPair(pair: FilePair): GitManualBaseline | undefined {
+		const key = uriKey(pair.uri);
+		const baseline = this.manualGitBaselines.get(key);
+		if (!baseline) {
+			return undefined;
+		}
+
+		if (pair.skippedReason) {
+			this.manualGitBaselines.delete(key);
+			return undefined;
+		}
+
+		return baseline;
+	}
+
+	private pruneManualGitBaselines(seenKeys: Set<string>): void {
+		for (const key of this.manualGitBaselines.keys()) {
+			if (!seenKeys.has(key)) {
+				this.manualGitBaselines.delete(key);
+			}
+		}
 	}
 
 	private async refreshFile(uri: vscode.Uri, options: { reconcileExternalChanges?: boolean; preferDisk?: boolean } = {}): Promise<void> {
@@ -1195,7 +1297,7 @@ export class ReviewController implements vscode.Disposable {
 			}
 
 			file = this.createFileState(pair);
-			if (file.hunks.length === 0 && !file.skippedReason) {
+			if (file.hunks.length === 0 && !file.skippedReason && !this.manualGitBaselines.has(key)) {
 				return;
 			}
 			this.activeSession.files.set(key, file);
@@ -1209,12 +1311,24 @@ export class ReviewController implements vscode.Disposable {
 			const externalHunks = computeLineDiff(file.uri.toString(), file.newText, current.text);
 			this.reconcileDecisionHunksForExternalChanges(file, externalHunks);
 		}
+		const manualBaseline = this.activeSession.mode === 'git'
+			? this.manualGitBaselines.get(key)
+			: undefined;
+		if (manualBaseline && !file.skippedReason) {
+			file.oldText = manualBaseline.oldText;
+			file.baselineExists = manualBaseline.baselineExists;
+			file.originalText = manualBaseline.oldText;
+			file.originalExists = manualBaseline.baselineExists;
+		}
 		file.newText = current.text;
 		file.currentExists = current.exists;
 		const diff = this.computeReviewHunks(file.uri, file.oldText, file.newText);
+		if (this.activeSession.mode === 'git' && diff.skippedReason) {
+			this.manualGitBaselines.delete(key);
+		}
 		file.hunks = diff.hunks;
 		file.skippedReason = diff.skippedReason;
-		if (file.hunks.length === 0 && this.decisionHunks(file).length === 0 && !file.skippedReason) {
+		if (file.hunks.length === 0 && this.decisionHunks(file).length === 0 && !file.skippedReason && !this.manualGitBaselines.has(key)) {
 			this.activeSession.files.delete(key);
 		}
 		if (previousState !== this.fileStateFingerprint(file)) {
@@ -1257,6 +1371,15 @@ export class ReviewController implements vscode.Disposable {
 	private refreshUi(): void {
 		this.treeProvider.refresh();
 		this.reviewWebview.refresh();
+		this.dashboardProvider.refresh();
+	}
+
+	private setCurrentReviewUri(uri: vscode.Uri): void {
+		if (this.currentReviewUri && uriKey(this.currentReviewUri) === uriKey(uri)) {
+			return;
+		}
+		this.currentReviewUri = uri;
+		this.dashboardProvider.refresh();
 	}
 
 	private activeGitWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
@@ -1313,7 +1436,7 @@ export class ReviewController implements vscode.Disposable {
 				return;
 			}
 
-			await this.refreshGitSessionFiles(signature);
+			await this.refreshGitSessionFiles({ source: 'gitIndexChanged', indexStateSignature: signature });
 		} catch {
 			// Git may be unavailable briefly while the repository is changing.
 		}
@@ -1497,6 +1620,7 @@ export class ReviewController implements vscode.Disposable {
 		const folder = vscode.workspace.getWorkspaceFolder(uri);
 
 		if (!this.activeSession) {
+			this.manualGitBaselines.clear();
 			this.activeSession = {
 				id: `git-${Date.now()}`,
 				mode: 'git',
@@ -1519,7 +1643,12 @@ export class ReviewController implements vscode.Disposable {
 		const folder = vscode.workspace.getWorkspaceFolder(uri);
 
 		try {
-			return await this.gitService.createFilePairForUri(uri, folder, { preferDisk: options.preferDisk });
+			const pair = await this.gitService.createFilePairForUri(uri, folder, { preferDisk: options.preferDisk });
+			if (!pair) {
+				this.manualGitBaselines.delete(uriKey(uri));
+				return undefined;
+			}
+			return applyManualGitBaselineToPair(pair, this.manualGitBaselineForPair(pair));
 		} catch {
 			return undefined;
 		}
@@ -1866,24 +1995,36 @@ export class ReviewController implements vscode.Disposable {
 		};
 	}
 
-	private mapAcceptedDecisionBaselineStarts(file: ReviewFileState, edit: { oldStart: number; oldLines: number; newLines: number }): void {
-		file.acceptedHunks = file.acceptedHunks.map((hunk) => this.refreshDecisionContexts({
+	private mapDecisionBaselineStarts(file: ReviewFileState, edits: Array<{ oldStart: number; oldLines: number; newLines: number }>): void {
+		if (edits.length === 0) {
+			return;
+		}
+
+		const mapHunk = (hunk: ReviewedHunk): ReviewedHunk => this.refreshDecisionContexts({
 			...hunk,
-			baselineStart: mapLineAfterLineEdits(hunk.baselineStart, [edit]),
-		}, file.oldText, file.newText));
+			baselineStart: mapLineAfterFileEdits(hunk.baselineStart, edits),
+		}, file.oldText, file.newText);
+		file.acceptedHunks = file.acceptedHunks.map(mapHunk);
+		file.rejectedHunks = file.rejectedHunks.map(mapHunk);
 	}
 
-	private mapRejectedDecisionCurrentStarts(file: ReviewFileState, edit: { oldStart: number; oldLines: number; newLines: number }): void {
-		file.rejectedHunks = file.rejectedHunks.map((hunk) => {
-			const currentStart = mapLineAfterLineEdits(hunk.currentStart, [edit]);
-			const displayStart = hunk.displayStart === hunk.currentStart ? currentStart : hunk.displayStart;
+	private mapDecisionCurrentStarts(file: ReviewFileState, edits: Array<{ oldStart: number; oldLines: number; newLines: number }>): void {
+		if (edits.length === 0) {
+			return;
+		}
+
+		const mapHunk = (hunk: ReviewedHunk): ReviewedHunk => {
+			const currentStart = mapLineAfterFileEdits(hunk.currentStart, edits);
+			const displayStart = mapLineAfterFileEdits(hunk.displayStart, edits);
 			return this.refreshDecisionContexts({
 				...hunk,
 				currentStart,
 				displayStart,
 				zoneAfterLineNumber: displayStart,
 			}, file.oldText, file.newText);
-		});
+		};
+		file.acceptedHunks = file.acceptedHunks.map(mapHunk);
+		file.rejectedHunks = file.rejectedHunks.map(mapHunk);
 	}
 
 	private mapPreviousLineToEditedLine(line: number, manualHunks: ReviewHunk[]): number {

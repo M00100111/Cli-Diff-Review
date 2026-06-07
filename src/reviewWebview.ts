@@ -94,6 +94,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 		private readonly getSession: () => ReviewSession | undefined,
 		private readonly navigateFromReview: (type: ReviewNavigationRequestType, uri: string, line: number, column: number, requestId?: number) => Promise<ReviewNavigationResponse | undefined>,
 		private readonly openNavigationTarget: (uri: string, line: number, column: number) => Promise<void>,
+		private readonly onDidActivateReview?: (uri: vscode.Uri) => void,
 	) {
 		this.disposables.push(
 			vscode.window.registerCustomEditorProvider(ReviewWebviewManager.viewType, this),
@@ -133,7 +134,15 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 			panel.webview.onDidReceiveMessage((message: WebviewMessage) => {
 				void this.handleMessage(host, message);
 			}),
+			panel.onDidChangeViewState((event) => {
+				if (event.webviewPanel.active) {
+					this.onDidActivateReview?.(host.uri);
+				}
+			}),
 		);
+		if (panel.active) {
+			this.onDidActivateReview?.(host.uri);
+		}
 	}
 
 	public async open(uri: vscode.Uri, revealPosition?: { line: number; column: number }): Promise<void> {
@@ -143,6 +152,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 		}
 
 		await vscode.commands.executeCommand('vscode.openWith', uri, ReviewWebviewManager.viewType, vscode.ViewColumn.Active);
+		this.onDidActivateReview?.(uri);
 		const host = this.hosts.get(key);
 		if (host) {
 			host.revealPosition = revealPosition;

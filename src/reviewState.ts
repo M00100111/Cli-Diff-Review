@@ -1,4 +1,5 @@
 import { splitLines } from './text';
+import type { FilePair, ReviewFileState } from './types';
 
 export function isStaleRevision(currentRevision: number, expectedRevision?: number): boolean {
 	return typeof expectedRevision === 'number' && currentRevision !== expectedRevision;
@@ -21,6 +22,11 @@ export interface LineBlockContext {
 	after: string[];
 }
 
+export interface GitManualBaseline {
+	oldText: string;
+	baselineExists: boolean;
+}
+
 export function skippedCurrentFile(skippedReason: string): CurrentTextState {
 	return { text: '', exists: true, skippedReason };
 }
@@ -34,10 +40,63 @@ export function shouldDeleteRejectedCurrentFileOnRefresh(
 	return !baselineExists && currentText.length === 0 && acceptedHunkCount === 0 && rejectedHunkCount > 0;
 }
 
+export function shouldMergeReviewedFileOnRefresh(
+	pendingHunkCount: number,
+	acceptedHunkCount: number,
+	rejectedHunkCount: number,
+	skippedReason?: string,
+): boolean {
+	return pendingHunkCount === 0
+		&& !skippedReason
+		&& acceptedHunkCount + rejectedHunkCount > 0;
+}
+
+export function manualGitBaselineFromReviewedFile(file: ReviewFileState): GitManualBaseline | undefined {
+	if ((!file.currentExists && file.acceptedHunks.length === 0) || !shouldMergeReviewedFileOnRefresh(
+		file.hunks.length,
+		file.acceptedHunks.length,
+		file.rejectedHunks.length,
+		file.skippedReason,
+	)) {
+		return undefined;
+	}
+
+	return {
+		oldText: file.newText,
+		baselineExists: file.currentExists,
+	};
+}
+
+export function applyManualGitBaselineToPair(pair: FilePair, baseline: GitManualBaseline | undefined): FilePair {
+	if (!baseline || pair.skippedReason) {
+		return pair;
+	}
+
+	return {
+		...pair,
+		oldText: baseline.oldText,
+		baselineExists: baseline.baselineExists,
+	};
+}
+
 export function mapLineAfterLineEdits(line: number, edits: LineEdit[]): number {
 	let mappedLine = line;
 	for (const edit of [...edits].sort((left, right) => left.oldStart - right.oldStart)) {
 		if (edit.oldStart < line && edit.oldStart + edit.oldLines <= line) {
+			mappedLine += edit.newLines - edit.oldLines;
+		}
+	}
+	return Math.max(0, mappedLine);
+}
+
+export function mapLineAfterFileEdits(line: number, edits: LineEdit[]): number {
+	let mappedLine = line;
+	for (const edit of [...edits].sort((left, right) => left.oldStart - right.oldStart)) {
+		if (edit.oldLines === 0) {
+			if (edit.oldStart <= line) {
+				mappedLine += edit.newLines;
+			}
+		} else if (edit.oldStart + edit.oldLines <= line) {
 			mappedLine += edit.newLines - edit.oldLines;
 		}
 	}
