@@ -150,7 +150,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 
 	private renderShell(webview: vscode.Webview): string {
 		const nonce = String(Date.now());
-		const iconFile = vscode.Uri.joinPath(vscode.Uri.file(__dirname), '..', 'resources', 'icon.svg');
+		const iconFile = vscode.Uri.joinPath(vscode.Uri.file(__dirname), '..', 'resources', 'logo.svg');
 		const iconUri = typeof webview.asWebviewUri === 'function' ? webview.asWebviewUri(iconFile).toString() : '';
 		return /* html */`<!DOCTYPE html>
 <html lang="en">
