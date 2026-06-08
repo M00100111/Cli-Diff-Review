@@ -1,5 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
+import type { LlmProvider } from './llm/config';
 import { ReviewFileState, ReviewSession, uriKey } from './types';
 
 type DashboardMessage =
@@ -8,7 +9,10 @@ type DashboardMessage =
 	| { type: 'open'; uri: string }
 	| { type: 'acceptFile'; uri: string }
 	| { type: 'rejectFile'; uri: string }
-	| { type: 'undoFile'; uri: string };
+	| { type: 'undoFile'; uri: string }
+	| { type: 'saveLlmConfig'; provider: LlmProvider; baseUrl: string; model: string; apiKey: string }
+	| { type: 'initializeWiki' }
+	| { type: 'cancelWikiInitialization' };
 
 export interface ReviewDashboardFile {
 	uri: string;
@@ -32,6 +36,22 @@ export interface ReviewDashboardPayload {
 	currentReviewLabel?: string;
 	changeSignature: string;
 	files: ReviewDashboardFile[];
+	llmWiki?: LlmWikiDashboardState;
+}
+
+export type LlmWikiStatus = 'unconfigured' | 'idle' | 'initializing' | 'initialized' | 'paused' | 'failed';
+
+export interface LlmWikiDashboardState {
+	configured: boolean;
+	provider: LlmProvider;
+	baseUrl: string;
+	model: string;
+	hasApiKey: boolean;
+	status: LlmWikiStatus;
+	wikiExists: boolean;
+	workspaceAvailable: boolean;
+	progress?: string;
+	error?: string;
 }
 
 export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vscode.Disposable {
@@ -53,7 +73,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 
 	public resolveWebviewView(view: vscode.WebviewView): void {
 		this.view = view;
-		view.webview.options = { enableScripts: true };
+		view.webview.options = {
+			enableScripts: true,
+			localResourceRoots: [vscode.Uri.joinPath(vscode.Uri.file(__dirname), '..', 'resources')],
+		};
 		view.webview.html = this.renderShell(view.webview);
 		this.disposables.push(view.webview.onDidReceiveMessage((message: DashboardMessage) => {
 			void this.handleMessage(message);
@@ -102,16 +125,38 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		if (message.type === 'undoFile') {
 			await this.executeCommand('cli-diff.undoFile', message.uri);
 			this.postState();
+			return;
+		}
+		if (message.type === 'saveLlmConfig') {
+			await this.executeCommand('cli-diff.saveLlmWikiConfig', {
+				provider: message.provider,
+				baseUrl: message.baseUrl,
+				model: message.model,
+				apiKey: message.apiKey,
+			});
+			this.postState();
+			return;
+		}
+		if (message.type === 'initializeWiki') {
+			await this.executeCommand('cli-diff.initializeLlmWiki');
+			this.postState();
+			return;
+		}
+		if (message.type === 'cancelWikiInitialization') {
+			await this.executeCommand('cli-diff.cancelLlmWikiInitialization');
+			this.postState();
 		}
 	}
 
 	private renderShell(webview: vscode.Webview): string {
 		const nonce = String(Date.now());
+		const iconFile = vscode.Uri.joinPath(vscode.Uri.file(__dirname), '..', 'resources', 'icon.svg');
+		const iconUri = typeof webview.asWebviewUri === 'function' ? webview.asWebviewUri(iconFile).toString() : '';
 		return /* html */`<!DOCTYPE html>
 <html lang="en">
 <head>
 	<meta charset="UTF-8">
-	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource}; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<style>
 		:root {
@@ -153,7 +198,97 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			flex-direction: column;
 			padding: 0;
 		}
-		.spacer { flex: 1 1 auto; min-height: 120px; }
+		.wiki-panel {
+			flex: 1 1 auto;
+			min-height: 168px;
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			padding: 12px 8px;
+			color: var(--vscode-sideBar-foreground);
+		}
+		.wiki-config,
+		.wiki-main {
+			width: 100%;
+			max-width: 260px;
+			display: flex;
+			flex-direction: column;
+			align-items: stretch;
+			gap: 7px;
+		}
+		.wiki-config[hidden],
+		.wiki-main[hidden],
+		.model-pill[hidden],
+		.wiki-logo[hidden] { display: none; }
+		.wiki-field {
+			display: flex;
+			flex-direction: column;
+			gap: 3px;
+		}
+		.wiki-field label {
+			color: var(--muted);
+			font-size: 11px;
+		}
+		.wiki-field input,
+		.wiki-field select {
+			width: 100%;
+			height: 24px;
+			border: 1px solid var(--vscode-input-border, transparent);
+			border-radius: 3px;
+			padding: 2px 6px;
+			color: var(--vscode-input-foreground);
+			background: var(--vscode-input-background);
+			font: inherit;
+		}
+		.wiki-field input:focus,
+		.wiki-field select:focus {
+			outline: 1px solid var(--accent);
+			outline-offset: -1px;
+		}
+		.wiki-action,
+		.wiki-save {
+			min-height: 26px;
+			padding: 3px 8px;
+			border-color: var(--vscode-button-border, transparent);
+			border-radius: 6px;
+			color: var(--vscode-button-foreground);
+			background: var(--vscode-button-background);
+		}
+		.wiki-action:hover:not(:disabled),
+		.wiki-save:hover:not(:disabled) {
+			background: var(--vscode-button-hoverBackground);
+		}
+		.wiki-action.secondary {
+			color: var(--vscode-sideBar-foreground);
+			background: transparent;
+			border-color: var(--tree-border);
+		}
+		.wiki-logo {
+			width: 72px;
+			height: 72px;
+			align-self: center;
+			opacity: .82;
+		}
+		.wiki-status {
+			min-height: 16px;
+			color: var(--muted);
+			text-align: center;
+			line-height: 1.35;
+			overflow-wrap: anywhere;
+		}
+		.model-pill {
+			max-width: 132px;
+			margin-right: 3px;
+			padding: 1px 5px;
+			border: 1px solid var(--tree-border);
+			border-radius: 6px;
+			color: var(--muted);
+			font-size: 10px;
+			font-weight: 500;
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+		}
 		.review-tree {
 			flex: 0 0 auto;
 			margin: 0;
@@ -311,7 +446,35 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 </head>
 <body>
 	<div class="shell">
-		<div class="spacer" aria-hidden="true"></div>
+		<section class="wiki-panel" aria-label="LLM Code Wiki">
+			<form class="wiki-config" id="wikiConfig">
+				<div class="wiki-field">
+					<label for="llmProvider">Provider</label>
+					<select id="llmProvider">
+						<option value="openai">OpenAI-compatible</option>
+						<option value="anthropic">Anthropic</option>
+					</select>
+				</div>
+				<div class="wiki-field">
+					<label for="llmBaseUrl">Base URL</label>
+					<input id="llmBaseUrl" type="url" autocomplete="off" placeholder="https://api.openai.com/v1">
+				</div>
+				<div class="wiki-field">
+					<label for="llmModel">Model</label>
+					<input id="llmModel" type="text" autocomplete="off" placeholder="gpt-4.1">
+				</div>
+				<div class="wiki-field">
+					<label for="llmApiKey">API Key</label>
+					<input id="llmApiKey" type="password" autocomplete="off" placeholder="sk-...">
+				</div>
+				<button class="wiki-save" id="saveLlmConfig" type="submit">Save</button>
+			</form>
+			<div class="wiki-main" id="wikiMain" hidden>
+				<img class="wiki-logo" id="wikiLogo" src="${iconUri}" alt="">
+				<div class="wiki-status" id="wikiStatus"></div>
+				<button class="wiki-action" id="wikiAction" type="button">Initialize LLM Code Wiki</button>
+			</div>
+		</section>
 		<section class="review-tree" aria-label="Cli Diff Review">
 			<header class="tree-header">
 				<div class="header-left">
@@ -321,6 +484,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					</button>
 				</div>
 				<div class="header-actions">
+					<span class="model-pill" id="modelPill" hidden></span>
 					<button class="refresh-button" id="refresh" title="Refresh" aria-label="Refresh">
 						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8A5 5 0 1 1 11.5 4.5"/><path d="M11.5 2.5V4.5H13.5"/></svg>
 					</button>
@@ -334,9 +498,37 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const tree = document.querySelector('.review-tree');
 		const toggle = document.getElementById('toggle');
 		const list = document.getElementById('list');
+		const modelPill = document.getElementById('modelPill');
+		const wikiConfig = document.getElementById('wikiConfig');
+		const wikiMain = document.getElementById('wikiMain');
+		const wikiLogo = document.getElementById('wikiLogo');
+		const wikiStatus = document.getElementById('wikiStatus');
+		const wikiAction = document.getElementById('wikiAction');
+		const llmProvider = document.getElementById('llmProvider');
+		const llmBaseUrl = document.getElementById('llmBaseUrl');
+		const llmModel = document.getElementById('llmModel');
+		const llmApiKey = document.getElementById('llmApiKey');
 		document.getElementById('refresh').addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
+		wikiConfig.addEventListener('submit', (event) => {
+			event.preventDefault();
+			vscode.postMessage({
+				type: 'saveLlmConfig',
+				provider: llmProvider.value,
+				baseUrl: llmBaseUrl.value,
+				model: llmModel.value,
+				apiKey: llmApiKey.value,
+			});
+		});
+		wikiAction.addEventListener('click', () => {
+			if (lastWikiState?.status === 'initializing') {
+				vscode.postMessage({ type: 'cancelWikiInitialization' });
+				return;
+			}
+			vscode.postMessage({ type: 'initializeWiki' });
+		});
 		let expanded = true;
 		let lastChangeSignature;
+		let lastWikiState;
 		toggle.addEventListener('click', () => setExpanded(!expanded));
 		toggle.addEventListener('keydown', (event) => {
 			if (event.key === 'Enter' || event.key === ' ') {
@@ -364,6 +556,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				setExpanded(true);
 			}
 			lastChangeSignature = changeSignature;
+			renderWiki(payload.llmWiki || emptyWikiState());
 			list.replaceChildren();
 			if (files.length === 0) {
 				const empty = document.createElement('div');
@@ -375,6 +568,62 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			for (const file of files) {
 				list.appendChild(fileRow(file));
 			}
+		}
+
+		function renderWiki(wiki) {
+			lastWikiState = wiki;
+			llmProvider.value = wiki.provider || 'openai';
+			llmBaseUrl.value = wiki.baseUrl || '';
+			llmModel.value = wiki.model || '';
+			modelPill.hidden = !wiki.configured || !wiki.model;
+			modelPill.textContent = wiki.model || '';
+			wikiConfig.hidden = Boolean(wiki.configured);
+			wikiMain.hidden = !wiki.configured;
+			if (!wiki.configured) {
+				return;
+			}
+
+			const initialized = wiki.status === 'initialized' || wiki.wikiExists;
+			const initializing = wiki.status === 'initializing';
+			wikiLogo.hidden = initializing;
+			wikiAction.classList.toggle('secondary', initializing);
+			wikiAction.disabled = (!wiki.workspaceAvailable && !initializing) || initialized;
+			wikiAction.textContent = initializing
+				? 'Cancel initialization'
+				: initialized ? 'LLM Code Wiki initialized' : 'Initialize LLM Code Wiki';
+			wikiStatus.textContent = wikiStatusText(wiki, initialized, initializing);
+		}
+
+		function wikiStatusText(wiki, initialized, initializing) {
+			if (!wiki.workspaceAvailable && !initializing) {
+				return 'Open a workspace folder';
+			}
+			if (initializing) {
+				return wiki.progress || 'Initializing .wiki';
+			}
+			if (initialized) {
+				return '.wiki initialized';
+			}
+			if (wiki.status === 'failed') {
+				return wiki.error || 'Initialization failed';
+			}
+			if (wiki.status === 'paused') {
+				return wiki.progress || 'Initialization paused';
+			}
+			return wiki.progress || 'Ready';
+		}
+
+		function emptyWikiState() {
+			return {
+				configured: false,
+				provider: 'openai',
+				baseUrl: '',
+				model: '',
+				hasApiKey: false,
+				status: 'unconfigured',
+				wikiExists: false,
+				workspaceAvailable: false,
+			};
 		}
 
 		function fileRow(file) {
@@ -455,6 +704,7 @@ export function buildReviewDashboardPayload(
 	session: ReviewSession | undefined,
 	currentReviewUri: vscode.Uri | undefined,
 	isDirty: (uri: vscode.Uri) => boolean,
+	llmWiki: LlmWikiDashboardState = defaultLlmWikiDashboardState(),
 ): ReviewDashboardPayload {
 	const currentKey = currentReviewUri ? uriKey(currentReviewUri) : undefined;
 	const files = session
@@ -502,6 +752,20 @@ export function buildReviewDashboardPayload(
 		currentReviewLabel,
 		changeSignature,
 		files,
+		llmWiki,
+	};
+}
+
+export function defaultLlmWikiDashboardState(): LlmWikiDashboardState {
+	return {
+		configured: false,
+		provider: 'openai',
+		baseUrl: '',
+		model: '',
+		hasApiKey: false,
+		status: 'unconfigured',
+		wikiExists: false,
+		workspaceAvailable: Boolean(vscode.workspace.workspaceFolders?.length),
 	};
 }
 

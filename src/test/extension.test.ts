@@ -6,6 +6,9 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { acceptHunkInBaseline, computeLineDiff } from '../diffEngine';
 import { GitService } from '../gitService';
+import { AnthropicClient, OpenAiCompatibleClient } from '../llm/client';
+import { LlmConfigStore } from '../llm/config';
+import { parseStrictJsonObject } from '../llm/json';
 import { buildReviewDashboardPayload, ReviewDashboardProvider } from '../reviewDashboard';
 import { isDotReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
 import { ReviewTreeProvider } from '../reviewTree';
@@ -24,6 +27,7 @@ import {
 } from '../reviewState';
 import { replaceLineBlock, splitLines } from '../text';
 import { FilePair, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewSession } from '../types';
+import { normalizeWikiFilePath, validateWikiInitializationResponse } from '../wiki/wikiInitializer';
 
 suite('Diff engine', () => {
 	test('detects added lines', () => {
@@ -477,6 +481,116 @@ suite('Review state', () => {
 	});
 });
 
+suite('LLM Code Wiki', () => {
+	test('parses only strict JSON objects', () => {
+		assert.deepStrictEqual(parseStrictJsonObject('{"files":[]}'), { files: [] });
+		assert.throws(() => parseStrictJsonObject('```json\n{"files":[]}\n```'));
+		assert.throws(() => parseStrictJsonObject('prefix {"files":[]}'));
+		assert.throws(() => parseStrictJsonObject('"not object"'));
+		assert.throws(() => parseStrictJsonObject('[{"files":[]}]'));
+	});
+
+	test('validates wiki response files and rejects unsafe paths', () => {
+		const valid = validateWikiInitializationResponse(validWikiResponse());
+
+		assert.strictEqual(valid.files.length, 10);
+		assert.strictEqual(normalizeWikiFilePath('modules/review-dashboard.md'), 'modules/review-dashboard.md');
+		assert.throws(() => normalizeWikiFilePath('../outside.md'));
+		assert.throws(() => normalizeWikiFilePath('/absolute.md'));
+		assert.throws(() => normalizeWikiFilePath('C:/repo/wiki.md'));
+		assert.throws(() => normalizeWikiFilePath('notes.txt'));
+		assert.throws(() => validateWikiInitializationResponse({ ...validWikiResponse(), files: [] }));
+		const missingSchema = validWikiResponse();
+		assert.throws(() => validateWikiInitializationResponse({
+			...missingSchema,
+			files: missingSchema.files.filter((file) => file.path !== 'schema.md'),
+		}));
+	});
+
+	test('extracts OpenAI-compatible JSON content from chat completions', async () => {
+		const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+		const fetchImpl: typeof fetch = async (input, init) => {
+			calls.push({ url: String(input), init });
+			return new Response(JSON.stringify({
+				choices: [{ message: { content: '{"version":1}' } }],
+			}), { status: 200 });
+		};
+		const client = new OpenAiCompatibleClient('https://api.example.test/v1', 'secret', fetchImpl);
+		const content = await client.completeJson({
+			model: 'gpt-test',
+			systemPrompt: 'system',
+			userPrompt: 'user',
+		});
+
+		assert.strictEqual(content, '{"version":1}');
+		assert.strictEqual(calls[0].url, 'https://api.example.test/v1/chat/completions');
+		assert.strictEqual((calls[0].init?.headers as Record<string, string>).authorization, 'Bearer secret');
+		assert.strictEqual(JSON.parse(String(calls[0].init?.body)).model, 'gpt-test');
+	});
+
+	test('extracts Anthropic JSON content from messages responses', async () => {
+		const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+		const fetchImpl: typeof fetch = async (input, init) => {
+			calls.push({ url: String(input), init });
+			return new Response(JSON.stringify({
+				content: [{ type: 'text', text: '{"version":1}' }],
+			}), { status: 200 });
+		};
+		const client = new AnthropicClient('https://api.anthropic.test', 'secret', fetchImpl);
+		const content = await client.completeJson({
+			model: 'claude-test',
+			systemPrompt: 'system',
+			userPrompt: 'user',
+		});
+
+		assert.strictEqual(content, '{"version":1}');
+		assert.strictEqual(calls[0].url, 'https://api.anthropic.test/v1/messages');
+		assert.strictEqual((calls[0].init?.headers as Record<string, string>)['x-api-key'], 'secret');
+		assert.strictEqual(JSON.parse(String(calls[0].init?.body)).model, 'claude-test');
+	});
+
+	test('stores LLM config globally while keeping API key in secrets', async () => {
+		const globalState = new TestMemento();
+		const secrets = new TestSecretStorage();
+		const store = new LlmConfigStore({ globalState, secrets } as unknown as vscode.ExtensionContext);
+
+		await store.save({
+			provider: 'anthropic',
+			baseUrl: ' https://api.anthropic.com ',
+			model: ' claude-test ',
+			apiKey: ' secret-key ',
+		});
+		const saved = await store.savedConfig();
+		const runtime = await store.runtimeConfig();
+
+		assert.strictEqual(saved.provider, 'anthropic');
+		assert.strictEqual(saved.baseUrl, 'https://api.anthropic.com');
+		assert.strictEqual(saved.model, 'claude-test');
+		assert.strictEqual(saved.configured, true);
+		assert.strictEqual(runtime?.apiKey, 'secret-key');
+		assert.strictEqual(globalState.values.has('cliDiff.llm.apiKey'), false);
+	});
+
+	test('includes wiki state in dashboard payload', () => {
+		const wiki = {
+			configured: true,
+			provider: 'openai' as const,
+			baseUrl: 'https://api.openai.com/v1',
+			model: 'gpt-test',
+			hasApiKey: true,
+			status: 'idle' as const,
+			wikiExists: false,
+			workspaceAvailable: true,
+		};
+		const payload = buildReviewDashboardPayload(undefined, undefined, () => false, wiki);
+
+		assert.ok(payload.llmWiki);
+		assert.strictEqual(payload.llmWiki.configured, true);
+		assert.strictEqual(payload.llmWiki.model, 'gpt-test');
+		assert.deepStrictEqual(payload.files, []);
+	});
+});
+
 suite('Git service', () => {
 	test('uses the index as the Git review baseline', async function (this: Mocha.Context) {
 		this.timeout(10000);
@@ -580,6 +694,67 @@ suite('Text helpers', () => {
 		assert.strictEqual(replaceLineBlock('a\nb\nc\n', 1, 1, 'B\n'), 'a\nB\nc\n');
 	});
 });
+
+class TestMemento {
+	public readonly values = new Map<string, unknown>();
+
+	public get<T>(key: string, defaultValue?: T): T {
+		return (this.values.has(key) ? this.values.get(key) : defaultValue) as T;
+	}
+
+	public async update(key: string, value: unknown): Promise<void> {
+		if (value === undefined) {
+			this.values.delete(key);
+			return;
+		}
+		this.values.set(key, value);
+	}
+}
+
+class TestSecretStorage {
+	public readonly values = new Map<string, string>();
+	public readonly onDidChange = new vscode.EventEmitter<vscode.SecretStorageChangeEvent>().event;
+
+	public async get(key: string): Promise<string | undefined> {
+		return this.values.get(key);
+	}
+
+	public async store(key: string, value: string): Promise<void> {
+		this.values.set(key, value);
+	}
+
+	public async delete(key: string): Promise<void> {
+		this.values.delete(key);
+	}
+}
+
+interface TestWikiResponse {
+	version: 1;
+	summary: string;
+	files: Array<{ path: string; content: string }>;
+	warnings: string[];
+}
+
+function validWikiResponse(): TestWikiResponse {
+	const files = [
+		'index.md',
+		'overview.md',
+		'architecture.md',
+		'extension-surface.md',
+		'workflows.md',
+		'modules.md',
+		'decisions.md',
+		'open-questions.md',
+		'schema.md',
+		'log.md',
+	].map((file) => ({ path: file, content: `# ${file}\n` }));
+	return {
+		version: 1,
+		summary: 'Generated wiki.',
+		files,
+		warnings: [],
+	};
+}
 
 function createTempGitRepo(): string {
 	const base = fs.existsSync('C:\\tmp') ? 'C:\\tmp' : os.tmpdir();
