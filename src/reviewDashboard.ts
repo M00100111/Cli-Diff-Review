@@ -1,6 +1,7 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import type { LlmProvider } from './llm/config';
+import type { AiReviewFinding } from './agent/codeReview';
+import type { LlmProvider, LlmThinkingMode } from './llm/config';
 import { ReviewFileState, ReviewSession, uriKey } from './types';
 
 type DashboardMessage =
@@ -10,9 +11,21 @@ type DashboardMessage =
 	| { type: 'acceptFile'; uri: string }
 	| { type: 'rejectFile'; uri: string }
 	| { type: 'undoFile'; uri: string }
-	| { type: 'saveLlmConfig'; provider: LlmProvider; baseUrl: string; model: string; apiKey: string }
+	| {
+		type: 'saveLlmConfig';
+		provider: LlmProvider;
+		baseUrl: string;
+		model: string;
+		apiKey: string;
+		jsonOutputEnabled: boolean;
+		thinkingMode: LlmThinkingMode;
+		strictTools: boolean;
+	}
 	| { type: 'initializeWiki' }
-	| { type: 'cancelWikiInitialization' };
+	| { type: 'updateWiki' }
+	| { type: 'generateAiReview' }
+	| { type: 'openFinding'; uri: string; hunkId: string }
+	| { type: 'cancelAgent' };
 
 export interface ReviewDashboardFile {
 	uri: string;
@@ -39,7 +52,7 @@ export interface ReviewDashboardPayload {
 	llmWiki?: LlmWikiDashboardState;
 }
 
-export type LlmWikiStatus = 'unconfigured' | 'idle' | 'initializing' | 'initialized' | 'paused' | 'failed';
+export type LlmWikiStatus = 'unconfigured' | 'idle' | 'initializing' | 'updating' | 'reviewing' | 'initialized' | 'paused' | 'failed';
 
 export interface LlmWikiDashboardState {
 	configured: boolean;
@@ -52,6 +65,12 @@ export interface LlmWikiDashboardState {
 	workspaceAvailable: boolean;
 	progress?: string;
 	error?: string;
+	pendingSourceCount: number;
+	wikiNeedsUpdate: boolean;
+	findings: AiReviewFinding[];
+	jsonOutputEnabled: boolean;
+	thinkingMode: LlmThinkingMode;
+	strictTools: boolean;
 }
 
 export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vscode.Disposable {
@@ -133,6 +152,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				baseUrl: message.baseUrl,
 				model: message.model,
 				apiKey: message.apiKey,
+				jsonOutputEnabled: message.jsonOutputEnabled,
+				thinkingMode: message.thinkingMode,
+				strictTools: message.strictTools,
 			});
 			this.postState();
 			return;
@@ -142,8 +164,23 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			this.postState();
 			return;
 		}
-		if (message.type === 'cancelWikiInitialization') {
-			await this.executeCommand('cli-diff.cancelLlmWikiInitialization');
+		if (message.type === 'updateWiki') {
+			await this.executeCommand('cli-diff.updateLlmWiki');
+			this.postState();
+			return;
+		}
+		if (message.type === 'generateAiReview') {
+			await this.executeCommand('cli-diff.generateAiReview');
+			this.postState();
+			return;
+		}
+		if (message.type === 'openFinding') {
+			await this.executeCommand('cli-diff.openAiReviewFinding', message.uri, message.hunkId);
+			this.postState();
+			return;
+		}
+		if (message.type === 'cancelAgent') {
+			await this.executeCommand('cli-diff.cancelAgent');
 			this.postState();
 		}
 	}
@@ -198,6 +235,15 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			flex-direction: column;
 			padding: 0;
 		}
+		.page-header {
+			flex: 0 0 auto;
+			min-height: 26px;
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			padding: 4px 8px 0;
+		}
+		.page-header[hidden] { display: none; }
 		.wiki-panel {
 			flex: 1 1 auto;
 			min-height: 168px;
@@ -219,7 +265,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		.wiki-config[hidden],
 		.wiki-main[hidden],
 		.model-pill[hidden],
-		.wiki-logo[hidden] { display: none; }
+		.page-close[hidden],
+		.wiki-logo[hidden],
+		.wiki-action[hidden],
+		.findings[hidden] { display: none; }
 		.wiki-field {
 			display: flex;
 			flex-direction: column;
@@ -240,6 +289,16 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			background: var(--vscode-input-background);
 			font: inherit;
 		}
+		.wiki-check {
+			min-height: 22px;
+			display: flex;
+			align-items: center;
+			gap: 6px;
+			color: var(--muted);
+			font-size: 11px;
+		}
+		.wiki-check input { margin: 0; accent-color: var(--vscode-checkbox-selectBackground); }
+		.provider-capability[hidden] { display: none; }
 		.wiki-field input:focus,
 		.wiki-field select:focus {
 			outline: 1px solid var(--accent);
@@ -276,9 +335,30 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			line-height: 1.35;
 			overflow-wrap: anywhere;
 		}
+		.findings {
+			display: flex;
+			flex-direction: column;
+			gap: 3px;
+			max-height: min(42vh, 360px);
+			overflow: auto;
+		}
+		.finding {
+			display: grid;
+			grid-template-columns: 7px minmax(0, 1fr);
+			gap: 6px;
+			padding: 5px 6px;
+			border: 1px solid var(--tree-border);
+			border-radius: 3px;
+			text-align: left;
+		}
+		.finding-marker { width: 7px; height: 7px; margin-top: 4px; border-radius: 50%; background: var(--muted); }
+		.finding.critical .finding-marker { background: var(--vscode-errorForeground); }
+		.finding.warning .finding-marker { background: var(--vscode-editorWarning-foreground); }
+		.finding.suggestion .finding-marker { background: var(--vscode-editorInfo-foreground); }
+		.finding-title { display: block; font-weight: 600; overflow-wrap: anywhere; }
+		.finding-detail { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; line-height: 1.3; overflow-wrap: anywhere; }
 		.model-pill {
 			max-width: 132px;
-			margin-right: 3px;
 			padding: 1px 5px;
 			border: 1px solid var(--tree-border);
 			border-radius: 6px;
@@ -288,6 +368,20 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			overflow: hidden;
 			text-overflow: ellipsis;
 			white-space: nowrap;
+		}
+		.page-close {
+			width: 22px;
+			height: 22px;
+			display: inline-grid;
+			place-items: center;
+		}
+		.page-close svg {
+			width: 15px;
+			height: 15px;
+			stroke: currentColor;
+			fill: none;
+			stroke-width: 1.7;
+			stroke-linecap: round;
 		}
 		.review-tree {
 			flex: 0 0 auto;
@@ -446,6 +540,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 </head>
 <body>
 	<div class="shell">
+		<header class="page-header" id="pageHeader" hidden>
+			<button class="model-pill" id="modelPill" type="button" title="Configure LLM" hidden></button>
+			<button class="page-close" id="closeConfig" type="button" title="Close configuration" aria-label="Close configuration" hidden>
+				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4L12 12"/><path d="M12 4L4 12"/></svg>
+			</button>
+		</header>
 		<section class="wiki-panel" aria-label="LLM Code Wiki">
 			<form class="wiki-config" id="wikiConfig">
 				<div class="wiki-field">
@@ -453,6 +553,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					<select id="llmProvider">
 						<option value="openai">OpenAI-compatible</option>
 						<option value="anthropic">Anthropic</option>
+						<option value="deepseek">DeepSeek</option>
 					</select>
 				</div>
 				<div class="wiki-field">
@@ -465,12 +566,29 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				</div>
 				<div class="wiki-field">
 					<label for="llmApiKey">API Key</label>
-					<input id="llmApiKey" type="password" autocomplete="off" placeholder="sk-...">
+					<input id="llmApiKey" type="password" autocomplete="off" placeholder="Leave blank to keep current key">
 				</div>
+				<label class="wiki-check provider-capability" id="jsonOutputField">
+					<input id="llmJsonOutput" type="checkbox">
+					<span>JSON Output</span>
+				</label>
+				<div class="wiki-field provider-capability" id="thinkingModeField" hidden>
+					<label for="llmThinkingMode">Thinking</label>
+					<select id="llmThinkingMode">
+						<option value="disabled">Disabled</option>
+						<option value="high">High</option>
+						<option value="max">Max</option>
+					</select>
+				</div>
+				<label class="wiki-check provider-capability" id="strictToolsField" hidden>
+					<input id="llmStrictTools" type="checkbox">
+					<span>Strict Tools (Beta)</span>
+				</label>
 				<button class="wiki-save" id="saveLlmConfig" type="submit">Save</button>
 			</form>
 			<div class="wiki-main" id="wikiMain" hidden>
 				<img class="wiki-logo" id="wikiLogo" src="${iconUri}" alt="">
+				<div class="findings" id="findings" hidden></div>
 				<div class="wiki-status" id="wikiStatus"></div>
 				<button class="wiki-action" id="wikiAction" type="button">Initialize LLM Code Wiki</button>
 			</div>
@@ -484,7 +602,6 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					</button>
 				</div>
 				<div class="header-actions">
-					<span class="model-pill" id="modelPill" hidden></span>
 					<button class="refresh-button" id="refresh" title="Refresh" aria-label="Refresh">
 						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8A5 5 0 1 1 11.5 4.5"/><path d="M11.5 2.5V4.5H13.5"/></svg>
 					</button>
@@ -498,33 +615,78 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const tree = document.querySelector('.review-tree');
 		const toggle = document.getElementById('toggle');
 		const list = document.getElementById('list');
+		const pageHeader = document.getElementById('pageHeader');
 		const modelPill = document.getElementById('modelPill');
+		const closeConfig = document.getElementById('closeConfig');
 		const wikiConfig = document.getElementById('wikiConfig');
 		const wikiMain = document.getElementById('wikiMain');
 		const wikiLogo = document.getElementById('wikiLogo');
+		const findings = document.getElementById('findings');
 		const wikiStatus = document.getElementById('wikiStatus');
 		const wikiAction = document.getElementById('wikiAction');
 		const llmProvider = document.getElementById('llmProvider');
 		const llmBaseUrl = document.getElementById('llmBaseUrl');
 		const llmModel = document.getElementById('llmModel');
 		const llmApiKey = document.getElementById('llmApiKey');
+		const llmJsonOutput = document.getElementById('llmJsonOutput');
+		const llmThinkingMode = document.getElementById('llmThinkingMode');
+		const llmStrictTools = document.getElementById('llmStrictTools');
+		const jsonOutputField = document.getElementById('jsonOutputField');
+		const thinkingModeField = document.getElementById('thinkingModeField');
+		const strictToolsField = document.getElementById('strictToolsField');
+		let editingConfig = false;
+		let apiKeyPlaceholderActive = false;
 		document.getElementById('refresh').addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
+		modelPill.addEventListener('click', () => {
+			editingConfig = true;
+			populateConfig(lastWikiState || emptyWikiState());
+			renderWiki(lastWikiState || emptyWikiState());
+		});
+		closeConfig.addEventListener('click', closeConfigEditor);
+		llmProvider.addEventListener('change', () => {
+			editingConfig = true;
+			applyProviderCapabilities(true);
+		});
+		for (const field of [llmBaseUrl, llmModel, llmJsonOutput, llmThinkingMode, llmStrictTools]) {
+			field.addEventListener('input', () => {
+				editingConfig = true;
+			});
+		}
+		llmApiKey.addEventListener('focus', () => {
+			if (apiKeyPlaceholderActive) {
+				llmApiKey.value = '';
+				apiKeyPlaceholderActive = false;
+			}
+		});
+		llmApiKey.addEventListener('input', () => {
+			editingConfig = true;
+			apiKeyPlaceholderActive = false;
+		});
+		llmApiKey.addEventListener('blur', () => {
+			if (!llmApiKey.value && lastWikiState?.hasApiKey) {
+				showStoredApiKey();
+			}
+		});
 		wikiConfig.addEventListener('submit', (event) => {
 			event.preventDefault();
+			editingConfig = false;
 			vscode.postMessage({
 				type: 'saveLlmConfig',
 				provider: llmProvider.value,
 				baseUrl: llmBaseUrl.value,
 				model: llmModel.value,
-				apiKey: llmApiKey.value,
+				apiKey: apiKeyPlaceholderActive ? '' : llmApiKey.value,
+				jsonOutputEnabled: llmJsonOutput.checked,
+				thinkingMode: llmThinkingMode.value,
+				strictTools: llmStrictTools.checked,
 			});
 		});
 		wikiAction.addEventListener('click', () => {
-			if (lastWikiState?.status === 'initializing') {
-				vscode.postMessage({ type: 'cancelWikiInitialization' });
+			if (isAgentRunning(lastWikiState?.status)) {
+				vscode.postMessage({ type: 'cancelAgent' });
 				return;
 			}
-			vscode.postMessage({ type: 'initializeWiki' });
+			vscode.postMessage({ type: wikiAction.dataset.action || 'initializeWiki' });
 		});
 		let expanded = true;
 		let lastChangeSignature;
@@ -546,6 +708,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				return;
 			}
 			render(event.data.payload || { files: [] });
+		});
+		window.addEventListener('keydown', (event) => {
+			if (event.key === 'Escape' && editingConfig && lastWikiState?.configured) {
+				closeConfigEditor();
+			}
 		});
 		vscode.postMessage({ type: 'ready' });
 
@@ -572,34 +739,82 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 
 		function renderWiki(wiki) {
 			lastWikiState = wiki;
-			llmProvider.value = wiki.provider || 'openai';
-			llmBaseUrl.value = wiki.baseUrl || '';
-			llmModel.value = wiki.model || '';
+			if (!editingConfig) {
+				populateConfig(wiki);
+			}
+			pageHeader.hidden = !wiki.configured;
 			modelPill.hidden = !wiki.configured || !wiki.model;
 			modelPill.textContent = wiki.model || '';
-			wikiConfig.hidden = Boolean(wiki.configured);
-			wikiMain.hidden = !wiki.configured;
+			closeConfig.hidden = !wiki.configured || !editingConfig;
+			wikiConfig.hidden = Boolean(wiki.configured) && !editingConfig;
+			wikiMain.hidden = !wiki.configured || editingConfig;
 			if (!wiki.configured) {
 				return;
 			}
 
-			const initialized = wiki.status === 'initialized' || wiki.wikiExists;
-			const initializing = wiki.status === 'initializing';
-			wikiLogo.hidden = initializing;
-			wikiAction.classList.toggle('secondary', initializing);
-			wikiAction.disabled = (!wiki.workspaceAvailable && !initializing) || initialized;
-			wikiAction.textContent = initializing
-				? 'Cancel initialization'
-				: initialized ? 'LLM Code Wiki initialized' : 'Initialize LLM Code Wiki';
-			wikiStatus.textContent = wikiStatusText(wiki, initialized, initializing);
+			const initialized = wiki.status === 'initialized';
+			const running = isAgentRunning(wiki.status);
+			renderFindings(wiki.findings || []);
+			wikiLogo.hidden = running || (wiki.findings || []).length > 0;
+			wikiAction.classList.toggle('secondary', running);
+			wikiAction.hidden = false;
+			wikiAction.disabled = !wiki.workspaceAvailable && !running;
+			if (running) {
+				wikiAction.dataset.action = 'cancelAgent';
+				wikiAction.textContent = 'Cancel Agent';
+			} else if ((wiki.findings || []).length > 0) {
+				wikiAction.dataset.action = 'generateAiReview';
+				wikiAction.textContent = 'Regenerate AI review';
+			} else if ((wiki.pendingSourceCount || 0) > 0) {
+				wikiAction.dataset.action = 'generateAiReview';
+				wikiAction.textContent = 'Generate AI review';
+			} else if (wiki.wikiNeedsUpdate) {
+				wikiAction.dataset.action = 'updateWiki';
+				wikiAction.textContent = 'Update LLM Code Wiki';
+			} else if (!initialized) {
+				wikiAction.dataset.action = 'initializeWiki';
+				wikiAction.textContent = 'Initialize LLM Code Wiki';
+			} else {
+				wikiAction.hidden = true;
+			}
+			wikiStatus.textContent = wikiStatusText(wiki, initialized, running);
 		}
 
-		function wikiStatusText(wiki, initialized, initializing) {
-			if (!wiki.workspaceAvailable && !initializing) {
+		function populateConfig(wiki) {
+			llmProvider.value = wiki.provider || 'openai';
+			llmBaseUrl.value = wiki.baseUrl || '';
+			llmModel.value = wiki.model || '';
+			llmJsonOutput.checked = Boolean(wiki.jsonOutputEnabled);
+			llmThinkingMode.value = wiki.thinkingMode || 'disabled';
+			llmStrictTools.checked = Boolean(wiki.strictTools);
+			if (wiki.hasApiKey) {
+				showStoredApiKey();
+			} else {
+				llmApiKey.value = '';
+				apiKeyPlaceholderActive = false;
+			}
+			applyProviderCapabilities(false);
+		}
+
+		function showStoredApiKey() {
+			llmApiKey.value = '********';
+			apiKeyPlaceholderActive = true;
+		}
+
+		function closeConfigEditor() {
+			editingConfig = false;
+			renderWiki(lastWikiState || emptyWikiState());
+		}
+
+		function wikiStatusText(wiki, initialized, running) {
+			if (!wiki.workspaceAvailable && !running) {
 				return 'Open a workspace folder';
 			}
-			if (initializing) {
-				return wiki.progress || 'Initializing .wiki';
+			if (running) {
+				return wiki.progress || 'Agent running';
+			}
+			if ((wiki.findings || []).length > 0) {
+				return (wiki.findings || []).length + ' findings for current file';
 			}
 			if (initialized) {
 				return '.wiki initialized';
@@ -613,6 +828,60 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			return wiki.progress || 'Ready';
 		}
 
+		function renderFindings(items) {
+			findings.replaceChildren();
+			findings.hidden = items.length === 0;
+			for (const item of items) {
+				const button = document.createElement('button');
+				button.className = 'finding ' + item.severity;
+				button.title = item.explanation + '\\n\\n' + item.recommendation;
+				button.addEventListener('click', () => vscode.postMessage({ type: 'openFinding', uri: item.uri, hunkId: item.hunkId }));
+				const marker = document.createElement('span');
+				marker.className = 'finding-marker';
+				button.appendChild(marker);
+				const body = document.createElement('span');
+				const title = document.createElement('span');
+				title.className = 'finding-title';
+				title.textContent = item.title;
+				const detail = document.createElement('span');
+				detail.className = 'finding-detail';
+				detail.textContent = item.severity + ' · line ' + (item.line + 1);
+				body.append(title, detail);
+				button.appendChild(body);
+				findings.appendChild(button);
+			}
+		}
+
+		function isAgentRunning(status) {
+			return status === 'initializing' || status === 'updating' || status === 'reviewing';
+		}
+
+		function applyProviderCapabilities(providerChanged) {
+			const provider = llmProvider.value;
+			const deepseek = provider === 'deepseek';
+			jsonOutputField.hidden = provider === 'anthropic';
+			thinkingModeField.hidden = !deepseek;
+			strictToolsField.hidden = !deepseek;
+			if (providerChanged) {
+				if (deepseek) {
+					llmBaseUrl.value = 'https://api.deepseek.com';
+					llmModel.value = '';
+					llmJsonOutput.checked = true;
+					llmThinkingMode.value = 'high';
+					llmStrictTools.checked = true;
+				} else if (provider === 'anthropic') {
+					llmJsonOutput.checked = false;
+					llmThinkingMode.value = 'disabled';
+					llmStrictTools.checked = false;
+				} else {
+					llmJsonOutput.checked = true;
+					llmThinkingMode.value = 'disabled';
+					llmStrictTools.checked = false;
+				}
+			}
+			llmJsonOutput.disabled = deepseek;
+		}
+
 		function emptyWikiState() {
 			return {
 				configured: false,
@@ -623,6 +892,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				status: 'unconfigured',
 				wikiExists: false,
 				workspaceAvailable: false,
+				pendingSourceCount: 0,
+				wikiNeedsUpdate: false,
+				findings: [],
+				jsonOutputEnabled: true,
+				thinkingMode: 'disabled',
+				strictTools: false,
 			};
 		}
 
@@ -766,6 +1041,12 @@ export function defaultLlmWikiDashboardState(): LlmWikiDashboardState {
 		status: 'unconfigured',
 		wikiExists: false,
 		workspaceAvailable: Boolean(vscode.workspace.workspaceFolders?.length),
+		pendingSourceCount: 0,
+		wikiNeedsUpdate: false,
+		findings: [],
+		jsonOutputEnabled: true,
+		thinkingMode: 'disabled',
+		strictTools: false,
 	};
 }
 

@@ -4,14 +4,18 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { reviewChangeSignature, sortFindings, validateReviewFindings } from '../agent/codeReview';
+import { AgentRunner, validateAgentResponse } from '../agent/runtime';
+import { createWikiAgentTools } from '../agent/tools';
 import { acceptHunkInBaseline, computeLineDiff } from '../diffEngine';
 import { GitService } from '../gitService';
-import { AnthropicClient, OpenAiCompatibleClient } from '../llm/client';
+import { AnthropicClient, DeepSeekClient, OpenAiCompatibleClient } from '../llm/client';
 import { LlmConfigStore } from '../llm/config';
 import { parseStrictJsonObject } from '../llm/json';
 import { buildReviewDashboardPayload, ReviewDashboardProvider } from '../reviewDashboard';
 import { isDotReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
 import { ReviewTreeProvider } from '../reviewTree';
+import { normalizeMonacoThemeColor } from '../reviewWebview';
 import {
 	applyManualGitBaselineToPair,
 	captureLineBlockContext,
@@ -28,6 +32,7 @@ import {
 import { replaceLineBlock, splitLines } from '../text';
 import { FilePair, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewSession } from '../types';
 import { normalizeWikiFilePath, validateWikiInitializationResponse } from '../wiki/wikiInitializer';
+import { WikiStateService } from '../wiki/state';
 
 suite('Diff engine', () => {
 	test('detects added lines', () => {
@@ -152,6 +157,31 @@ suite('Diff engine', () => {
 	});
 });
 
+suite('Review webview compatibility', () => {
+	test('normalizes VS Code and Cursor theme colors for Monaco', () => {
+		assert.strictEqual(normalizeMonacoThemeColor('#abc', '#000000'), '#aabbcc');
+		assert.strictEqual(normalizeMonacoThemeColor('#abcd', '#000000'), '#aabbccdd');
+		assert.strictEqual(normalizeMonacoThemeColor('#AABBCCDD', '#000000', false), '#aabbcc');
+		assert.strictEqual(normalizeMonacoThemeColor('rgb(228, 228, 228)', '#000000', false), '#e4e4e4');
+		assert.strictEqual(normalizeMonacoThemeColor('rgba(228, 228, 228, 0.92)', '#000000', false), '#e4e4e4');
+		assert.strictEqual(normalizeMonacoThemeColor('rgba(228, 228, 228, 0.92)', '#000000'), '#e4e4e4eb');
+		assert.strictEqual(normalizeMonacoThemeColor('rgb(100%, 50%, 0%)', '#000000'), '#ff8000');
+		assert.strictEqual(normalizeMonacoThemeColor('not-a-color', '#123456'), '#123456');
+		assert.strictEqual(normalizeMonacoThemeColor('', 'not-a-color'), '#000000');
+	});
+
+	test('keeps Review Webview CSP and initialization failure handling compatible', () => {
+		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewWebview.ts'), 'utf8');
+		assert.ok(source.includes('font-src ${cspSource} data:;'));
+		assert.ok(source.includes("require(['vs/editor/editor.main']"));
+		assert.ok(source.includes('showInitializationError'));
+		assert.ok(source.includes('Review editor failed to initialize: '));
+		const createEditorIndex = source.indexOf('createEditor();');
+		const readyIndex = source.indexOf('ready = true;', createEditorIndex);
+		assert.ok(createEditorIndex >= 0 && readyIndex > createEditorIndex);
+	});
+});
+
 suite('Review state', () => {
 	test('skips dot files and dot folders in review file discovery', () => {
 		assert.strictEqual(isDotReviewPath('.env'), true);
@@ -159,6 +189,10 @@ suite('Review state', () => {
 		assert.strictEqual(isDotReviewPath('src/.cache/output.txt'), true);
 		assert.strictEqual(shouldSkipReviewPath('src/app.ts'), false);
 		assert.strictEqual(shouldSkipReviewPath('src/file.name.ts'), false);
+		assert.strictEqual(shouldSkipReviewPath('.wiki/overview.md', true), false);
+		assert.strictEqual(shouldSkipReviewPath('.wiki/overview.md', false), true);
+		assert.strictEqual(shouldSkipReviewPath('.wiki/.state.json', true), true);
+		assert.strictEqual(shouldSkipReviewPath('.wiki/private.json', true), true);
 	});
 
 	test('treats mismatched expected revisions as stale', () => {
@@ -388,10 +422,14 @@ suite('Review state', () => {
 	test('posts dashboard state after file-level commands', async () => {
 		const uri = vscode.Uri.file('D:/repo/src/pending.ts');
 		const posted: unknown[] = [];
+		const commands: Array<{ command: string; args: unknown[] }> = [];
 		let messageHandler: ((message: unknown) => void) | undefined;
 		const provider = new ReviewDashboardProvider(
 			() => ({ currentReviewLabel: 'pending.ts', changeSignature: String(posted.length), files: [] }),
-			async <T,>() => undefined as T,
+			async <T,>(command: string, ...args: unknown[]) => {
+				commands.push({ command, args });
+				return undefined as T;
+			},
 		);
 		const view = {
 			webview: {
@@ -412,11 +450,43 @@ suite('Review state', () => {
 
 		assert.ok(messageHandler);
 		assert.strictEqual(view.title, 'pending.ts');
+		assert.ok(view.webview.html.includes('<option value="deepseek">DeepSeek</option>'));
+		assert.ok(view.webview.html.includes('Strict Tools (Beta)'));
+		assert.ok(view.webview.html.includes('id="closeConfig"'));
+		assert.ok(view.webview.html.includes("llmApiKey.value = '********'"));
+		assert.ok(view.webview.html.includes("apiKey: apiKeyPlaceholderActive ? '' : llmApiKey.value"));
+		const modelIndex = view.webview.html.indexOf('id="modelPill"');
+		const wikiPanelIndex = view.webview.html.indexOf('class="wiki-panel"');
+		const reviewTreeIndex = view.webview.html.indexOf('class="review-tree"');
+		assert.ok(modelIndex >= 0);
+		assert.ok(modelIndex < wikiPanelIndex);
+		assert.ok(modelIndex < reviewTreeIndex);
 		const before = posted.length;
 		messageHandler({ type: 'acceptFile', uri: uri.toString() });
 		await new Promise((resolve) => setTimeout(resolve, 0));
 
 		assert.ok(posted.length > before);
+		messageHandler({
+			type: 'saveLlmConfig',
+			provider: 'deepseek',
+			baseUrl: 'https://api.deepseek.com',
+			model: 'deepseek-test',
+			apiKey: 'secret',
+			jsonOutputEnabled: true,
+			thinkingMode: 'max',
+			strictTools: true,
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const save = commands.find((call) => call.command === 'cli-diff.saveLlmWikiConfig');
+		assert.deepStrictEqual(save?.args[0], {
+			provider: 'deepseek',
+			baseUrl: 'https://api.deepseek.com',
+			model: 'deepseek-test',
+			apiKey: 'secret',
+			jsonOutputEnabled: true,
+			thinkingMode: 'max',
+			strictTools: true,
+		});
 		provider.dispose();
 	});
 
@@ -493,17 +563,17 @@ suite('LLM Code Wiki', () => {
 	test('validates wiki response files and rejects unsafe paths', () => {
 		const valid = validateWikiInitializationResponse(validWikiResponse());
 
-		assert.strictEqual(valid.files.length, 10);
+		assert.strictEqual(valid.files.length, 9);
 		assert.strictEqual(normalizeWikiFilePath('modules/review-dashboard.md'), 'modules/review-dashboard.md');
 		assert.throws(() => normalizeWikiFilePath('../outside.md'));
 		assert.throws(() => normalizeWikiFilePath('/absolute.md'));
 		assert.throws(() => normalizeWikiFilePath('C:/repo/wiki.md'));
 		assert.throws(() => normalizeWikiFilePath('notes.txt'));
 		assert.throws(() => validateWikiInitializationResponse({ ...validWikiResponse(), files: [] }));
-		const missingSchema = validWikiResponse();
+		const missingInterface = validWikiResponse();
 		assert.throws(() => validateWikiInitializationResponse({
-			...missingSchema,
-			files: missingSchema.files.filter((file) => file.path !== 'schema.md'),
+			...missingInterface,
+			files: missingInterface.files.filter((file) => file.path !== 'interfaces.md'),
 		}));
 	});
 
@@ -525,7 +595,73 @@ suite('LLM Code Wiki', () => {
 		assert.strictEqual(content, '{"version":1}');
 		assert.strictEqual(calls[0].url, 'https://api.example.test/v1/chat/completions');
 		assert.strictEqual((calls[0].init?.headers as Record<string, string>).authorization, 'Bearer secret');
-		assert.strictEqual(JSON.parse(String(calls[0].init?.body)).model, 'gpt-test');
+		const body = JSON.parse(String(calls[0].init?.body));
+		assert.strictEqual(body.model, 'gpt-test');
+		assert.deepStrictEqual(body.response_format, { type: 'json_object' });
+	});
+
+	test('allows OpenAI-compatible JSON Output to be disabled explicitly', async () => {
+		let body: Record<string, unknown> = {};
+		const client = new OpenAiCompatibleClient('https://api.example.test/v1', 'secret', async (_input, init) => {
+			body = JSON.parse(String(init?.body));
+			return new Response(JSON.stringify({ choices: [{ message: { content: '{"version":1}' } }] }), { status: 200 });
+		}, false);
+
+		await client.completeJson({ model: 'custom', systemPrompt: 'json system', userPrompt: 'user' });
+
+		assert.strictEqual(body.response_format, undefined);
+	});
+
+	test('sends DeepSeek JSON Output, thinking, and strict native tools', async () => {
+		const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+		const client = new DeepSeekClient('https://api.deepseek.com', 'secret', 'high', true, async (input, init) => {
+			calls.push({ url: String(input), body: JSON.parse(String(init?.body)) });
+			return new Response(JSON.stringify({
+				choices: [{
+					message: {
+						content: '',
+						reasoning_content: 'Need the source file.',
+						tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"src/app.ts"}' } }],
+					},
+				}],
+			}), { status: 200 });
+		});
+		const completion = await client.complete({
+			model: 'deepseek-test',
+			messages: [{ role: 'user', content: 'Use json and inspect the file.' }],
+			tools: [{
+				name: 'read_file',
+				description: 'Read a file.',
+				parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'], additionalProperties: false },
+			}],
+		});
+
+		assert.strictEqual(calls[0].url, 'https://api.deepseek.com/beta/chat/completions');
+		assert.deepStrictEqual(calls[0].body.response_format, { type: 'json_object' });
+		assert.deepStrictEqual(calls[0].body.thinking, { type: 'enabled' });
+		assert.strictEqual(calls[0].body.reasoning_effort, 'high');
+		assert.strictEqual(calls[0].body.temperature, undefined);
+		const tools = calls[0].body.tools as Array<{ function: { strict: boolean } }>;
+		assert.strictEqual(tools[0].function.strict, true);
+		assert.strictEqual(completion.reasoningContent, 'Need the source file.');
+		assert.strictEqual(completion.toolCalls[0].name, 'read_file');
+	});
+
+	test('supports DeepSeek disabled thinking and non-strict tools', async () => {
+		let url = '';
+		let body: Record<string, unknown> = {};
+		const client = new DeepSeekClient('https://api.deepseek.com', 'secret', 'disabled', false, async (input, init) => {
+			url = String(input);
+			body = JSON.parse(String(init?.body));
+			return new Response(JSON.stringify({ choices: [{ message: { content: '{"type":"final","result":{}}' } }] }), { status: 200 });
+		});
+
+		await client.completeJson({ model: 'deepseek-test', systemPrompt: 'json system', userPrompt: 'user', temperature: 0.2 });
+
+		assert.strictEqual(url, 'https://api.deepseek.com/chat/completions');
+		assert.deepStrictEqual(body.thinking, { type: 'disabled' });
+		assert.strictEqual(body.temperature, 0.2);
+		assert.strictEqual(body.reasoning_effort, undefined);
 	});
 
 	test('extracts Anthropic JSON content from messages responses', async () => {
@@ -568,7 +704,73 @@ suite('LLM Code Wiki', () => {
 		assert.strictEqual(saved.model, 'claude-test');
 		assert.strictEqual(saved.configured, true);
 		assert.strictEqual(runtime?.apiKey, 'secret-key');
+		assert.strictEqual(saved.jsonOutputEnabled, false);
+		assert.strictEqual(saved.thinkingMode, 'disabled');
+		assert.strictEqual(saved.strictTools, false);
 		assert.strictEqual(globalState.values.has('cliDiff.llm.apiKey'), false);
+
+		await store.save({
+			provider: 'anthropic',
+			baseUrl: 'https://api.anthropic.com',
+			model: 'claude-updated',
+			apiKey: '',
+		});
+		assert.strictEqual((await store.runtimeConfig())?.apiKey, 'secret-key');
+	});
+
+	test('stores DeepSeek capabilities and applies provider defaults', async () => {
+		const globalState = new TestMemento();
+		const secrets = new TestSecretStorage();
+		const store = new LlmConfigStore({ globalState, secrets } as unknown as vscode.ExtensionContext);
+
+		const saved = await store.save({
+			provider: 'deepseek',
+			baseUrl: '',
+			model: 'deepseek-custom',
+			apiKey: 'secret-key',
+			jsonOutputEnabled: false,
+			thinkingMode: 'max',
+			strictTools: false,
+		});
+
+		assert.strictEqual(saved.baseUrl, 'https://api.deepseek.com');
+		assert.strictEqual(saved.jsonOutputEnabled, true);
+		assert.strictEqual(saved.thinkingMode, 'max');
+		assert.strictEqual(saved.strictTools, false);
+	});
+
+	test('migrates legacy provider config to capability defaults', async () => {
+		const openAiState = new TestMemento();
+		openAiState.values.set('cliDiff.llm.provider', 'openai');
+		const anthropicState = new TestMemento();
+		anthropicState.values.set('cliDiff.llm.provider', 'anthropic');
+		const secrets = new TestSecretStorage();
+
+		const openAi = await new LlmConfigStore({ globalState: openAiState, secrets } as unknown as vscode.ExtensionContext).savedConfig();
+		const anthropic = await new LlmConfigStore({ globalState: anthropicState, secrets } as unknown as vscode.ExtensionContext).savedConfig();
+
+		assert.strictEqual(openAi.jsonOutputEnabled, true);
+		assert.strictEqual(anthropic.jsonOutputEnabled, false);
+		assert.strictEqual(openAi.thinkingMode, 'disabled');
+		assert.strictEqual(anthropic.strictTools, false);
+	});
+
+	test('migrates legacy OpenAI-compatible official DeepSeek config', async () => {
+		const globalState = new TestMemento();
+		globalState.values.set('cliDiff.llm.provider', 'openai');
+		globalState.values.set('cliDiff.llm.baseUrl', 'https://api.deepseek.com');
+		globalState.values.set('cliDiff.llm.model', 'deepseek-v4-pro');
+		const secrets = new TestSecretStorage();
+
+		const saved = await new LlmConfigStore({ globalState, secrets } as unknown as vscode.ExtensionContext).savedConfig();
+
+		assert.strictEqual(saved.provider, 'deepseek');
+		assert.strictEqual(saved.baseUrl, 'https://api.deepseek.com');
+		assert.strictEqual(saved.model, 'deepseek-v4-pro');
+		assert.strictEqual(saved.jsonOutputEnabled, true);
+		assert.strictEqual(saved.thinkingMode, 'high');
+		assert.strictEqual(saved.strictTools, true);
+		assert.strictEqual(globalState.values.get('cliDiff.llm.provider'), 'deepseek');
 	});
 
 	test('includes wiki state in dashboard payload', () => {
@@ -581,6 +783,12 @@ suite('LLM Code Wiki', () => {
 			status: 'idle' as const,
 			wikiExists: false,
 			workspaceAvailable: true,
+			pendingSourceCount: 0,
+			wikiNeedsUpdate: false,
+			findings: [],
+			jsonOutputEnabled: true,
+			thinkingMode: 'disabled' as const,
+			strictTools: false,
 		};
 		const payload = buildReviewDashboardPayload(undefined, undefined, () => false, wiki);
 
@@ -588,6 +796,282 @@ suite('LLM Code Wiki', () => {
 		assert.strictEqual(payload.llmWiki.configured, true);
 		assert.strictEqual(payload.llmWiki.model, 'gpt-test');
 		assert.deepStrictEqual(payload.files, []);
+	});
+});
+
+suite('Agent runtime', () => {
+	test('runs strict multi-round tool calls and returns final result', async () => {
+		const responses = [
+			'{"type":"tool_calls","calls":[{"id":"call-1","name":"echo","arguments":{"value":"hello"}}]}',
+			'{"type":"final","result":{"summary":"done"}}',
+		];
+		const runner = new AgentRunner();
+		const result = await runner.run({
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: { completeJson: async () => responses.shift() ?? '' },
+			systemPrompt: 'test',
+			userPrompt: 'test',
+			tools: [{
+				name: 'echo',
+				description: 'Echo.',
+				parameters: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false },
+				execute: async (args) => args,
+			}],
+		});
+
+		assert.strictEqual(result.result.summary, 'done');
+		assert.strictEqual(result.rounds, 2);
+		assert.strictEqual(result.toolCalls, 1);
+	});
+
+	test('rejects invalid Agent actions and unavailable tools', async () => {
+		assert.throws(() => validateAgentResponse({ type: 'tool_calls', calls: [] }));
+		assert.throws(() => validateAgentResponse({ type: 'final', result: [] }));
+		const runner = new AgentRunner();
+		await assert.rejects(() => runner.run({
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: { completeJson: async () => '{"type":"tool_calls","calls":[{"id":"x","name":"missing","arguments":{}}]}' },
+			systemPrompt: 'test',
+			userPrompt: 'test',
+			tools: [],
+		}), /unavailable tool/);
+	});
+
+	test('corrects invalid text JSON once without adding it to history', async () => {
+		const requests: unknown[] = [];
+		const responses = ['Now I have enough context.', '{"type":"final","result":{"summary":"done"}}'];
+		const runner = new AgentRunner();
+		const result = await runner.run({
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: {
+				completeJson: async (request) => {
+					requests.push(request);
+					return responses.shift() ?? '';
+				},
+			},
+			systemPrompt: 'test json',
+			userPrompt: 'test',
+			tools: [],
+		});
+
+		assert.strictEqual(result.result.summary, 'done');
+		assert.strictEqual(requests.length, 2);
+		assert.strictEqual(JSON.stringify(requests[1]).includes('Now I have enough context.'), false);
+	});
+
+	test('uses DeepSeek native tools and returns reasoning content on the next round', async () => {
+		const requests: Array<{ messages?: Array<{ role: string; reasoningContent?: string; toolCallId?: string }> }> = [];
+		const completions = [
+			{
+				content: '',
+				reasoningContent: 'I need to echo.',
+				toolCalls: [{ id: 'call-1', name: 'echo', arguments: '{"value":"hello"}' }],
+			},
+			{ content: '{"type":"final","result":{"summary":"done"}}', toolCalls: [] },
+		];
+		const runner = new AgentRunner();
+		const result = await runner.run({
+			config: {
+				provider: 'deepseek',
+				baseUrl: 'https://api.deepseek.com',
+				model: 'deepseek-test',
+				apiKey: 'secret',
+				jsonOutputEnabled: true,
+				thinkingMode: 'high',
+				strictTools: true,
+			},
+			client: {
+				completeJson: async () => '',
+				complete: async (request) => {
+					requests.push(request);
+					return completions.shift() ?? { content: '', toolCalls: [] };
+				},
+			},
+			systemPrompt: 'test json',
+			userPrompt: 'test',
+			tools: [{
+				name: 'echo',
+				description: 'Echo.',
+				parameters: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false },
+				execute: async (args) => args,
+			}],
+		});
+
+		assert.strictEqual(result.result.summary, 'done');
+		assert.strictEqual(requests.length, 2);
+		assert.ok(requests[1].messages?.some((message) => message.role === 'assistant' && message.reasoningContent === 'I need to echo.'));
+		assert.ok(requests[1].messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call-1'));
+	});
+
+	test('corrects empty or invalid DeepSeek native tool output once', async () => {
+		const completions = [
+			{ content: '', toolCalls: [] },
+			{ content: '{"type":"final","result":{"summary":"fixed"}}', toolCalls: [] },
+		];
+		const runner = new AgentRunner();
+		const result = await runner.run({
+			config: { provider: 'deepseek', baseUrl: 'https://api.deepseek.com', model: 'deepseek-test', apiKey: 'secret' },
+			client: {
+				completeJson: async () => '',
+				complete: async () => completions.shift() ?? { content: '', toolCalls: [] },
+			},
+			systemPrompt: 'test json',
+			userPrompt: 'test',
+			tools: [],
+		});
+		assert.strictEqual(result.result.summary, 'fixed');
+	});
+
+	test('corrects invalid DeepSeek native tool arguments once', async () => {
+		const completions = [
+			{ content: '', toolCalls: [{ id: 'bad', name: 'echo', arguments: '{"value":1}' }] },
+			{ content: '{"type":"final","result":{"summary":"fixed arguments"}}', toolCalls: [] },
+		];
+		const runner = new AgentRunner();
+		const result = await runner.run({
+			config: { provider: 'deepseek', baseUrl: 'https://api.deepseek.com', model: 'deepseek-test', apiKey: 'secret' },
+			client: {
+				completeJson: async () => '',
+				complete: async () => completions.shift() ?? { content: '', toolCalls: [] },
+			},
+			systemPrompt: 'test json',
+			userPrompt: 'test',
+			tools: [{
+				name: 'echo',
+				description: 'Echo.',
+				parameters: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false },
+				execute: async (args) => args,
+			}],
+		});
+		assert.strictEqual(result.result.summary, 'fixed arguments');
+	});
+
+	test('reports provider, model, and preview after correction retry fails', async () => {
+		const runner = new AgentRunner();
+		await assert.rejects(() => runner.run({
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'broken-model', apiKey: 'secret' },
+			client: { completeJson: async () => 'Now I have no JSON.' },
+			systemPrompt: 'test json',
+			userPrompt: 'test',
+			tools: [],
+		}), /OpenAI-compatible model "broken-model".*Now I have no JSON/);
+	});
+
+	test('enforces cancellation and runtime limits', async () => {
+		const runner = new AgentRunner();
+		const waitForAbort = async (_request: unknown, signal?: AbortSignal): Promise<string> => new Promise((_resolve, reject) => {
+			signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+		});
+		await assert.rejects(() => runner.run({
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: { completeJson: waitForAbort },
+			systemPrompt: 'test',
+			userPrompt: 'test',
+			tools: [],
+			maxRunMs: 5,
+		}), /runtime limit/);
+
+		const abortController = new AbortController();
+		abortController.abort();
+		await assert.rejects(() => runner.run({
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: { completeJson: async () => '{"type":"final","result":{}}' },
+			systemPrompt: 'test',
+			userPrompt: 'test',
+			tools: [],
+			signal: abortController.signal,
+		}), /cancelled/i);
+	});
+
+	test('protects Wiki template and state files from Agent writes', async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-agent-'));
+		try {
+			const tools = createWikiAgentTools({ root: workspaceFolder(root), generatedFiles: new Set() });
+			const write = tools.find((tool) => tool.name === 'write_wiki_file');
+			assert.ok(write);
+			await assert.rejects(() => write.execute({ path: 'llm-code-wiki.md', content: 'changed' }), /protected/);
+			await assert.rejects(() => write.execute({ path: '../outside.md', content: 'changed' }), /Invalid relative path/);
+			await write.execute({ path: 'overview.md', content: '# Overview\n' });
+			assert.strictEqual(fs.readFileSync(path.join(root, '.wiki', 'overview.md'), 'utf8'), '# Overview\n');
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+suite('Wiki state', () => {
+	test('copies the generic specification and detects source fingerprint changes', async () => {
+		const extensionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-extension-'));
+		const repositoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-wiki-state-'));
+		try {
+			writeRepoFile(extensionRoot, 'llm-code-wiki/llm-code-wiki.md', '# Generic Wiki\n');
+			writeRepoFile(repositoryRoot, 'src/app.ts', 'export const value = 1;\n');
+			writeRepoFile(repositoryRoot, '.env', 'secret\n');
+			const folder = workspaceFolder(repositoryRoot);
+			const service = new WikiStateService(vscode.Uri.file(extensionRoot));
+			const state = await service.ensureScaffold(folder, 'initializing');
+
+			assert.strictEqual(fs.readFileSync(path.join(repositoryRoot, '.wiki', 'llm-code-wiki.md'), 'utf8'), '# Generic Wiki\n');
+			const ready = await service.completeRun(folder, state, 'done', ['overview.md']);
+			assert.strictEqual(ready.status, 'ready');
+			assert.ok(ready.sourceFingerprints['src/app.ts']);
+			assert.strictEqual(ready.sourceFingerprints['.env'], undefined);
+
+			writeRepoFile(repositoryRoot, 'src/app.ts', 'export const value = 2;\n');
+			writeRepoFile(repositoryRoot, 'src/new.ts', 'export const next = true;\n');
+			const diff = await service.sourceDiff(folder, ready);
+			assert.deepStrictEqual(diff.added, ['src/new.ts']);
+			assert.deepStrictEqual(diff.modified, ['src/app.ts']);
+		} finally {
+			fs.rmSync(extensionRoot, { recursive: true, force: true });
+			fs.rmSync(repositoryRoot, { recursive: true, force: true });
+		}
+	});
+});
+
+suite('AI review findings', () => {
+	test('drops findings that do not bind to a current pending hunk', () => {
+		const uri = vscode.Uri.file('/repo/src/app.ts');
+		const hunk = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
+		const file = reviewFileState(uri, 'src/app.ts', { hunks: [hunk] });
+		const findings = validateReviewFindings({
+			findings: [
+				{ hunkId: 'missing', severity: 'warning', title: 'x', explanation: 'x', recommendation: 'x', evidence: [] },
+				{ hunkId: hunk.id, severity: 'warning', title: 'Bound', explanation: 'Risk', recommendation: 'Fix', evidence: ['src/app.ts:1'] },
+			],
+		}, file);
+
+		assert.strictEqual(findings.length, 1);
+		assert.strictEqual(findings[0].title, 'Bound');
+	});
+
+	test('sorts findings by chunk by default and severity when configured', () => {
+		const uri = vscode.Uri.file('/repo/src/app.ts');
+		const hunks = computeLineDiff(uri.toString(), 'a\nold\nc\nold2\n', 'a\nnew\nc\nnew2\n');
+		const file = reviewFileState(uri, 'src/app.ts', { hunks });
+		const findings = validateReviewFindings({
+			findings: [
+				{ hunkId: hunks[1].id, severity: 'critical', title: 'Later', explanation: 'x', recommendation: 'x' },
+				{ hunkId: hunks[0].id, severity: 'info', title: 'Earlier', explanation: 'x', recommendation: 'x' },
+			],
+		}, file);
+
+		assert.deepStrictEqual(sortFindings(findings, [file], 'chunk').map((item) => item.title), ['Earlier', 'Later']);
+		assert.deepStrictEqual(sortFindings(findings, [file], 'severity').map((item) => item.title), ['Later', 'Earlier']);
+	});
+
+	test('changes review signature when pending chunks change and skips Wiki files', () => {
+		const sourceUri = vscode.Uri.file('/repo/src/app.ts');
+		const wikiUri = vscode.Uri.file('/repo/.wiki/overview.md');
+		const source = reviewFileState(sourceUri, 'src/app.ts', { hunks: computeLineDiff(sourceUri.toString(), 'a\n', 'b\n') });
+		const wiki = reviewFileState(wikiUri, '.wiki/overview.md', { hunks: computeLineDiff(wikiUri.toString(), 'a\n', 'b\n') });
+		const session: ReviewSession = { id: 'x', mode: 'git', rootUri: vscode.Uri.file('/repo'), createdAt: 1, files: new Map([[sourceUri.toString(), source], [wikiUri.toString(), wiki]]) };
+		const first = reviewChangeSignature(session);
+		source.revision += 1;
+		const afterSource = reviewChangeSignature(session);
+		assert.notStrictEqual(afterSource, first);
+		wiki.revision += 1;
+		assert.strictEqual(reviewChangeSignature(session), afterSource);
 	});
 });
 
@@ -647,12 +1131,16 @@ suite('Git service', () => {
 			writeRepoFile(root, '.cache/output.txt', 'cache\n');
 			writeRepoFile(root, '.gitignore', 'ignored.txt\n');
 			writeRepoFile(root, 'ignored.txt', 'ignored\n');
+			writeRepoFile(root, '.wiki/overview.md', '# Overview\n');
+			writeRepoFile(root, '.wiki/.state.json', '{}\n');
 			pairs = await service.createFilePairs(folder);
 			byPath = filePairsByPath(pairs);
 			assert.strictEqual(byPath.has('.env'), false);
 			assert.strictEqual(byPath.has('.cache/output.txt'), false);
 			assert.strictEqual(byPath.has('.gitignore'), false);
 			assert.strictEqual(byPath.has('ignored.txt'), false);
+			assert.strictEqual(byPath.has('.wiki/overview.md'), true);
+			assert.strictEqual(byPath.has('.wiki/.state.json'), false);
 		} finally {
 			removeTempRepo(root);
 		}
@@ -740,12 +1228,11 @@ function validWikiResponse(): TestWikiResponse {
 		'index.md',
 		'overview.md',
 		'architecture.md',
-		'extension-surface.md',
+		'interfaces.md',
 		'workflows.md',
 		'modules.md',
 		'decisions.md',
 		'open-questions.md',
-		'schema.md',
 		'log.md',
 	].map((file) => ({ path: file, content: `# ${file}\n` }));
 	return {

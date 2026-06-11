@@ -11,8 +11,22 @@ export function isDotReviewPath(relativePath: string): boolean {
 		.some((segment) => segment.length > 1 && segment.startsWith('.'));
 }
 
-export function shouldSkipReviewPath(relativePath: string): boolean {
-	return isDotReviewPath(relativePath);
+export function isWikiReviewPath(relativePath: string): boolean {
+	return normalizeReviewPath(relativePath).startsWith('.wiki/');
+}
+
+export function shouldSkipReviewPath(
+	relativePath: string,
+	reviewWikiChanges = vscode.workspace.getConfiguration('cliDiff').get<boolean>('reviewWikiChanges', true),
+): boolean {
+	const normalized = normalizeReviewPath(relativePath);
+	if (normalized === '.wiki/.state.json') {
+		return true;
+	}
+	if (normalized.startsWith('.wiki/')) {
+		return !reviewWikiChanges || !normalized.endsWith('.md');
+	}
+	return isDotReviewPath(normalized);
 }
 
 export async function gitIgnoredReviewPaths(root: vscode.WorkspaceFolder, relativePaths: string[]): Promise<Set<string>> {
@@ -22,7 +36,7 @@ export async function gitIgnoredReviewPaths(root: vscode.WorkspaceFolder, relati
 export async function gitIgnoredReviewPathsInRoot(rootPath: string, relativePaths: string[]): Promise<Set<string>> {
 	const candidates = [...new Set(relativePaths
 		.map((relativePath) => normalizeReviewPath(relativePath))
-		.filter((relativePath) => relativePath.length > 0 && !shouldSkipReviewPath(relativePath)))];
+		.filter((relativePath) => relativePath.length > 0 && !shouldSkipReviewPath(relativePath) && !isWikiReviewPath(relativePath)))];
 	if (candidates.length === 0) {
 		return new Set();
 	}

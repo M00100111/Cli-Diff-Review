@@ -1,5 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { AiReviewStore, CodeReviewAgentService, sortFindings, sourcePendingFiles } from './agent/codeReview';
 import { acceptHunkInBaseline, computeLineDiff } from './diffEngine';
 import { GitService } from './gitService';
 import { createLlmClient, LlmClient } from './llm/client';
@@ -48,6 +49,7 @@ interface ReviewNavigationTarget extends vscode.QuickPickItem {
 }
 
 interface WikiInitializationTask {
+	kind: 'initialize' | 'update' | 'review';
 	root: vscode.WorkspaceFolder;
 	abortController: AbortController;
 	done: Promise<void>;
@@ -59,6 +61,8 @@ export class ReviewController implements vscode.Disposable {
 	private readonly gitService = new GitService();
 	private readonly llmConfigStore: LlmConfigStore;
 	private readonly wikiInitializationService: WikiInitializationService;
+	private readonly codeReviewAgentService = new CodeReviewAgentService();
+	private readonly aiReviewStore: AiReviewStore;
 	private readonly disposables: vscode.Disposable[] = [];
 	private readonly treeProvider: ReviewTreeProvider;
 	private readonly dashboardProvider: ReviewDashboardProvider;
@@ -80,6 +84,9 @@ export class ReviewController implements vscode.Disposable {
 		model: '',
 		hasApiKey: false,
 		configured: false,
+		jsonOutputEnabled: true,
+		thinkingMode: 'disabled',
+		strictTools: false,
 	};
 	private llmWikiState: LlmWikiDashboardState = defaultLlmWikiDashboardState();
 	private currentWikiTask: WikiInitializationTask | undefined;
@@ -89,6 +96,7 @@ export class ReviewController implements vscode.Disposable {
 		this.snapshotStore = new SnapshotStore(context);
 		this.llmConfigStore = new LlmConfigStore(context);
 		this.wikiInitializationService = new WikiInitializationService(context.extensionUri);
+		this.aiReviewStore = new AiReviewStore(context.workspaceState);
 		this.treeProvider = new ReviewTreeProvider(() => this.activeSession);
 		this.dashboardProvider = new ReviewDashboardProvider(() => buildReviewDashboardPayload(
 			this.activeSession,
@@ -125,6 +133,13 @@ export class ReviewController implements vscode.Disposable {
 				void this.handleSavedDocument(document);
 			}),
 			vscode.workspace.onDidChangeTextDocument((event) => this.handleChangedDocument(event)),
+			vscode.workspace.onDidChangeConfiguration((event) => {
+				if (event.affectsConfiguration('cliDiff.reviewWikiChanges')) {
+					void this.refreshAll();
+				} else if (event.affectsConfiguration('cliDiff.aiReviewFindingOrder')) {
+					void this.refreshLlmWikiDashboardState();
+				}
+			}),
 			this.createFileWatcher(),
 			this.createGitMetadataWatcher(),
 			this.createGitExtensionStateWatcher(),
@@ -145,6 +160,10 @@ export class ReviewController implements vscode.Disposable {
 			this.registerCommand('cli-diff.saveLlmWikiConfig', (input: LlmConfigInput) => this.saveLlmWikiConfig(input)),
 			this.registerCommand('cli-diff.initializeLlmWiki', () => this.initializeLlmWiki()),
 			this.registerCommand('cli-diff.cancelLlmWikiInitialization', () => this.cancelLlmWikiInitialization()),
+			this.registerCommand('cli-diff.updateLlmWiki', () => this.updateLlmWiki()),
+			this.registerCommand('cli-diff.generateAiReview', () => this.generateAiReview()),
+			this.registerCommand('cli-diff.openAiReviewFinding', (uri: string, hunkId: string) => this.openAiReviewFinding(uri, hunkId)),
+			this.registerCommand('cli-diff.cancelAgent', () => this.cancelCurrentAgent()),
 		);
 		void vscode.commands.executeCommand('setContext', 'cliDiff:hasSession', false);
 		void this.refreshLlmWikiDashboardState();
@@ -1231,13 +1250,14 @@ export class ReviewController implements vscode.Disposable {
 			}
 			this.wikiRootUri = root.uri;
 
-			if (await this.wikiInitializationService.wikiExists(root.uri)) {
+			if ((await this.wikiInitializationService.state(root.uri))?.status === 'ready') {
 				await this.refreshLlmWikiDashboardState({ status: 'initialized', progress: undefined, error: undefined });
 				vscode.window.showInformationMessage('LLM Code Wiki is already initialized for this workspace.');
 				return;
 			}
 
 			const task: WikiInitializationTask = {
+				kind: 'initialize',
 				root,
 				abortController: new AbortController(),
 				done: Promise.resolve(),
@@ -1264,7 +1284,7 @@ export class ReviewController implements vscode.Disposable {
 
 	private async cancelLlmWikiInitialization(): Promise<void> {
 		const task = this.currentWikiTask;
-		if (!task) {
+		if (!task || task.kind !== 'initialize') {
 			return;
 		}
 
@@ -1350,6 +1370,159 @@ export class ReviewController implements vscode.Disposable {
 				await this.refreshLlmWikiDashboardState();
 			}
 		}
+	}
+
+	private async updateLlmWiki(): Promise<void> {
+		if (this.currentWikiTask) {
+			return;
+		}
+		try {
+			const config = await this.requireLlmConfig();
+			const root = await this.pickWorkspaceFolder('Select a workspace folder for LLM Code Wiki update');
+			if (!config || !root) {
+				return;
+			}
+			if (this.hasPendingReviewChanges()) {
+				vscode.window.showInformationMessage('Finish all pending review changes before updating LLM Code Wiki.');
+				return;
+			}
+			const task: WikiInitializationTask = {
+				kind: 'update',
+				root,
+				abortController: new AbortController(),
+				done: Promise.resolve(),
+			};
+			this.currentWikiTask = task;
+			this.applyLlmWikiDashboardState({ status: 'updating', progress: 'Preparing Wiki update', error: undefined });
+			task.done = this.runLlmWikiUpdate(task, config, createLlmClient(config));
+			await task.done;
+		} catch (error) {
+			this.showError(error);
+		}
+	}
+
+	private async runLlmWikiUpdate(task: WikiInitializationTask, config: LlmRuntimeConfig, client: LlmClient): Promise<void> {
+		try {
+			const result = await this.wikiInitializationService.update({
+				root: task.root,
+				config,
+				client,
+				signal: task.abortController.signal,
+				onProgress: (progress) => this.currentWikiTask === task
+					&& this.applyLlmWikiDashboardState({ status: 'updating', progress: progress.message, error: undefined }),
+			});
+			if (this.currentWikiTask === task) {
+				vscode.window.showInformationMessage(result.summary);
+				this.applyLlmWikiDashboardState({ status: 'initialized', progress: result.summary, error: undefined });
+			}
+		} catch (error) {
+			if (!isAbortError(error)) {
+				this.showError(error);
+				this.applyLlmWikiDashboardState({ status: 'failed', error: error instanceof Error ? error.message : String(error) });
+			}
+		} finally {
+			if (this.currentWikiTask === task) {
+				this.currentWikiTask = undefined;
+				await this.refreshLlmWikiDashboardState();
+			}
+		}
+	}
+
+	private async generateAiReview(): Promise<void> {
+		if (this.currentWikiTask) {
+			return;
+		}
+		try {
+			const config = await this.requireLlmConfig();
+			const session = this.activeSession;
+			if (!config || !session || sourcePendingFiles(session).length === 0) {
+				vscode.window.showInformationMessage('No pending source chunks to review.');
+				return;
+			}
+			const root = vscode.workspace.getWorkspaceFolder(session.rootUri)
+				?? vscode.workspace.workspaceFolders?.find((folder) => uriKey(folder.uri) === uriKey(session.rootUri));
+			if (!root) {
+				throw new Error('The active review workspace is not available.');
+			}
+			const task: WikiInitializationTask = {
+				kind: 'review',
+				root,
+				abortController: new AbortController(),
+				done: Promise.resolve(),
+			};
+			this.currentWikiTask = task;
+			this.applyLlmWikiDashboardState({ status: 'reviewing', progress: 'Preparing AI review', error: undefined });
+			task.done = this.runAiReview(task, config, createLlmClient(config), session);
+			await task.done;
+		} catch (error) {
+			this.showError(error);
+		}
+	}
+
+	private async runAiReview(task: WikiInitializationTask, config: LlmRuntimeConfig, client: LlmClient, session: ReviewSession): Promise<void> {
+		try {
+			const result = await this.codeReviewAgentService.review({
+				session,
+				root: task.root,
+				config,
+				client,
+				signal: task.abortController.signal,
+				onProgress: (message) => this.currentWikiTask === task
+					&& this.applyLlmWikiDashboardState({ status: 'reviewing', progress: message, error: undefined }),
+			});
+			if (this.currentWikiTask === task) {
+				await this.aiReviewStore.save(session, result);
+				vscode.window.showInformationMessage(`AI review completed (${result.findings.length} findings).`);
+			}
+		} catch (error) {
+			if (!isAbortError(error)) {
+				this.showError(error);
+				this.applyLlmWikiDashboardState({ status: 'failed', error: error instanceof Error ? error.message : String(error) });
+			}
+		} finally {
+			if (this.currentWikiTask === task) {
+				this.currentWikiTask = undefined;
+				await this.refreshLlmWikiDashboardState();
+			}
+		}
+	}
+
+	private async cancelCurrentAgent(): Promise<void> {
+		const task = this.currentWikiTask;
+		if (!task) {
+			return;
+		}
+		if (task.kind === 'initialize') {
+			await this.cancelLlmWikiInitialization();
+			return;
+		}
+		this.applyLlmWikiDashboardState({ progress: 'Cancelling Agent', error: undefined });
+		task.abortController.abort();
+		await task.done.catch(() => undefined);
+		await this.refreshLlmWikiDashboardState({ progress: task.kind === 'update' ? 'Wiki update cancelled.' : 'AI review cancelled.' });
+	}
+
+	private async openAiReviewFinding(uriString: string, hunkId: string): Promise<void> {
+		const file = this.activeSession?.files.get(uriKey(vscode.Uri.parse(uriString)));
+		const hunk = file?.hunks.find((candidate) => candidate.id === hunkId);
+		if (!file || !hunk) {
+			return;
+		}
+		await this.reviewWebview.open(file.uri, { line: hunk.newStart, column: 0 });
+		this.setCurrentReviewUri(file.uri);
+	}
+
+	private async requireLlmConfig(): Promise<LlmRuntimeConfig | undefined> {
+		const config = await this.llmConfigStore.runtimeConfig();
+		if (!config) {
+			await this.refreshLlmWikiDashboardState({ status: 'unconfigured', error: 'Configure an LLM provider first.' });
+			vscode.window.showInformationMessage('Configure an LLM provider first.');
+		}
+		return config;
+	}
+
+	private hasPendingReviewChanges(): boolean {
+		return Boolean(this.activeSession && [...this.activeSession.files.values()].some((file) => file.hunks.length > 0));
 	}
 
 	private async mergeReviewedSnapshotFileOnRefresh(file: ReviewFileState): Promise<void> {
@@ -1559,6 +1732,7 @@ export class ReviewController implements vscode.Disposable {
 		this.treeProvider.refresh();
 		this.reviewWebview.refresh();
 		this.dashboardProvider.refresh();
+		void this.refreshLlmWikiDashboardState();
 	}
 
 	private applyLlmWikiDashboardState(update: Partial<LlmWikiDashboardState>): void {
@@ -1569,15 +1743,34 @@ export class ReviewController implements vscode.Disposable {
 	private async refreshLlmWikiDashboardState(update: Partial<LlmWikiDashboardState> = {}): Promise<void> {
 		this.llmConfigState = await this.llmConfigStore.savedConfig();
 		const workspaceAvailable = Boolean(vscode.workspace.workspaceFolders?.length);
-		const wikiExists = await this.dashboardWikiExists();
+		const root = this.dashboardWikiRootFolder();
+		const wikiExists = root ? await this.wikiInitializationService.wikiExists(root.uri) : false;
+		const wikiState = root ? await this.wikiInitializationService.state(root.uri) : undefined;
+		const pendingSourceCount = sourcePendingFiles(this.activeSession).reduce((total, file) => total + file.hunks.length, 0);
+		const hasPending = this.hasPendingReviewChanges();
+		const storedReview = this.aiReviewStore.load(this.activeSession);
+		const findingOrder = vscode.workspace.getConfiguration('cliDiff').get<'chunk' | 'severity'>('aiReviewFindingOrder', 'chunk');
+		const findings = this.currentReviewUri && storedReview && this.activeSession
+			? sortFindings(
+				storedReview.findings.filter((finding) => uriKey(vscode.Uri.parse(finding.uri)) === uriKey(this.currentReviewUri as vscode.Uri)),
+				this.activeSession.files.values(),
+				findingOrder,
+			)
+			: [];
+		const wikiNeedsUpdate = Boolean(root && wikiState?.status === 'ready' && !hasPending && !this.currentWikiTask
+			&& await this.wikiInitializationService.needsUpdate(root));
 		let status = update.status ?? this.llmWikiState.status;
 
 		if (!this.llmConfigState.configured) {
 			status = 'unconfigured';
 		} else if (this.currentWikiTask) {
-			status = 'initializing';
-		} else if (wikiExists || status === 'initialized') {
-			status = wikiExists || update.status === 'initialized' ? 'initialized' : 'idle';
+			status = this.currentWikiTask.kind === 'review' ? 'reviewing' : this.currentWikiTask.kind === 'update' ? 'updating' : 'initializing';
+		} else if (wikiState?.status === 'ready') {
+			status = 'initialized';
+		} else if (wikiState?.status === 'paused') {
+			status = 'paused';
+		} else if (wikiState?.status === 'failed') {
+			status = 'failed';
 		} else if (!['idle', 'paused', 'failed'].includes(status)) {
 			status = 'idle';
 		}
@@ -1594,6 +1787,12 @@ export class ReviewController implements vscode.Disposable {
 			status,
 			progress: update.progress ?? (statusChanged ? undefined : this.llmWikiState.progress),
 			error: update.error ?? (statusChanged ? undefined : this.llmWikiState.error),
+			pendingSourceCount,
+			wikiNeedsUpdate,
+			findings,
+			jsonOutputEnabled: this.llmConfigState.jsonOutputEnabled,
+			thinkingMode: this.llmConfigState.thinkingMode,
+			strictTools: this.llmConfigState.strictTools,
 		};
 		this.dashboardProvider.refresh();
 	}
@@ -1608,7 +1807,17 @@ export class ReviewController implements vscode.Disposable {
 		if (this.wikiRootUri && folders.some((folder) => uriKey(folder.uri) === uriKey(this.wikiRootUri as vscode.Uri))) {
 			return this.wikiRootUri;
 		}
+		if (this.activeSession && folders.some((folder) => uriKey(folder.uri) === uriKey(this.activeSession?.rootUri as vscode.Uri))) {
+			return this.activeSession.rootUri;
+		}
 		return folders.length === 1 ? folders[0].uri : undefined;
+	}
+
+	private dashboardWikiRootFolder(): vscode.WorkspaceFolder | undefined {
+		const rootUri = this.dashboardWikiRootUri();
+		return rootUri
+			? vscode.workspace.workspaceFolders?.find((folder) => uriKey(folder.uri) === uriKey(rootUri))
+			: undefined;
 	}
 
 	private setCurrentReviewUri(uri: vscode.Uri): void {
@@ -1617,6 +1826,7 @@ export class ReviewController implements vscode.Disposable {
 		}
 		this.currentReviewUri = uri;
 		this.dashboardProvider.refresh();
+		void this.refreshLlmWikiDashboardState();
 	}
 
 	private activeGitWorkspaceFolder(): vscode.WorkspaceFolder | undefined {

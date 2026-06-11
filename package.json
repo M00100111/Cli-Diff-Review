@@ -6,7 +6,7 @@
   "icon": "resources/icon.png",
   "publisher": "local",
   "engines": {
-    "vscode": "^1.117.0"
+    "vscode": "^1.105.0"
   },
   "categories": [
     "Other"
@@ -25,6 +25,9 @@
     "onCommand:cli-diff.previousChange",
     "onCommand:cli-diff.openReviewView",
     "onCommand:cli-diff.refresh",
+    "onCommand:cli-diff.initializeLlmWiki",
+    "onCommand:cli-diff.updateLlmWiki",
+    "onCommand:cli-diff.generateAiReview",
     "onCustomEditor:cli-diff.reviewEditor",
     "onView:cli-diff.dashboard",
     "onView:cli-diff.review"
@@ -95,6 +98,21 @@
         "title": "Refresh Review",
         "category": "Cli Diff Review",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "cli-diff.initializeLlmWiki",
+        "title": "Initialize LLM Code Wiki",
+        "category": "Cli Diff Review"
+      },
+      {
+        "command": "cli-diff.updateLlmWiki",
+        "title": "Update LLM Code Wiki",
+        "category": "Cli Diff Review"
+      },
+      {
+        "command": "cli-diff.generateAiReview",
+        "title": "Generate AI Review",
+        "category": "Cli Diff Review"
       }
     ],
     "viewsContainers": {
@@ -215,6 +233,20 @@
           "type": "string",
           "default": "**/{.git,node_modules,dist,out,.vscode-test}/**",
           "description": "Glob pattern excluded when capturing or scanning snapshot review files."
+        },
+        "cliDiff.reviewWikiChanges": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include generated .wiki Markdown changes in Cli Diff Review."
+        },
+        "cliDiff.aiReviewFindingOrder": {
+          "type": "string",
+          "enum": [
+            "chunk",
+            "severity"
+          ],
+          "default": "chunk",
+          "description": "Ordering used for AI review findings in the Activity Bar."
         }
       }
     }
@@ -233,7 +265,7 @@
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
-    "@types/vscode": "^1.117.0",
+    "@types/vscode": "1.105.0",
     "@vscode/test-cli": "^0.0.12",
     "@vscode/test-electron": "^2.5.2",
     "eslint": "^9.39.3",

@@ -2,6 +2,69 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { ReviewedHunk, ReviewFileState, ReviewHunk, ReviewSession, uriKey } from './types';
 
+export function normalizeMonacoThemeColor(value: string | undefined, fallback: string, allowAlpha = true): string {
+	function component(valuePart: string): number | undefined {
+		const trimmed = valuePart.trim();
+		const percent = trimmed.endsWith('%');
+		const parsed = Number.parseFloat(percent ? trimmed.slice(0, -1) : trimmed);
+		if (!Number.isFinite(parsed)) {
+			return undefined;
+		}
+		const scaled = percent ? parsed * 255 / 100 : parsed;
+		return Math.round(Math.max(0, Math.min(255, scaled)));
+	}
+
+	function alpha(valuePart: string): number | undefined {
+		const trimmed = valuePart.trim();
+		const percent = trimmed.endsWith('%');
+		const parsed = Number.parseFloat(percent ? trimmed.slice(0, -1) : trimmed);
+		if (!Number.isFinite(parsed)) {
+			return undefined;
+		}
+		const scaled = percent ? parsed / 100 : parsed;
+		return Math.round(Math.max(0, Math.min(1, scaled)) * 255);
+	}
+
+	function hexByte(byte: number): string {
+		return byte.toString(16).padStart(2, '0');
+	}
+
+	function parse(candidate: string | undefined): string | undefined {
+		const normalized = candidate?.trim().toLowerCase();
+		if (!normalized) {
+			return undefined;
+		}
+
+		const hex = /^#([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/.exec(normalized);
+		if (hex) {
+			const expanded = hex[1].length <= 4
+				? [...hex[1]].map((digit) => digit + digit).join('')
+				: hex[1];
+			return `#${allowAlpha ? expanded : expanded.slice(0, 6)}`;
+		}
+
+		const rgb = /^rgba?\(([^)]+)\)$/.exec(normalized);
+		if (!rgb) {
+			return undefined;
+		}
+		const parts = rgb[1].split(',').map((part) => part.trim());
+		if (parts.length !== 3 && parts.length !== 4) {
+			return undefined;
+		}
+		const red = component(parts[0]);
+		const green = component(parts[1]);
+		const blue = component(parts[2]);
+		const opacity = parts.length === 4 ? alpha(parts[3]) : undefined;
+		if (red === undefined || green === undefined || blue === undefined || (parts.length === 4 && opacity === undefined)) {
+			return undefined;
+		}
+		const color = `#${hexByte(red)}${hexByte(green)}${hexByte(blue)}`;
+		return allowAlpha && opacity !== undefined ? `${color}${hexByte(opacity)}` : color;
+	}
+
+	return parse(value) ?? parse(fallback) ?? '#000000';
+}
+
 export interface EditedRange {
 	startLine: number;
 	endLine: number;
@@ -360,7 +423,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 <html lang="en">
 <head>
 	<meta charset="UTF-8">
-	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${cspSource} data:; font-src ${cspSource}; style-src ${cspSource} 'unsafe-inline'; script-src ${cspSource} 'nonce-${nonce}'; worker-src blob: data:;">
+	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${cspSource} data:; font-src ${cspSource} data:; style-src ${cspSource} 'unsafe-inline'; script-src ${cspSource} 'nonce-${nonce}'; worker-src blob: data:;">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<title>Cli Diff Review</title>
 	<style>
@@ -427,6 +490,16 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 		#editor {
 			min-height: 0;
 			background: var(--bg);
+		}
+		.initialization-error {
+			height: 100%;
+			display: grid;
+			place-items: center;
+			padding: 24px;
+			color: var(--vscode-errorForeground);
+			text-align: center;
+			line-height: 1.45;
+			overflow-wrap: anywhere;
 		}
 		#status {
 			display: flex;
@@ -687,6 +760,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 	<script nonce="${nonce}">
 		const vscode = acquireVsCodeApi();
 		const monacoBaseUri = ${JSON.stringify(monacoBaseUri)};
+		const normalizeMonacoThemeColor = ${normalizeMonacoThemeColor.toString()};
 		const labels = {
 			accept: 'Accept',
 			reject: 'Reject',
@@ -745,12 +819,20 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 			}
 		};
 
-		require.config({ paths: { vs: monacoBaseUri } });
-		require(['vs/editor/editor.main'], function () {
-			ready = true;
-			createEditor();
-			vscode.postMessage({ type: 'ready' });
-		});
+		try {
+			require.config({ paths: { vs: monacoBaseUri } });
+			require(['vs/editor/editor.main'], function () {
+				try {
+					createEditor();
+					ready = true;
+					vscode.postMessage({ type: 'ready' });
+				} catch (error) {
+					showInitializationError(error);
+				}
+			}, showInitializationError);
+		} catch (error) {
+			showInitializationError(error);
+		}
 
 		window.addEventListener('message', function (event) {
 			if (event.data.type === 'state') {
@@ -895,8 +977,8 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 		}
 
 		function defineTheme() {
-			const foreground = cssVar('--vscode-editor-foreground') || '#d4d4d4';
-			const background = cssVar('--vscode-editor-background') || '#1e1e1e';
+			const foreground = normalizeMonacoThemeColor(cssVar('--vscode-editor-foreground'), '#d4d4d4', false);
+			const background = normalizeMonacoThemeColor(cssVar('--vscode-editor-background'), '#1e1e1e');
 			monaco.editor.defineTheme('cli-diff-dark', {
 				base: 'vs-dark',
 				inherit: true,
@@ -904,12 +986,12 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 				colors: {
 					'editor.background': background,
 					'editor.foreground': foreground,
-					'editorLineNumber.foreground': cssVar('--vscode-editorLineNumber-foreground') || '#858585',
-					'editorCursor.foreground': cssVar('--vscode-editorCursor-foreground') || foreground,
+					'editorLineNumber.foreground': normalizeMonacoThemeColor(cssVar('--vscode-editorLineNumber-foreground'), '#858585', false),
+					'editorCursor.foreground': normalizeMonacoThemeColor(cssVar('--vscode-editorCursor-foreground'), foreground, false),
 					'editor.selectionBackground': '#8b949e55',
 					'editor.inactiveSelectionBackground': '#8b949e33',
 					'editor.selectionHighlightBackground': '#8b949e22',
-					'editor.lineHighlightBackground': cssVar('--vscode-editor-lineHighlightBackground') || '#2a2d2e',
+					'editor.lineHighlightBackground': normalizeMonacoThemeColor(cssVar('--vscode-editor-lineHighlightBackground'), '#2a2d2e'),
 				},
 			});
 			monaco.editor.defineTheme('cli-diff-light', {
@@ -919,14 +1001,26 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 				colors: {
 					'editor.background': background,
 					'editor.foreground': foreground,
-					'editorLineNumber.foreground': cssVar('--vscode-editorLineNumber-foreground') || '#237893',
-					'editorCursor.foreground': cssVar('--vscode-editorCursor-foreground') || foreground,
+					'editorLineNumber.foreground': normalizeMonacoThemeColor(cssVar('--vscode-editorLineNumber-foreground'), '#237893', false),
+					'editorCursor.foreground': normalizeMonacoThemeColor(cssVar('--vscode-editorCursor-foreground'), foreground, false),
 					'editor.selectionBackground': '#8c8c8c44',
 					'editor.inactiveSelectionBackground': '#8c8c8c24',
 					'editor.selectionHighlightBackground': '#8c8c8c1f',
-					'editor.lineHighlightBackground': cssVar('--vscode-editor-lineHighlightBackground') || '#f0f0f0',
+					'editor.lineHighlightBackground': normalizeMonacoThemeColor(cssVar('--vscode-editor-lineHighlightBackground'), '#f0f0f0'),
 				},
 			});
+		}
+
+		function showInitializationError(error) {
+			ready = false;
+			const message = error instanceof Error ? error.message : String(error || 'Unknown error');
+			console.error('Cli Diff Review failed to initialize Monaco:', error);
+			editorNode.replaceChildren();
+			const errorNode = document.createElement('div');
+			errorNode.className = 'initialization-error';
+			errorNode.textContent = 'Review editor failed to initialize: ' + message;
+			editorNode.appendChild(errorNode);
+			statusNode.textContent = 'Review editor unavailable';
 		}
 
 		function setState(nextState) {
