@@ -24,6 +24,8 @@ type DashboardMessage =
 	| { type: 'initializeWiki' }
 	| { type: 'updateWiki' }
 	| { type: 'generateAiReview' }
+	| { type: 'openWikiIndex' }
+	| { type: 'openExtensionSettings' }
 	| { type: 'openFinding'; uri: string; hunkId: string }
 	| { type: 'cancelAgent' };
 
@@ -174,6 +176,16 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			this.postState();
 			return;
 		}
+		if (message.type === 'openWikiIndex') {
+			await this.executeCommand('cli-diff.openWikiIndex');
+			this.postState();
+			return;
+		}
+		if (message.type === 'openExtensionSettings') {
+			await this.executeCommand('workbench.action.openSettings', '@ext:local.cli-diff-review');
+			this.postState();
+			return;
+		}
 		if (message.type === 'openFinding') {
 			await this.executeCommand('cli-diff.openAiReviewFinding', message.uri, message.hunkId);
 			this.postState();
@@ -243,7 +255,76 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			justify-content: space-between;
 			padding: 4px 8px 0;
 		}
-		.page-header[hidden] { display: none; }
+		.page-actions {
+			position: relative;
+			display: flex;
+			align-items: center;
+			gap: 2px;
+			margin-left: auto;
+		}
+		.settings-button,
+		.page-close {
+			width: 22px;
+			height: 22px;
+			display: inline-grid;
+			place-items: center;
+		}
+		.settings-button svg,
+		.page-close svg {
+			width: 15px;
+			height: 15px;
+			stroke: currentColor;
+			fill: none;
+			stroke-width: 1.7;
+			stroke-linecap: round;
+			stroke-linejoin: round;
+		}
+		.settings-menu {
+			position: absolute;
+			z-index: 10;
+			top: 25px;
+			right: 0;
+			width: min(230px, calc(100vw - 16px));
+			padding: 3px;
+			border: 1px solid var(--vscode-menu-border, var(--tree-border));
+			border-radius: 6px;
+			color: var(--vscode-menu-foreground, var(--vscode-sideBar-foreground));
+			background: var(--vscode-menu-background, var(--vscode-sideBar-background));
+			box-shadow: 0 2px 8px var(--vscode-widget-shadow);
+		}
+		.settings-menu[hidden] { display: none; }
+		.settings-menu-item {
+			width: 100%;
+			min-height: 28px;
+			display: flex;
+			flex-direction: column;
+			align-items: flex-start;
+			justify-content: center;
+			gap: 1px;
+			padding: 4px 6px;
+			text-align: left;
+		}
+		.settings-menu-item:hover:not(:disabled) {
+			color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground));
+			background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground));
+		}
+		.settings-menu-item:disabled { opacity: 1; }
+		.settings-menu-item:disabled .settings-menu-title { color: var(--vscode-disabledForeground, var(--muted)); }
+		.settings-menu-title {
+			font-size: 11px;
+			line-height: 1.25;
+		}
+		.settings-menu-reason {
+			color: var(--muted);
+			font-size: 9px;
+			line-height: 1.2;
+		}
+		.settings-menu-reason:empty { display: none; }
+		.settings-menu-divider {
+			height: 1px;
+			margin: 3px 4px;
+			background: var(--vscode-menu-separatorBackground, var(--tree-border));
+		}
 		.wiki-panel {
 			flex: 1 1 auto;
 			min-height: 168px;
@@ -368,20 +449,6 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			overflow: hidden;
 			text-overflow: ellipsis;
 			white-space: nowrap;
-		}
-		.page-close {
-			width: 22px;
-			height: 22px;
-			display: inline-grid;
-			place-items: center;
-		}
-		.page-close svg {
-			width: 15px;
-			height: 15px;
-			stroke: currentColor;
-			fill: none;
-			stroke-width: 1.7;
-			stroke-linecap: round;
 		}
 		.review-tree {
 			flex: 0 0 auto;
@@ -540,11 +607,39 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 </head>
 <body>
 	<div class="shell">
-		<header class="page-header" id="pageHeader" hidden>
+		<header class="page-header" id="pageHeader">
 			<button class="model-pill" id="modelPill" type="button" title="Configure LLM" hidden></button>
-			<button class="page-close" id="closeConfig" type="button" title="Close configuration" aria-label="Close configuration" hidden>
-				<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4L12 12"/><path d="M12 4L4 12"/></svg>
-			</button>
+			<div class="page-actions">
+				<button class="page-close" id="closeConfig" type="button" title="Close configuration" aria-label="Close configuration" hidden>
+					<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4L12 12"/><path d="M12 4L4 12"/></svg>
+				</button>
+				<button class="settings-button" id="settingsButton" type="button" title="Actions and settings" aria-label="Actions and settings" aria-controls="settingsMenu" aria-expanded="false">
+					<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.2"/><path d="M6.8 2.3L7.2 1H8.8L9.2 2.3L10.5 2.9L11.7 2.3L12.8 3.4L12.2 4.6L12.7 5.9L14 6.3V7.9L12.7 8.3L12.2 9.6L12.8 10.8L11.7 11.9L10.5 11.3L9.2 11.8L8.8 13.1H7.2L6.8 11.8L5.5 11.3L4.3 11.9L3.2 10.8L3.8 9.6L3.3 8.3L2 7.9V6.3L3.3 5.9L3.8 4.6L3.2 3.4L4.3 2.3L5.5 2.9Z"/></svg>
+				</button>
+				<div class="settings-menu" id="settingsMenu" role="menu" hidden>
+					<button class="settings-menu-item" type="button" role="menuitem" data-menu-action="initializeWiki">
+						<span class="settings-menu-title">Initialize LLM Code Wiki</span>
+						<span class="settings-menu-reason"></span>
+					</button>
+					<button class="settings-menu-item" type="button" role="menuitem" data-menu-action="updateWiki">
+						<span class="settings-menu-title">Update LLM Code Wiki</span>
+						<span class="settings-menu-reason"></span>
+					</button>
+					<button class="settings-menu-item" type="button" role="menuitem" data-menu-action="generateAiReview">
+						<span class="settings-menu-title">Generate AI review</span>
+						<span class="settings-menu-reason"></span>
+					</button>
+					<div class="settings-menu-divider" role="separator"></div>
+					<button class="settings-menu-item" type="button" role="menuitem" data-menu-action="openWikiIndex">
+						<span class="settings-menu-title">Open Wiki home</span>
+						<span class="settings-menu-reason"></span>
+					</button>
+					<button class="settings-menu-item" type="button" role="menuitem" data-menu-action="openExtensionSettings">
+						<span class="settings-menu-title">Open extension settings</span>
+						<span class="settings-menu-reason"></span>
+					</button>
+				</div>
+			</div>
 		</header>
 		<section class="wiki-panel" aria-label="LLM Code Wiki">
 			<form class="wiki-config" id="wikiConfig">
@@ -615,9 +710,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const tree = document.querySelector('.review-tree');
 		const toggle = document.getElementById('toggle');
 		const list = document.getElementById('list');
-		const pageHeader = document.getElementById('pageHeader');
 		const modelPill = document.getElementById('modelPill');
 		const closeConfig = document.getElementById('closeConfig');
+		const settingsButton = document.getElementById('settingsButton');
+		const settingsMenu = document.getElementById('settingsMenu');
+		const settingsMenuItems = [...settingsMenu.querySelectorAll('[data-menu-action]')];
 		const wikiConfig = document.getElementById('wikiConfig');
 		const wikiMain = document.getElementById('wikiMain');
 		const wikiLogo = document.getElementById('wikiLogo');
@@ -643,6 +740,24 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			renderWiki(lastWikiState || emptyWikiState());
 		});
 		closeConfig.addEventListener('click', closeConfigEditor);
+		settingsButton.addEventListener('click', (event) => {
+			event.stopPropagation();
+			setSettingsMenuOpen(settingsMenu.hidden);
+		});
+		document.addEventListener('click', (event) => {
+			if (!event.target.closest('.page-actions')) {
+				setSettingsMenuOpen(false);
+			}
+		});
+		for (const item of settingsMenuItems) {
+			item.addEventListener('click', () => {
+				if (item.disabled) {
+					return;
+				}
+				setSettingsMenuOpen(false);
+				vscode.postMessage({ type: item.dataset.menuAction });
+			});
+		}
 		llmProvider.addEventListener('change', () => {
 			editingConfig = true;
 			applyProviderCapabilities(true);
@@ -710,7 +825,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			render(event.data.payload || { files: [] });
 		});
 		window.addEventListener('keydown', (event) => {
-			if (event.key === 'Escape' && editingConfig && lastWikiState?.configured) {
+			if (event.key !== 'Escape') {
+				return;
+			}
+			if (!settingsMenu.hidden) {
+				setSettingsMenuOpen(false);
+			} else if (editingConfig && lastWikiState?.configured) {
 				closeConfigEditor();
 			}
 		});
@@ -742,12 +862,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			if (!editingConfig) {
 				populateConfig(wiki);
 			}
-			pageHeader.hidden = !wiki.configured;
 			modelPill.hidden = !wiki.configured || !wiki.model;
 			modelPill.textContent = wiki.model || '';
 			closeConfig.hidden = !wiki.configured || !editingConfig;
 			wikiConfig.hidden = Boolean(wiki.configured) && !editingConfig;
 			wikiMain.hidden = !wiki.configured || editingConfig;
+			renderSettingsMenu(wiki);
 			if (!wiki.configured) {
 				return;
 			}
@@ -778,6 +898,47 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				wikiAction.hidden = true;
 			}
 			wikiStatus.textContent = wikiStatusText(wiki, initialized, running);
+		}
+
+		function renderSettingsMenu(wiki) {
+			const running = isAgentRunning(wiki.status);
+			const initialized = wiki.status === 'initialized';
+			const initializeLabel = wiki.status === 'paused'
+				? 'Resume Wiki Initialization'
+				: wiki.status === 'failed' ? 'Retry Wiki Initialization' : 'Initialize LLM Code Wiki';
+			setMenuAction('initializeWiki', initializeLabel, running || !wiki.configured || !wiki.workspaceAvailable || initialized,
+				running ? 'Agent is running'
+					: !wiki.configured ? 'Configure LLM first'
+						: !wiki.workspaceAvailable ? 'Open a workspace folder'
+							: initialized ? 'Wiki already initialized' : '');
+			setMenuAction('updateWiki', 'Update LLM Code Wiki',
+				running || !wiki.configured || !wiki.workspaceAvailable || !initialized || !wiki.wikiNeedsUpdate,
+				running ? 'Agent is running'
+					: !wiki.configured ? 'Configure LLM first'
+						: !wiki.workspaceAvailable ? 'Open a workspace folder'
+							: !initialized ? 'Initialize Wiki first' : 'Wiki is up to date');
+			setMenuAction('generateAiReview', 'Generate AI review',
+				running || !wiki.configured || !wiki.workspaceAvailable || (wiki.pendingSourceCount || 0) === 0,
+				running ? 'Agent is running'
+					: !wiki.configured ? 'Configure LLM first'
+						: !wiki.workspaceAvailable ? 'Open a workspace folder' : 'No pending source changes');
+			setMenuAction('openWikiIndex', 'Open Wiki home', !initialized, initialized ? '' : 'Initialize Wiki first');
+			setMenuAction('openExtensionSettings', 'Open extension settings', false, '');
+		}
+
+		function setMenuAction(action, label, disabled, reason) {
+			const item = settingsMenuItems.find((candidate) => candidate.dataset.menuAction === action);
+			if (!item) {
+				return;
+			}
+			item.disabled = Boolean(disabled);
+			item.querySelector('.settings-menu-title').textContent = label;
+			item.querySelector('.settings-menu-reason').textContent = disabled ? reason : '';
+		}
+
+		function setSettingsMenuOpen(open) {
+			settingsMenu.hidden = !open;
+			settingsButton.setAttribute('aria-expanded', String(open));
 		}
 
 		function populateConfig(wiki) {

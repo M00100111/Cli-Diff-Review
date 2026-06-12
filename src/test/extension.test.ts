@@ -453,6 +453,16 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('<option value="deepseek">DeepSeek</option>'));
 		assert.ok(view.webview.html.includes('Strict Tools (Beta)'));
 		assert.ok(view.webview.html.includes('id="closeConfig"'));
+		assert.ok(view.webview.html.includes('id="settingsButton"'));
+		assert.ok(view.webview.html.includes('id="settingsMenu"'));
+		assert.ok(view.webview.html.includes('data-menu-action="initializeWiki"'));
+		assert.ok(view.webview.html.includes('data-menu-action="updateWiki"'));
+		assert.ok(view.webview.html.includes('data-menu-action="generateAiReview"'));
+		assert.ok(view.webview.html.includes('data-menu-action="openWikiIndex"'));
+		assert.ok(view.webview.html.includes('data-menu-action="openExtensionSettings"'));
+		assert.ok(view.webview.html.includes('Wiki is up to date'));
+		assert.ok(view.webview.html.includes('No pending source changes'));
+		assert.ok(view.webview.html.includes('Agent is running'));
 		assert.ok(view.webview.html.includes("llmApiKey.value = '********'"));
 		assert.ok(view.webview.html.includes("apiKey: apiKeyPlaceholderActive ? '' : llmApiKey.value"));
 		const modelIndex = view.webview.html.indexOf('id="modelPill"');
@@ -487,6 +497,12 @@ suite('Review state', () => {
 			thinkingMode: 'max',
 			strictTools: true,
 		});
+		messageHandler({ type: 'openWikiIndex' });
+		messageHandler({ type: 'openExtensionSettings' });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.ok(commands.some((call) => call.command === 'cli-diff.openWikiIndex' && call.args.length === 0));
+		assert.ok(commands.some((call) => call.command === 'workbench.action.openSettings'
+			&& call.args[0] === '@ext:local.cli-diff-review'));
 		provider.dispose();
 	});
 

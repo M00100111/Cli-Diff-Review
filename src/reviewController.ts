@@ -162,6 +162,7 @@ export class ReviewController implements vscode.Disposable {
 			this.registerCommand('cli-diff.cancelLlmWikiInitialization', () => this.cancelLlmWikiInitialization()),
 			this.registerCommand('cli-diff.updateLlmWiki', () => this.updateLlmWiki()),
 			this.registerCommand('cli-diff.generateAiReview', () => this.generateAiReview()),
+			this.registerCommand('cli-diff.openWikiIndex', () => this.openWikiIndex()),
 			this.registerCommand('cli-diff.openAiReviewFinding', (uri: string, hunkId: string) => this.openAiReviewFinding(uri, hunkId)),
 			this.registerCommand('cli-diff.cancelAgent', () => this.cancelCurrentAgent()),
 		);
@@ -1510,6 +1511,23 @@ export class ReviewController implements vscode.Disposable {
 		}
 		await this.reviewWebview.open(file.uri, { line: hunk.newStart, column: 0 });
 		this.setCurrentReviewUri(file.uri);
+	}
+
+	private async openWikiIndex(): Promise<void> {
+		const root = this.dashboardWikiRootFolder();
+		if (!root) {
+			vscode.window.showInformationMessage('Open a workspace folder before opening the Wiki.');
+			return;
+		}
+
+		const indexUri = vscode.Uri.joinPath(root.uri, '.wiki', 'index.md');
+		try {
+			await vscode.workspace.fs.stat(indexUri);
+		} catch {
+			vscode.window.showInformationMessage('Initialize LLM Code Wiki before opening the Wiki home page.');
+			return;
+		}
+		await vscode.commands.executeCommand('vscode.open', indexUri);
 	}
 
 	private async requireLlmConfig(): Promise<LlmRuntimeConfig | undefined> {
