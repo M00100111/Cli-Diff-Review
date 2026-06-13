@@ -5,7 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { reviewChangeSignature, sortFindings, validateReviewFindings } from '../agent/codeReview';
-import { AgentRunner, validateAgentResponse } from '../agent/runtime';
+import { AgentRunner, type AgentTraceEvent, validateAgentResponse } from '../agent/runtime';
 import { createWikiAgentTools } from '../agent/tools';
 import { acceptHunkInBaseline, computeLineDiff } from '../diffEngine';
 import { GitService } from '../gitService';
@@ -31,7 +31,7 @@ import {
 } from '../reviewState';
 import { replaceLineBlock, splitLines } from '../text';
 import { FilePair, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewSession } from '../types';
-import { normalizeWikiFilePath, validateWikiInitializationResponse } from '../wiki/wikiInitializer';
+import { normalizeWikiFilePath, validateWikiInitializationResponse, WikiInitializationService } from '../wiki/wikiInitializer';
 import { WikiStateService } from '../wiki/state';
 
 suite('Diff engine', () => {
@@ -455,6 +455,20 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('id="closeConfig"'));
 		assert.ok(view.webview.html.includes('id="settingsButton"'));
 		assert.ok(view.webview.html.includes('id="settingsMenu"'));
+		assert.ok(view.webview.html.includes('id="wikiRunList"'));
+		assert.ok(view.webview.html.includes('function renderRunLog'));
+		assert.ok(view.webview.html.includes('function groupRunLog'));
+		assert.ok(view.webview.html.includes('function renderRunLogRound'));
+		assert.ok(view.webview.html.includes("typeof item.round === 'number'"));
+		assert.ok(view.webview.html.includes('wiki-run-detail'));
+		assert.ok(view.webview.html.includes('wiki-run-round'));
+		assert.ok(view.webview.html.includes('height: 100vh;'));
+		assert.ok(view.webview.html.includes('overflow: hidden;'));
+		assert.ok(view.webview.html.includes('.wiki-panel.has-run-log'));
+		assert.ok(view.webview.html.includes('.wiki-main.has-run-log'));
+		assert.ok(view.webview.html.includes('.wiki-main.has-run-log .wiki-run-list'));
+		assert.ok(view.webview.html.includes("wikiPanel?.classList.toggle('has-run-log', hasRunLog)"));
+		assert.ok(view.webview.html.includes("wikiMain.classList.toggle('has-run-log', hasRunLog)"));
 		assert.ok(view.webview.html.includes('data-menu-action="initializeWiki"'));
 		assert.ok(view.webview.html.includes('data-menu-action="updateWiki"'));
 		assert.ok(view.webview.html.includes('data-menu-action="generateAiReview"'));
@@ -591,6 +605,43 @@ suite('LLM Code Wiki', () => {
 			...missingInterface,
 			files: missingInterface.files.filter((file) => file.path !== 'interfaces.md'),
 		}));
+	});
+
+	test('passes Agent trace events through Wiki initialization', async () => {
+		const extensionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-extension-'));
+		const repositoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-wiki-init-'));
+		try {
+			writeRepoFile(extensionRoot, 'llm-code-wiki/llm-code-wiki.md', '# Generic Wiki\n');
+			writeRepoFile(repositoryRoot, 'src/app.ts', 'export const value = 1;\n');
+			const wiki = validWikiResponse();
+			const responses = [
+				JSON.stringify({
+					type: 'tool_calls',
+					calls: wiki.files.map((file, index) => ({
+						id: `write-${index}`,
+						name: 'write_wiki_file',
+						arguments: file,
+					})),
+				}),
+				'{"type":"final","result":{"summary":"Generated wiki.","warnings":[]}}',
+			];
+			const trace: AgentTraceEvent[] = [];
+			const service = new WikiInitializationService(vscode.Uri.file(extensionRoot));
+			const result = await service.initialize({
+				root: workspaceFolder(repositoryRoot),
+				config: { provider: 'openai', baseUrl: 'https://example.test', model: 'wiki-test', apiKey: 'secret' },
+				client: { completeJson: async () => responses.shift() ?? '' },
+				onTrace: (event) => trace.push(event),
+			});
+
+			assert.strictEqual(result.summary, 'Generated wiki.');
+			assert.ok(trace.some((event) => event.kind === 'llm_request'));
+			assert.ok(trace.some((event) => event.kind === 'tool_result' && event.summary.includes('write_wiki_file')));
+			assert.ok(trace.some((event) => event.kind === 'run_complete'));
+		} finally {
+			fs.rmSync(extensionRoot, { recursive: true, force: true });
+			fs.rmSync(repositoryRoot, { recursive: true, force: true });
+		}
 	});
 
 	test('extracts OpenAI-compatible JSON content from chat completions', async () => {
@@ -805,12 +856,26 @@ suite('LLM Code Wiki', () => {
 			jsonOutputEnabled: true,
 			thinkingMode: 'disabled' as const,
 			strictTools: false,
+			runLog: [{
+				id: 'wiki-run-1',
+				sequence: 1,
+				timestamp: '2026-06-13T00:00:00.000Z',
+				kind: 'llm_request' as const,
+				title: 'LLM request',
+				summary: 'Round 1 request',
+				round: 1,
+				status: 'running' as const,
+				details: [{ label: 'Request', format: 'json' as const, content: '{"model":"gpt-test"}' }],
+			}],
 		};
+		const defaultPayload = buildReviewDashboardPayload(undefined, undefined, () => false);
 		const payload = buildReviewDashboardPayload(undefined, undefined, () => false, wiki);
 
+		assert.deepStrictEqual(defaultPayload.llmWiki?.runLog, []);
 		assert.ok(payload.llmWiki);
 		assert.strictEqual(payload.llmWiki.configured, true);
 		assert.strictEqual(payload.llmWiki.model, 'gpt-test');
+		assert.strictEqual(payload.llmWiki.runLog[0].summary, 'Round 1 request');
 		assert.deepStrictEqual(payload.files, []);
 	});
 });
@@ -821,6 +886,7 @@ suite('Agent runtime', () => {
 			'{"type":"tool_calls","calls":[{"id":"call-1","name":"echo","arguments":{"value":"hello"}}]}',
 			'{"type":"final","result":{"summary":"done"}}',
 		];
+		const trace: AgentTraceEvent[] = [];
 		const runner = new AgentRunner();
 		const result = await runner.run({
 			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
@@ -833,11 +899,27 @@ suite('Agent runtime', () => {
 				parameters: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false },
 				execute: async (args) => args,
 			}],
+			onTrace: (event) => trace.push(event),
 		});
 
 		assert.strictEqual(result.result.summary, 'done');
 		assert.strictEqual(result.rounds, 2);
 		assert.strictEqual(result.toolCalls, 1);
+		assert.deepStrictEqual(trace.map((event) => event.kind), [
+			'run_start',
+			'llm_request',
+			'llm_response',
+			'parse_success',
+			'tool_call',
+			'tool_result',
+			'tool_results_context',
+			'llm_request',
+			'llm_response',
+			'parse_success',
+			'run_complete',
+		]);
+		assert.ok(trace.find((event) => event.kind === 'llm_request')?.details[0].content.includes('"messages"'));
+		assert.ok(!JSON.stringify(trace).includes('secret'));
 	});
 
 	test('rejects invalid Agent actions and unavailable tools', async () => {
@@ -856,6 +938,7 @@ suite('Agent runtime', () => {
 	test('corrects invalid text JSON once without adding it to history', async () => {
 		const requests: unknown[] = [];
 		const responses = ['Now I have enough context.', '{"type":"final","result":{"summary":"done"}}'];
+		const trace: AgentTraceEvent[] = [];
 		const runner = new AgentRunner();
 		const result = await runner.run({
 			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
@@ -868,15 +951,19 @@ suite('Agent runtime', () => {
 			systemPrompt: 'test json',
 			userPrompt: 'test',
 			tools: [],
+			onTrace: (event) => trace.push(event),
 		});
 
 		assert.strictEqual(result.result.summary, 'done');
 		assert.strictEqual(requests.length, 2);
 		assert.strictEqual(JSON.stringify(requests[1]).includes('Now I have enough context.'), false);
+		assert.ok(trace.some((event) => event.kind === 'parse_error' && event.summary.includes('Unexpected token')));
+		assert.ok(trace.some((event) => event.kind === 'parse_success' && event.summary === 'Parsed final result'));
 	});
 
 	test('uses DeepSeek native tools and returns reasoning content on the next round', async () => {
 		const requests: Array<{ messages?: Array<{ role: string; reasoningContent?: string; toolCallId?: string }> }> = [];
+		const trace: AgentTraceEvent[] = [];
 		const completions = [
 			{
 				content: '',
@@ -911,12 +998,17 @@ suite('Agent runtime', () => {
 				parameters: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false },
 				execute: async (args) => args,
 			}],
+			onTrace: (event) => trace.push(event),
 		});
 
 		assert.strictEqual(result.result.summary, 'done');
 		assert.strictEqual(requests.length, 2);
 		assert.ok(requests[1].messages?.some((message) => message.role === 'assistant' && message.reasoningContent === 'I need to echo.'));
 		assert.ok(requests[1].messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call-1'));
+		assert.ok(trace.some((event) => event.kind === 'llm_response' && event.summary.includes('native tool call')));
+		assert.ok(trace.some((event) => event.kind === 'tool_results_context'));
+		assert.ok(JSON.stringify(trace).includes('I need to echo.'));
+		assert.ok(JSON.stringify(trace).includes('toolCallId'));
 	});
 
 	test('corrects empty or invalid DeepSeek native tool output once', async () => {

@@ -1,6 +1,7 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { AiReviewFinding } from './agent/codeReview';
+import type { AgentTraceDetail, AgentTraceEventKind, AgentTraceStatus } from './agent/runtime';
 import type { LlmProvider, LlmThinkingMode } from './llm/config';
 import { ReviewFileState, ReviewSession, uriKey } from './types';
 
@@ -56,6 +57,18 @@ export interface ReviewDashboardPayload {
 
 export type LlmWikiStatus = 'unconfigured' | 'idle' | 'initializing' | 'updating' | 'reviewing' | 'initialized' | 'paused' | 'failed';
 
+export interface LlmWikiRunLogEntry {
+	id: string;
+	sequence: number;
+	timestamp: string;
+	kind: AgentTraceEventKind;
+	title: string;
+	summary: string;
+	round?: number;
+	status: AgentTraceStatus;
+	details: AgentTraceDetail[];
+}
+
 export interface LlmWikiDashboardState {
 	configured: boolean;
 	provider: LlmProvider;
@@ -73,6 +86,7 @@ export interface LlmWikiDashboardState {
 	jsonOutputEnabled: boolean;
 	thinkingMode: LlmThinkingMode;
 	strictTools: boolean;
+	runLog: LlmWikiRunLogEntry[];
 }
 
 export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vscode.Disposable {
@@ -224,9 +238,14 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			--skipped: var(--vscode-descriptionForeground);
 		}
 		* { box-sizing: border-box; }
+		html {
+			height: 100%;
+			overflow: hidden;
+		}
 		body {
 			margin: 0;
-			min-height: 100vh;
+			height: 100vh;
+			overflow: hidden;
 			color: var(--vscode-sideBar-foreground);
 			background: var(--vscode-sideBar-background);
 			font: var(--vscode-font-size) var(--vscode-font-family);
@@ -244,9 +263,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		button:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
 		button:disabled { opacity: .45; cursor: default; }
 		.shell {
-			min-height: 100vh;
+			height: 100vh;
+			min-height: 0;
 			display: flex;
 			flex-direction: column;
+			overflow: hidden;
 			padding: 0;
 		}
 		.page-header {
@@ -341,7 +362,20 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			padding: 12px 8px;
 			color: var(--vscode-sideBar-foreground);
 		}
-		.wiki-config,
+		.wiki-panel.has-run-log {
+			min-height: 0;
+			align-items: stretch;
+			justify-content: stretch;
+			overflow: hidden;
+		}
+		.wiki-config {
+			width: 100%;
+			max-width: 260px;
+			display: flex;
+			flex-direction: column;
+			align-items: stretch;
+			gap: 7px;
+		}
 		.wiki-main {
 			width: 100%;
 			max-width: 260px;
@@ -350,12 +384,21 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			align-items: stretch;
 			gap: 7px;
 		}
+		.wiki-main.has-run-log {
+			flex: 1 1 auto;
+			width: 100%;
+			max-width: none;
+			min-height: 0;
+			align-self: stretch;
+			overflow: hidden;
+		}
 		.wiki-config[hidden],
 		.wiki-main[hidden],
 		.model-pill[hidden],
 		.page-close[hidden],
 		.wiki-logo[hidden],
 		.wiki-action[hidden],
+		.wiki-run-list[hidden],
 		.findings[hidden] { display: none; }
 		.wiki-field {
 			display: flex;
@@ -410,6 +453,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			background: transparent;
 			border-color: var(--tree-border);
 		}
+		.wiki-main.has-run-log .wiki-action {
+			flex: 0 0 auto;
+		}
 		.wiki-logo {
 			width: 72px;
 			height: 72px;
@@ -417,11 +463,136 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			opacity: .82;
 		}
 		.wiki-status {
+			flex: 0 0 auto;
 			min-height: 16px;
 			color: var(--muted);
 			text-align: center;
 			line-height: 1.35;
 			overflow-wrap: anywhere;
+		}
+		.wiki-run-list {
+			display: flex;
+			flex-direction: column;
+			gap: 4px;
+			max-height: min(46vh, 380px);
+			overflow: auto;
+		}
+		.wiki-main.has-run-log .wiki-run-list {
+			flex: 1 1 auto;
+			width: 100%;
+			min-height: 0;
+			max-height: none;
+			overflow: auto;
+		}
+		.wiki-run-item {
+			border: 1px solid var(--tree-border);
+			border-radius: 4px;
+			background: var(--vscode-sideBar-background);
+		}
+		.wiki-run-item[open] {
+			background: var(--vscode-list-hoverBackground, var(--vscode-sideBar-background));
+		}
+		.wiki-run-summary {
+			display: grid;
+			grid-template-columns: minmax(0, 1fr) auto;
+			gap: 5px;
+			padding: 5px 6px;
+			cursor: pointer;
+			list-style: none;
+		}
+		.wiki-run-summary::-webkit-details-marker { display: none; }
+		.wiki-run-main {
+			min-width: 0;
+			display: flex;
+			flex-direction: column;
+			gap: 2px;
+		}
+		.wiki-run-title {
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+			font-size: 11px;
+			font-weight: 600;
+		}
+		.wiki-run-meta {
+			color: var(--muted);
+			font-size: 9px;
+			line-height: 1.2;
+			overflow-wrap: anywhere;
+		}
+		.wiki-run-status {
+			align-self: start;
+			min-width: 36px;
+			padding-top: 1px;
+			font-size: 9px;
+			font-weight: 700;
+			text-align: right;
+			text-transform: uppercase;
+		}
+		.wiki-run-status.success { color: var(--vscode-testing-iconPassed, var(--vscode-gitDecoration-untrackedResourceForeground)); }
+		.wiki-run-status.error { color: var(--vscode-errorForeground); }
+		.wiki-run-status.running { color: var(--vscode-progressBar-background, var(--vscode-focusBorder)); }
+		.wiki-run-status.info { color: var(--muted); }
+		.wiki-run-round {
+			border: 1px solid var(--tree-border);
+			border-radius: 4px;
+			background: var(--vscode-sideBar-background);
+		}
+		.wiki-run-round[open] {
+			background: var(--vscode-list-hoverBackground, var(--vscode-sideBar-background));
+		}
+		.wiki-run-round-summary {
+			display: grid;
+			grid-template-columns: minmax(0, 1fr) auto;
+			gap: 5px;
+			padding: 5px 6px;
+			cursor: pointer;
+			list-style: none;
+		}
+		.wiki-run-round-summary::-webkit-details-marker { display: none; }
+		.wiki-run-round-items {
+			display: flex;
+			flex-direction: column;
+			gap: 3px;
+			margin: 0 4px 5px 7px;
+			padding-left: 7px;
+			border-left: 1px solid var(--tree-border);
+		}
+		.wiki-run-round-items .wiki-run-item {
+			border-color: transparent;
+			background: transparent;
+		}
+		.wiki-run-round-items .wiki-run-item[open] {
+			border-color: var(--tree-border);
+			background: var(--vscode-sideBar-background);
+		}
+		.wiki-run-details {
+			display: flex;
+			flex-direction: column;
+			gap: 5px;
+			padding: 0 6px 6px;
+		}
+		.wiki-run-detail-label {
+			display: block;
+			margin: 0 0 2px;
+			color: var(--muted);
+			font-size: 9px;
+			font-weight: 600;
+		}
+		.wiki-run-detail pre {
+			max-height: 220px;
+			margin: 0;
+			overflow: auto;
+			white-space: pre-wrap;
+			overflow-wrap: anywhere;
+			padding: 5px;
+			border: 1px solid var(--tree-border);
+			border-radius: 3px;
+			color: var(--vscode-editor-foreground, var(--vscode-sideBar-foreground));
+			background: var(--vscode-textCodeBlock-background, var(--vscode-editor-background, transparent));
+			font-family: var(--vscode-editor-font-family, var(--vscode-font-family));
+			font-size: 10px;
+			line-height: 1.35;
 		}
 		.findings {
 			display: flex;
@@ -459,6 +630,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 		.review-tree {
 			flex: 0 0 auto;
+			max-height: min(48vh, 420px);
+			display: flex;
+			flex-direction: column;
 			margin: 0;
 			background: var(--vscode-sideBar-background);
 			overflow: hidden;
@@ -466,6 +640,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			border-radius: 6px;
 		}
 		.tree-header {
+			flex: 0 0 auto;
 			height: 22px;
 			display: flex;
 			align-items: center;
@@ -523,6 +698,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			height: 20px;
 		}
 		.list {
+			flex: 1 1 auto;
+			min-height: 0;
 			max-height: min(48vh, 420px);
 			overflow: auto;
 		}
@@ -691,6 +868,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			<div class="wiki-main" id="wikiMain" hidden>
 				<img class="wiki-logo" id="wikiLogo" src="${iconUri}" alt="">
 				<div class="findings" id="findings" hidden></div>
+				<div class="wiki-run-list" id="wikiRunList" hidden></div>
 				<div class="wiki-status" id="wikiStatus"></div>
 				<button class="wiki-action" id="wikiAction" type="button">Initialize LLM Code Wiki</button>
 			</div>
@@ -715,6 +893,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 	<script nonce="${nonce}">
 		const vscode = acquireVsCodeApi();
 		const tree = document.querySelector('.review-tree');
+		const wikiPanel = document.querySelector('.wiki-panel');
 		const toggle = document.getElementById('toggle');
 		const list = document.getElementById('list');
 		const modelPill = document.getElementById('modelPill');
@@ -726,6 +905,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const wikiMain = document.getElementById('wikiMain');
 		const wikiLogo = document.getElementById('wikiLogo');
 		const findings = document.getElementById('findings');
+		const wikiRunList = document.getElementById('wikiRunList');
 		const wikiStatus = document.getElementById('wikiStatus');
 		const wikiAction = document.getElementById('wikiAction');
 		const llmProvider = document.getElementById('llmProvider');
@@ -874,6 +1054,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			closeConfig.hidden = !wiki.configured || !editingConfig;
 			wikiConfig.hidden = Boolean(wiki.configured) && !editingConfig;
 			wikiMain.hidden = !wiki.configured || editingConfig;
+			const runLog = wiki.runLog || [];
+			const hasRunLog = runLog.length > 0 && Boolean(wiki.configured) && !editingConfig;
+			wikiPanel?.classList.toggle('has-run-log', hasRunLog);
+			wikiMain.classList.toggle('has-run-log', hasRunLog);
 			renderSettingsMenu(wiki);
 			if (!wiki.configured) {
 				return;
@@ -881,8 +1065,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 
 			const initialized = wiki.status === 'initialized';
 			const running = isAgentRunning(wiki.status);
-			renderFindings(wiki.findings || []);
-			wikiLogo.hidden = running || (wiki.findings || []).length > 0;
+			const currentFindings = wiki.findings || [];
+			renderFindings(currentFindings);
+			renderRunLog(runLog);
+			wikiLogo.hidden = running || currentFindings.length > 0 || hasRunLog;
 			wikiAction.classList.toggle('secondary', running);
 			wikiAction.hidden = false;
 			wikiAction.disabled = !wiki.workspaceAvailable && !running;
@@ -1020,6 +1206,157 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			}
 		}
 
+		function renderRunLog(items) {
+			wikiRunList.replaceChildren();
+			wikiRunList.hidden = items.length === 0;
+			for (const block of groupRunLog(items)) {
+				wikiRunList.appendChild(block.type === 'round'
+					? renderRunLogRound(block)
+					: renderRunLogEntry(block.item));
+			}
+		}
+
+		function groupRunLog(items) {
+			const leading = [];
+			const trailing = [];
+			const rounds = [];
+			const roundByNumber = new Map();
+			let seenRound = false;
+			for (const item of items) {
+				if (typeof item.round === 'number') {
+					seenRound = true;
+					let round = roundByNumber.get(item.round);
+					if (!round) {
+						round = { type: 'round', round: item.round, items: [] };
+						roundByNumber.set(item.round, round);
+						rounds.push(round);
+					}
+					round.items.push(item);
+				} else if (!seenRound && item.kind !== 'run_complete' && item.kind !== 'run_error') {
+					leading.push({ type: 'entry', item });
+				} else {
+					trailing.push({ type: 'entry', item });
+				}
+			}
+			return [...leading, ...rounds, ...trailing];
+		}
+
+		function renderRunLogRound(group) {
+			const details = document.createElement('details');
+			const statusValue = roundStatus(group.items);
+			details.className = 'wiki-run-round ' + statusValue;
+
+			const summary = document.createElement('summary');
+			summary.className = 'wiki-run-round-summary';
+			const main = document.createElement('span');
+			main.className = 'wiki-run-main';
+			const title = document.createElement('span');
+			title.className = 'wiki-run-title';
+			title.textContent = 'Round ' + group.round;
+			const meta = document.createElement('span');
+			meta.className = 'wiki-run-meta';
+			meta.textContent = group.items.length + ' events';
+			main.append(title, meta);
+			const status = document.createElement('span');
+			status.className = 'wiki-run-status ' + statusValue;
+			status.textContent = statusValue;
+			summary.append(main, status);
+			details.appendChild(summary);
+
+			const body = document.createElement('div');
+			body.className = 'wiki-run-round-items';
+			for (const item of group.items) {
+				body.appendChild(renderRunLogEntry(item));
+			}
+			details.appendChild(body);
+			return details;
+		}
+
+		function renderRunLogEntry(item) {
+			const details = document.createElement('details');
+			details.className = 'wiki-run-item ' + (item.status || 'info');
+			details.id = item.id || '';
+
+			const summary = document.createElement('summary');
+			summary.className = 'wiki-run-summary';
+			const main = document.createElement('span');
+			main.className = 'wiki-run-main';
+			const title = document.createElement('span');
+			title.className = 'wiki-run-title';
+			title.textContent = item.title || eventKindLabel(item.kind);
+			const meta = document.createElement('span');
+			meta.className = 'wiki-run-meta';
+			meta.textContent = runLogMeta(item);
+			main.append(title, meta);
+			const status = document.createElement('span');
+			status.className = 'wiki-run-status ' + (item.status || 'info');
+			status.textContent = item.status || 'info';
+			summary.append(main, status);
+			details.appendChild(summary);
+
+			const body = document.createElement('div');
+			body.className = 'wiki-run-details';
+			for (const detail of item.details || []) {
+				const block = document.createElement('div');
+				block.className = 'wiki-run-detail';
+				const label = document.createElement('span');
+				label.className = 'wiki-run-detail-label';
+				label.textContent = detail.label || detail.format || 'Detail';
+				const pre = document.createElement('pre');
+				pre.dataset.format = detail.format || 'text';
+				pre.textContent = detail.content || '';
+				block.append(label, pre);
+				body.appendChild(block);
+			}
+			if (!body.childElementCount) {
+				const block = document.createElement('div');
+				block.className = 'wiki-run-detail';
+				const pre = document.createElement('pre');
+				pre.textContent = item.summary || '';
+				block.appendChild(pre);
+				body.appendChild(block);
+			}
+			details.appendChild(body);
+			return details;
+		}
+
+		function roundStatus(items) {
+			if (items.some((item) => item.status === 'error')) {
+				return 'error';
+			}
+			if (items.some((item) => item.status === 'running')) {
+				return 'running';
+			}
+			return 'success';
+		}
+
+		function runLogMeta(item) {
+			const parts = [eventKindLabel(item.kind)];
+			if (typeof item.round === 'number') {
+				parts.push('round ' + item.round);
+			}
+			if (item.summary) {
+				parts.push(item.summary);
+			}
+			return parts.join(' | ');
+		}
+
+		function eventKindLabel(kind) {
+			const labels = {
+				run_start: 'Run start',
+				llm_request: 'LLM request',
+				llm_response: 'LLM response',
+				parse_success: 'Parse success',
+				parse_error: 'Parse error',
+				tool_call: 'Tool call',
+				tool_result: 'Tool result',
+				tool_results_context: 'Tool context',
+				run_complete: 'Run complete',
+				run_error: 'Run event',
+			};
+			return labels[kind] || 'Run event';
+		}
+
 		function isAgentRunning(status) {
 			return status === 'initializing' || status === 'updating' || status === 'reviewing';
 		}
@@ -1066,6 +1403,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				jsonOutputEnabled: true,
 				thinkingMode: 'disabled',
 				strictTools: false,
+				runLog: [],
 			};
 		}
 
@@ -1215,6 +1553,7 @@ export function defaultLlmWikiDashboardState(): LlmWikiDashboardState {
 		jsonOutputEnabled: true,
 		thinkingMode: 'disabled',
 		strictTools: false,
+		runLog: [],
 	};
 }
 

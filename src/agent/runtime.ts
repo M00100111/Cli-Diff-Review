@@ -16,6 +16,37 @@ export interface AgentProgress {
 	toolCalls: number;
 }
 
+export type AgentTraceEventKind =
+	| 'run_start'
+	| 'llm_request'
+	| 'llm_response'
+	| 'parse_success'
+	| 'parse_error'
+	| 'tool_call'
+	| 'tool_result'
+	| 'tool_results_context'
+	| 'run_complete'
+	| 'run_error';
+
+export type AgentTraceStatus = 'info' | 'running' | 'success' | 'error';
+
+export type AgentTraceDetailFormat = 'text' | 'json' | 'markdown';
+
+export interface AgentTraceDetail {
+	label: string;
+	format: AgentTraceDetailFormat;
+	content: string;
+}
+
+export interface AgentTraceEvent {
+	kind: AgentTraceEventKind;
+	title: string;
+	summary: string;
+	round?: number;
+	status: AgentTraceStatus;
+	details: AgentTraceDetail[];
+}
+
 export interface AgentRunOptions {
 	config: LlmRuntimeConfig;
 	client: LlmClient;
@@ -24,6 +55,7 @@ export interface AgentRunOptions {
 	tools: AgentTool[];
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
+	onTrace?: (event: AgentTraceEvent) => void;
 	maxRounds?: number;
 	maxToolCalls?: number;
 	maxToolResultChars?: number;
@@ -92,6 +124,16 @@ export class AgentRunner {
 		];
 		let toolCalls = 0;
 		let toolResultChars = 0;
+		emitTrace(options, {
+			kind: 'run_start',
+			title: 'Agent started',
+			summary: `${providerName(options.config.provider)} model ${options.config.model}`,
+			status: 'running',
+			details: [
+				jsonDetail('Initial messages', messages),
+				jsonDetail('Tools', toolDefinitions(options.tools)),
+			],
+		});
 
 		try {
 			for (let round = 1; round <= maxRounds; round += 1) {
@@ -103,11 +145,20 @@ export class AgentRunner {
 					throw new Error('Agent exceeded its accumulated context limit.');
 				}
 				options.onProgress?.({ message: `Agent round ${round}`, round, toolCalls });
-				const response = await requestAgentRound(options, messages, nativeTools, signal);
+				const response = await requestAgentRound(options, messages, nativeTools, signal, round);
 				throwIfAborted(signal);
 				if (response.type === 'final') {
 					messages.push({ role: 'assistant', content: response.content, reasoningContent: response.reasoningContent });
-					return { result: response.result, rounds: round, toolCalls };
+					const result = { result: response.result, rounds: round, toolCalls };
+					emitTrace(options, {
+						kind: 'run_complete',
+						title: 'Agent completed',
+						summary: `Completed in ${round} rounds with ${toolCalls} tool calls`,
+						round,
+						status: 'success',
+						details: [jsonDetail('Final result', response.result)],
+					});
+					return result;
 				}
 
 				if (toolCalls + response.calls.length > maxToolCalls) {
@@ -121,11 +172,37 @@ export class AgentRunner {
 						throw new Error(`Agent requested an unavailable tool: ${call.name}`);
 					}
 					options.onProgress?.({ message: `Running ${call.name}`, round, toolCalls });
+					emitTrace(options, {
+						kind: 'tool_call',
+						title: 'Tool call',
+						summary: call.name,
+						round,
+						status: 'running',
+						details: [
+							textDetail('Call ID', call.id),
+							jsonDetail('Arguments', call.arguments),
+						],
+					});
+					const result: { id: string; name: string; ok: boolean; result?: unknown; error?: string } = {
+						id: call.id,
+						name: call.name,
+						ok: true,
+					};
 					try {
-						results.push({ id: call.id, name: call.name, ok: true, result: await tool.execute(call.arguments, signal) });
+						result.result = await tool.execute(call.arguments, signal);
 					} catch (error) {
-						results.push({ id: call.id, name: call.name, ok: false, error: error instanceof Error ? error.message : String(error) });
+						result.ok = false;
+						result.error = error instanceof Error ? error.message : String(error);
 					}
+					results.push(result);
+					emitTrace(options, {
+						kind: 'tool_result',
+						title: result.ok ? 'Tool result' : 'Tool error',
+						summary: result.ok ? `${call.name} completed` : `${call.name} failed`,
+						round,
+						status: result.ok ? 'success' : 'error',
+						details: [jsonDetail('Result', result)],
+					});
 					toolCalls += 1;
 				}
 				const content = JSON.stringify({ type: 'tool_results', results });
@@ -133,6 +210,14 @@ export class AgentRunner {
 				if (toolResultChars > maxToolResultChars) {
 					throw new Error('Agent exceeded its tool result context limit.');
 				}
+				emitTrace(options, {
+					kind: 'tool_results_context',
+					title: 'Tool results context',
+					summary: `${results.length} tool result${results.length === 1 ? '' : 's'} returned to model`,
+					round,
+					status: 'info',
+					details: [jsonTextDetail('Tool results JSON', content)],
+				});
 				if (nativeTools) {
 					messages.push({
 						role: 'assistant',
@@ -150,6 +235,14 @@ export class AgentRunner {
 			}
 			throw new Error('Agent exceeded its round limit.');
 		} catch (error) {
+			const reportedError = timedOut ? new Error('Agent exceeded its runtime limit.') : error;
+			emitTrace(options, {
+				kind: 'run_error',
+				title: 'Agent error',
+				summary: errorMessage(reportedError),
+				status: 'error',
+				details: [textDetail('Error', errorMessage(reportedError))],
+			});
 			if (timedOut) {
 				throw new Error('Agent exceeded its runtime limit.');
 			}
@@ -201,6 +294,7 @@ async function requestAgentRound(
 	messages: LlmMessage[],
 	nativeTools: boolean,
 	signal: AbortSignal,
+	round: number,
 ): Promise<ValidAgentRound> {
 	let failure: unknown;
 	let preview = '';
@@ -211,19 +305,56 @@ async function requestAgentRound(
 				? 'Your previous response was invalid. Use a provided native function tool, or return only valid JSON exactly shaped as {"type":"final","result":{}}.'
 				: 'Your previous response was invalid. Return only valid JSON matching either the tool_calls or final JSON example from the system prompt.',
 		}];
-		const completion = await completeLlm(options.client, {
+		const request = {
 			model: options.config.model,
 			messages: [...messages, ...correction],
 			temperature: 0,
 			maxTokens: 12000,
 			jsonOutput: options.config.provider === 'deepseek' ? true : options.config.jsonOutputEnabled,
 			tools: nativeTools ? toolDefinitions(options.tools) : undefined,
-		}, signal);
+		};
+		emitTrace(options, {
+			kind: 'llm_request',
+			title: attempt === 0 ? 'LLM request' : 'LLM correction request',
+			summary: attempt === 0 ? `Round ${round} request` : `Round ${round} correction request`,
+			round,
+			status: 'running',
+			details: [jsonDetail('Request', request)],
+		});
+		const completion = await completeLlm(options.client, request, signal);
+		emitTrace(options, {
+			kind: 'llm_response',
+			title: 'LLM response',
+			summary: completionSummary(completion),
+			round,
+			status: 'success',
+			details: completionDetails(completion),
+		});
 		preview = (completion.content || JSON.stringify(completion.toolCalls)).slice(0, 240);
 		try {
-			return nativeTools ? validateNativeRound(completion, options.tools) : validateTextRound(completion);
+			const response = nativeTools ? validateNativeRound(completion, options.tools) : validateTextRound(completion);
+			emitTrace(options, {
+				kind: 'parse_success',
+				title: 'Parsed response',
+				summary: validRoundSummary(response),
+				round,
+				status: 'success',
+				details: [jsonDetail('Parsed action', parsedRoundForTrace(response))],
+			});
+			return response;
 		} catch (error) {
 			failure = error;
+			emitTrace(options, {
+				kind: 'parse_error',
+				title: 'Parse error',
+				summary: errorMessage(error),
+				round,
+				status: 'error',
+				details: [
+					textDetail('Error', errorMessage(error)),
+					textDetail('Response preview', preview || '<empty>'),
+				],
+			});
 		}
 	}
 	const reason = failure instanceof Error ? failure.message : String(failure);
@@ -276,6 +407,75 @@ function toolDefinitions(tools: AgentTool[]): LlmToolDefinition[] {
 
 function providerName(provider: LlmRuntimeConfig['provider']): string {
 	return provider === 'deepseek' ? 'DeepSeek' : provider === 'anthropic' ? 'Anthropic' : 'OpenAI-compatible';
+}
+
+function emitTrace(options: AgentRunOptions, event: AgentTraceEvent): void {
+	options.onTrace?.(event);
+}
+
+function textDetail(label: string, content: string): AgentTraceDetail {
+	return { label, format: 'text', content };
+}
+
+function jsonTextDetail(label: string, content: string): AgentTraceDetail {
+	return { label, format: 'json', content };
+}
+
+function jsonDetail(label: string, value: unknown): AgentTraceDetail {
+	return jsonTextDetail(label, stringifyTraceJson(value));
+}
+
+function stringifyTraceJson(value: unknown): string {
+	try {
+		return JSON.stringify(value, undefined, 2);
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
+}
+
+function completionSummary(completion: LlmCompletion): string {
+	if (completion.toolCalls.length > 0) {
+		return `Received ${completion.toolCalls.length} native tool call${completion.toolCalls.length === 1 ? '' : 's'}`;
+	}
+	if (completion.content) {
+		return `Received ${completion.content.length} content chars`;
+	}
+	return 'Received empty response';
+}
+
+function completionDetails(completion: LlmCompletion): AgentTraceDetail[] {
+	const details: AgentTraceDetail[] = [];
+	if (completion.content) {
+		details.push(textDetail('Content', completion.content));
+	}
+	if (completion.reasoningContent) {
+		details.push(textDetail('Reasoning content', completion.reasoningContent));
+	}
+	if (completion.toolCalls.length > 0) {
+		details.push(jsonDetail('Native tool calls', completion.toolCalls));
+	}
+	if (details.length === 0) {
+		details.push(textDetail('Content', '<empty>'));
+	}
+	return details;
+}
+
+function validRoundSummary(response: ValidAgentRound): string {
+	if (response.type === 'final') {
+		return 'Parsed final result';
+	}
+	const names = response.calls.map((call) => call.name).join(', ');
+	return `Parsed ${response.calls.length} tool call${response.calls.length === 1 ? '' : 's'}${names ? `: ${names}` : ''}`;
+}
+
+function parsedRoundForTrace(response: ValidAgentRound): Record<string, unknown> {
+	return response.type === 'final'
+		? { type: response.type, result: response.result }
+		: { type: response.type, calls: response.calls };
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 function validateToolArguments(tool: AgentTool, argumentsValue: Record<string, unknown>): void {

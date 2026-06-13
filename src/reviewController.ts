@@ -1,11 +1,12 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { AiReviewStore, CodeReviewAgentService, sortFindings, sourcePendingFiles } from './agent/codeReview';
+import type { AgentTraceEvent } from './agent/runtime';
 import { acceptHunkInBaseline, computeLineDiff } from './diffEngine';
 import { GitService } from './gitService';
 import { createLlmClient, LlmClient } from './llm/client';
 import { LlmConfigInput, LlmConfigStore, LlmSavedConfig, LlmRuntimeConfig } from './llm/config';
-import { buildReviewDashboardPayload, defaultLlmWikiDashboardState, LlmWikiDashboardState, ReviewDashboardProvider } from './reviewDashboard';
+import { buildReviewDashboardPayload, defaultLlmWikiDashboardState, LlmWikiDashboardState, LlmWikiRunLogEntry, ReviewDashboardProvider } from './reviewDashboard';
 import { ReviewTreeProvider } from './reviewTree';
 import {
 	EditedRange,
@@ -78,6 +79,8 @@ export class ReviewController implements vscode.Disposable {
 	private gitIndexStateSignature: string | undefined;
 	private currentReviewUri: vscode.Uri | undefined;
 	private activeSession: ReviewSession | undefined;
+	private wikiRunLog: LlmWikiRunLogEntry[] = [];
+	private wikiRunLogSequence = 0;
 	private llmConfigState: LlmSavedConfig = {
 		provider: 'openai',
 		baseUrl: '',
@@ -1264,6 +1267,18 @@ export class ReviewController implements vscode.Disposable {
 				done: Promise.resolve(),
 			};
 			this.currentWikiTask = task;
+			this.startWikiRunLog({
+				kind: 'run_start',
+				title: 'Wiki initialization started',
+				summary: `${root.name} with ${config.model}`,
+				status: 'running',
+				details: [this.wikiRunJsonDetail('Operation', {
+					operation: 'initialize',
+					workspace: root.uri.fsPath,
+					provider: config.provider,
+					model: config.model,
+				})],
+			});
 			this.applyLlmWikiDashboardState({
 				status: 'initializing',
 				configured: true,
@@ -1309,10 +1324,24 @@ export class ReviewController implements vscode.Disposable {
 		if (picked.mode === 'revert') {
 			try {
 				await this.wikiInitializationService.deleteWiki(task.root.uri);
+				this.appendWikiRunLog({
+					kind: 'run_error',
+					title: 'Initialization reverted',
+					summary: 'Deleted the generated .wiki folder',
+					status: 'info',
+					details: [this.wikiRunTextDetail('Result', 'Initialization reverted and .wiki was removed.')],
+				});
 				await this.refreshLlmWikiDashboardState({ status: 'idle', progress: 'Initialization reverted.', error: undefined });
 				vscode.window.showInformationMessage('LLM Code Wiki initialization reverted.');
 			} catch (error) {
 				this.showError(error);
+				this.appendWikiRunLog({
+					kind: 'run_error',
+					title: 'Revert failed',
+					summary: error instanceof Error ? error.message : String(error),
+					status: 'error',
+					details: [this.wikiRunTextDetail('Error', error instanceof Error ? error.message : String(error))],
+				});
 				await this.refreshLlmWikiDashboardState({
 					status: 'failed',
 					error: error instanceof Error ? error.message : String(error),
@@ -1336,8 +1365,20 @@ export class ReviewController implements vscode.Disposable {
 						this.applyLlmWikiDashboardState({ status: 'initializing', progress: progress.message, error: undefined });
 					}
 				},
+				onTrace: (event) => {
+					if (this.currentWikiTask === task) {
+						this.appendWikiRunLog(event);
+					}
+				},
 			});
 			if (this.currentWikiTask === task) {
+				this.appendWikiRunLog({
+					kind: 'run_complete',
+					title: 'Wiki initialized',
+					summary: result.summary || `Generated ${result.fileCount} wiki files.`,
+					status: 'success',
+					details: [this.wikiRunJsonDetail('Result', result)],
+				});
 				this.applyLlmWikiDashboardState({
 					status: 'initialized',
 					wikiExists: true,
@@ -1349,6 +1390,13 @@ export class ReviewController implements vscode.Disposable {
 		} catch (error) {
 			if (isAbortError(error)) {
 				if (this.currentWikiTask === task) {
+					this.appendWikiRunLog({
+						kind: 'run_error',
+						title: task.cancelMode === 'pause' ? 'Initialization paused' : 'Initialization cancelled',
+						summary: task.cancelMode === 'pause' ? 'Generated files were kept.' : 'Initialization was cancelled.',
+						status: 'info',
+						details: [this.wikiRunTextDetail('Result', task.cancelMode === 'pause' ? 'Initialization paused.' : 'Initialization cancelled.')],
+					});
 					this.applyLlmWikiDashboardState({
 						status: task.cancelMode === 'pause' ? 'paused' : 'idle',
 						progress: task.cancelMode === 'pause' ? 'Initialization paused.' : 'Initialization cancelled.',
@@ -1358,6 +1406,13 @@ export class ReviewController implements vscode.Disposable {
 				return;
 			}
 			if (this.currentWikiTask === task) {
+				this.appendWikiRunLog({
+					kind: 'run_error',
+					title: 'Wiki initialization failed',
+					summary: error instanceof Error ? error.message : String(error),
+					status: 'error',
+					details: [this.wikiRunTextDetail('Error', error instanceof Error ? error.message : String(error))],
+				});
 				this.applyLlmWikiDashboardState({
 					status: 'failed',
 					error: error instanceof Error ? error.message : String(error),
@@ -1394,6 +1449,19 @@ export class ReviewController implements vscode.Disposable {
 				done: Promise.resolve(),
 			};
 			this.currentWikiTask = task;
+			this.wikiRootUri = root.uri;
+			this.startWikiRunLog({
+				kind: 'run_start',
+				title: 'Wiki update started',
+				summary: `${root.name} with ${config.model}`,
+				status: 'running',
+				details: [this.wikiRunJsonDetail('Operation', {
+					operation: 'update',
+					workspace: root.uri.fsPath,
+					provider: config.provider,
+					model: config.model,
+				})],
+			});
 			this.applyLlmWikiDashboardState({ status: 'updating', progress: 'Preparing Wiki update', error: undefined });
 			task.done = this.runLlmWikiUpdate(task, config, createLlmClient(config));
 			await task.done;
@@ -1411,14 +1479,33 @@ export class ReviewController implements vscode.Disposable {
 				signal: task.abortController.signal,
 				onProgress: (progress) => this.currentWikiTask === task
 					&& this.applyLlmWikiDashboardState({ status: 'updating', progress: progress.message, error: undefined }),
+				onTrace: (event) => {
+					if (this.currentWikiTask === task) {
+						this.appendWikiRunLog(event);
+					}
+				},
 			});
 			if (this.currentWikiTask === task) {
+				this.appendWikiRunLog({
+					kind: 'run_complete',
+					title: 'Wiki update completed',
+					summary: result.summary,
+					status: 'success',
+					details: [this.wikiRunJsonDetail('Result', result)],
+				});
 				vscode.window.showInformationMessage(result.summary);
 				this.applyLlmWikiDashboardState({ status: 'initialized', progress: result.summary, error: undefined });
 			}
 		} catch (error) {
 			if (!isAbortError(error)) {
 				this.showError(error);
+				this.appendWikiRunLog({
+					kind: 'run_error',
+					title: 'Wiki update failed',
+					summary: error instanceof Error ? error.message : String(error),
+					status: 'error',
+					details: [this.wikiRunTextDetail('Error', error instanceof Error ? error.message : String(error))],
+				});
 				this.applyLlmWikiDashboardState({ status: 'failed', error: error instanceof Error ? error.message : String(error) });
 			}
 		} finally {
@@ -1500,6 +1587,15 @@ export class ReviewController implements vscode.Disposable {
 		this.applyLlmWikiDashboardState({ progress: 'Cancelling Agent', error: undefined });
 		task.abortController.abort();
 		await task.done.catch(() => undefined);
+		if (task.kind === 'update') {
+			this.appendWikiRunLog({
+				kind: 'run_error',
+				title: 'Wiki update cancelled',
+				summary: 'Wiki update cancelled.',
+				status: 'info',
+				details: [this.wikiRunTextDetail('Result', 'Wiki update cancelled.')],
+			});
+		}
 		await this.refreshLlmWikiDashboardState({ progress: task.kind === 'update' ? 'Wiki update cancelled.' : 'AI review cancelled.' });
 	}
 
@@ -1753,8 +1849,41 @@ export class ReviewController implements vscode.Disposable {
 		void this.refreshLlmWikiDashboardState();
 	}
 
+	private startWikiRunLog(event: AgentTraceEvent): void {
+		this.wikiRunLog = [];
+		this.wikiRunLogSequence = 0;
+		this.appendWikiRunLog(event);
+	}
+
+	private appendWikiRunLog(event: AgentTraceEvent): void {
+		this.wikiRunLog = [...this.wikiRunLog, {
+			id: `wiki-run-${++this.wikiRunLogSequence}`,
+			sequence: this.wikiRunLogSequence,
+			timestamp: new Date().toISOString(),
+			kind: event.kind,
+			title: event.title,
+			summary: event.summary,
+			round: event.round,
+			status: event.status,
+			details: event.details,
+		}];
+		this.applyLlmWikiDashboardState({ runLog: this.wikiRunLog });
+	}
+
+	private wikiRunTextDetail(label: string, content: string): AgentTraceEvent['details'][number] {
+		return { label, format: 'text', content };
+	}
+
+	private wikiRunJsonDetail(label: string, value: unknown): AgentTraceEvent['details'][number] {
+		try {
+			return { label, format: 'json', content: JSON.stringify(value, undefined, 2) };
+		} catch (error) {
+			return { label, format: 'text', content: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
 	private applyLlmWikiDashboardState(update: Partial<LlmWikiDashboardState>): void {
-		this.llmWikiState = { ...this.llmWikiState, ...update };
+		this.llmWikiState = { ...this.llmWikiState, ...update, runLog: update.runLog ?? this.wikiRunLog };
 		this.dashboardProvider.refresh();
 	}
 
@@ -1811,6 +1940,7 @@ export class ReviewController implements vscode.Disposable {
 			jsonOutputEnabled: this.llmConfigState.jsonOutputEnabled,
 			thinkingMode: this.llmConfigState.thinkingMode,
 			strictTools: this.llmConfigState.strictTools,
+			runLog: update.runLog ?? this.wikiRunLog,
 		};
 		this.dashboardProvider.refresh();
 	}

@@ -1,6 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { AgentRunner } from '../agent/runtime';
+import { AgentRunner, type AgentTraceEvent } from '../agent/runtime';
 import { createWikiAgentTools } from '../agent/tools';
 import { LlmClient } from '../llm/client';
 import { LlmRuntimeConfig } from '../llm/config';
@@ -26,6 +26,7 @@ export interface WikiInitializationOptions {
 	client: LlmClient;
 	signal?: AbortSignal;
 	onProgress?: (progress: WikiInitializationProgress) => void;
+	onTrace?: (event: AgentTraceEvent) => void;
 }
 
 export interface WikiFile {
@@ -184,6 +185,7 @@ export class WikiInitializationService {
 			tools: createWikiAgentTools({ root: options.root, generatedFiles }),
 			signal: options.signal,
 			onProgress: (progress) => options.onProgress?.({ message: progress.message }),
+			onTrace: options.onTrace,
 		});
 		const summary = typeof result.result.summary === 'string' && result.result.summary.trim()
 			? result.result.summary
