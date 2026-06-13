@@ -201,6 +201,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const nonce = String(Date.now());
 		const iconFile = vscode.Uri.joinPath(vscode.Uri.file(__dirname), '..', 'resources', 'logo.svg');
 		const iconUri = typeof webview.asWebviewUri === 'function' ? webview.asWebviewUri(iconFile).toString() : '';
+		const settingIconFile = vscode.Uri.joinPath(vscode.Uri.file(__dirname), '..', 'resources', 'setting.svg');
+		const settingIconUri = typeof webview.asWebviewUri === 'function' ? webview.asWebviewUri(settingIconFile).toString() : '';
 		return /* html */`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -278,6 +280,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			stroke-width: 1.7;
 			stroke-linecap: round;
 			stroke-linejoin: round;
+		}
+		.settings-button img {
+			width: 15px;
+			height: 15px;
+			display: block;
 		}
 		.settings-menu {
 			position: absolute;
@@ -614,7 +621,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4L12 12"/><path d="M12 4L4 12"/></svg>
 				</button>
 				<button class="settings-button" id="settingsButton" type="button" title="Actions and settings" aria-label="Actions and settings" aria-controls="settingsMenu" aria-expanded="false">
-					<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.2"/><path d="M6.8 2.3L7.2 1H8.8L9.2 2.3L10.5 2.9L11.7 2.3L12.8 3.4L12.2 4.6L12.7 5.9L14 6.3V7.9L12.7 8.3L12.2 9.6L12.8 10.8L11.7 11.9L10.5 11.3L9.2 11.8L8.8 13.1H7.2L6.8 11.8L5.5 11.3L4.3 11.9L3.2 10.8L3.8 9.6L3.3 8.3L2 7.9V6.3L3.3 5.9L3.8 4.6L3.2 3.4L4.3 2.3L5.5 2.9Z"/></svg>
+					<img src="${settingIconUri}" alt="" aria-hidden="true">
 				</button>
 				<div class="settings-menu" id="settingsMenu" role="menu" hidden>
 					<button class="settings-menu-item" type="button" role="menuitem" data-menu-action="initializeWiki">
