@@ -5,7 +5,7 @@ import { LlmRuntimeConfig } from '../llm/config';
 import { isJsonObject } from '../llm/json';
 import { ReviewFileState, ReviewHunk, ReviewSession } from '../types';
 import { createReadOnlyAgentTools } from './tools';
-import { AgentRunner } from './runtime';
+import { AgentRunner, AgentTraceDetail, AgentTraceEvent } from './runtime';
 
 export type AiReviewSeverity = 'critical' | 'warning' | 'suggestion' | 'info';
 
@@ -29,6 +29,31 @@ export interface StoredAiReview {
 	generatedAt: string;
 }
 
+export interface CodeReviewTraceContext {
+	fileUri: string;
+	relativePath: string;
+	fileIndex: number;
+	fileCount: number;
+}
+
+export interface AiReviewFindingDrop {
+	index: number;
+	reason: string;
+	hunkId?: string;
+	candidate: unknown;
+}
+
+export interface AiReviewFindingDiagnostics {
+	rawCount: number;
+	acceptedCount: number;
+	dropped: AiReviewFindingDrop[];
+}
+
+export interface AiReviewFindingValidation {
+	findings: AiReviewFinding[];
+	diagnostics: AiReviewFindingDiagnostics;
+}
+
 export interface CodeReviewAgentOptions {
 	session: ReviewSession;
 	root: vscode.WorkspaceFolder;
@@ -36,6 +61,7 @@ export interface CodeReviewAgentOptions {
 	client: LlmClient;
 	signal?: AbortSignal;
 	onProgress?: (message: string) => void;
+	onTrace?: (event: AgentTraceEvent, context: CodeReviewTraceContext) => void;
 }
 
 const severities = new Set<AiReviewSeverity>(['critical', 'warning', 'suggestion', 'info']);
@@ -49,6 +75,12 @@ export class CodeReviewAgentService {
 		const signature = reviewChangeSignature(options.session);
 		const findings: AiReviewFinding[] = [];
 		for (const [index, file] of files.entries()) {
+			const context: CodeReviewTraceContext = {
+				fileUri: file.uri.toString(),
+				relativePath: file.relativePath,
+				fileIndex: index + 1,
+				fileCount: files.length,
+			};
 			options.onProgress?.(`Reviewing ${file.relativePath} (${index + 1}/${files.length})`);
 			const result = await this.runner.run({
 				config: options.config,
@@ -58,10 +90,39 @@ export class CodeReviewAgentService {
 				tools: createReadOnlyAgentTools({ root: options.root }),
 				signal: options.signal,
 				onProgress: (progress) => options.onProgress?.(`${file.relativePath}: ${progress.message}`),
+				onTrace: (event) => options.onTrace?.(event, context),
 				maxRounds: 8,
 				maxToolCalls: 24,
 			});
-			findings.push(...validateReviewFindings(result.result, file, findings.length));
+			let validation: AiReviewFindingValidation;
+			try {
+				validation = validateReviewFindingsWithDiagnostics(result.result, file, findings.length);
+			} catch (error) {
+				options.onTrace?.({
+					kind: 'parse_error',
+					title: 'Review findings parse error',
+					summary: error instanceof Error ? error.message : String(error),
+					round: result.rounds,
+					status: 'error',
+					details: [
+						textTraceDetail('Error', error instanceof Error ? error.message : String(error)),
+						jsonTraceDetail('Final result', result.result),
+					],
+				}, context);
+				throw error;
+			}
+			options.onTrace?.({
+				kind: 'parse_success',
+				title: 'Review findings parsed',
+				summary: findingDiagnosticsSummary(validation.diagnostics),
+				round: result.rounds,
+				status: 'success',
+				details: [
+					jsonTraceDetail('Finding diagnostics', validation.diagnostics),
+					jsonTraceDetail('Accepted findings', validation.findings),
+				],
+			}, context);
+			findings.push(...validation.findings);
 		}
 		if (reviewChangeSignature(options.session) !== signature) {
 			throw new Error('Pending source chunks changed while the AI review was running. Generate the review again.');
@@ -118,17 +179,36 @@ export function reviewChangeSignature(session: ReviewSession): string {
 }
 
 export function validateReviewFindings(result: Record<string, unknown>, file: ReviewFileState, startOrder = 0): AiReviewFinding[] {
+	return validateReviewFindingsWithDiagnostics(result, file, startOrder).findings;
+}
+
+export function validateReviewFindingsWithDiagnostics(result: Record<string, unknown>, file: ReviewFileState, startOrder = 0): AiReviewFindingValidation {
 	if (!Array.isArray(result.findings)) {
 		throw new Error('Code Review Agent final result must include findings.');
 	}
 	const hunks = new Map(file.hunks.map((hunk) => [hunk.id, hunk]));
 	const findings: AiReviewFinding[] = [];
-	for (const candidate of result.findings) {
-		if (!isJsonObject(candidate) || typeof candidate.hunkId !== 'string') {
+	const dropped: AiReviewFindingDrop[] = [];
+	for (const [index, candidate] of result.findings.entries()) {
+		if (!isJsonObject(candidate)) {
+			dropped.push({ index, reason: 'Finding is not a JSON object.', candidate });
+			continue;
+		}
+		if (typeof candidate.hunkId !== 'string') {
+			dropped.push({ index, reason: 'Finding is missing a string hunkId.', candidate });
 			continue;
 		}
 		const hunk = hunks.get(candidate.hunkId);
-		if (!hunk || !isSeverity(candidate.severity) || !hasFindingStrings(candidate)) {
+		if (!hunk) {
+			dropped.push({ index, reason: 'Finding hunkId does not match a current pending chunk.', hunkId: candidate.hunkId, candidate });
+			continue;
+		}
+		if (!isSeverity(candidate.severity)) {
+			dropped.push({ index, reason: 'Finding severity is invalid.', hunkId: candidate.hunkId, candidate });
+			continue;
+		}
+		if (!hasFindingStrings(candidate)) {
+			dropped.push({ index, reason: 'Finding must include title, explanation, and recommendation strings.', hunkId: candidate.hunkId, candidate });
 			continue;
 		}
 		const evidence = Array.isArray(candidate.evidence)
@@ -149,7 +229,14 @@ export function validateReviewFindings(result: Record<string, unknown>, file: Re
 			generationOrder,
 		});
 	}
-	return findings;
+	return {
+		findings,
+		diagnostics: {
+			rawCount: result.findings.length,
+			acceptedCount: findings.length,
+			dropped,
+		},
+	};
 }
 
 export function sortFindings(
@@ -214,6 +301,28 @@ function hasFindingStrings(value: Record<string, unknown>): value is Record<stri
 	return typeof value.title === 'string'
 		&& typeof value.explanation === 'string'
 		&& typeof value.recommendation === 'string';
+}
+
+function findingDiagnosticsSummary(diagnostics: AiReviewFindingDiagnostics): string {
+	if (diagnostics.rawCount === 0) {
+		return 'Model returned 0 findings.';
+	}
+	if (diagnostics.dropped.length === 0) {
+		return `Accepted ${diagnostics.acceptedCount} of ${diagnostics.rawCount} findings.`;
+	}
+	return `Accepted ${diagnostics.acceptedCount} of ${diagnostics.rawCount} findings; dropped ${diagnostics.dropped.length}.`;
+}
+
+function textTraceDetail(label: string, content: string): AgentTraceDetail {
+	return { label, format: 'text', content };
+}
+
+function jsonTraceDetail(label: string, value: unknown): AgentTraceDetail {
+	try {
+		return { label, format: 'json', content: JSON.stringify(value, undefined, 2) };
+	} catch (error) {
+		return textTraceDetail(label, error instanceof Error ? error.message : String(error));
+	}
 }
 
 function storeKey(rootUri: vscode.Uri): string {

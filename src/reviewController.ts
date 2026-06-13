@@ -1,6 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { AiReviewStore, CodeReviewAgentService, sortFindings, sourcePendingFiles } from './agent/codeReview';
+import { AiReviewStore, CodeReviewAgentService, CodeReviewTraceContext, sortFindings, sourcePendingFiles } from './agent/codeReview';
 import type { AgentTraceEvent } from './agent/runtime';
 import { acceptHunkInBaseline, computeLineDiff } from './diffEngine';
 import { GitService } from './gitService';
@@ -49,6 +49,10 @@ interface ReviewNavigationTarget extends vscode.QuickPickItem {
 	range: vscode.Range;
 }
 
+type RunLogSource = 'wiki' | 'review';
+
+type RunLogMetadata = Pick<LlmWikiRunLogEntry, 'source' | 'fileUri' | 'relativePath' | 'fileIndex' | 'fileCount'>;
+
 interface WikiInitializationTask {
 	kind: 'initialize' | 'update' | 'review';
 	root: vscode.WorkspaceFolder;
@@ -81,6 +85,7 @@ export class ReviewController implements vscode.Disposable {
 	private activeSession: ReviewSession | undefined;
 	private wikiRunLog: LlmWikiRunLogEntry[] = [];
 	private wikiRunLogSequence = 0;
+	private wikiRunLogSource: RunLogSource | undefined;
 	private llmConfigState: LlmSavedConfig = {
 		provider: 'openai',
 		baseUrl: '',
@@ -1523,7 +1528,8 @@ export class ReviewController implements vscode.Disposable {
 		try {
 			const config = await this.requireLlmConfig();
 			const session = this.activeSession;
-			if (!config || !session || sourcePendingFiles(session).length === 0) {
+			const files = session ? sourcePendingFiles(session) : [];
+			if (!config || !session || files.length === 0) {
 				vscode.window.showInformationMessage('No pending source chunks to review.');
 				return;
 			}
@@ -1539,6 +1545,19 @@ export class ReviewController implements vscode.Disposable {
 				done: Promise.resolve(),
 			};
 			this.currentWikiTask = task;
+			this.startWikiRunLog({
+				kind: 'run_start',
+				title: 'AI review started',
+				summary: `${files.length} file${files.length === 1 ? '' : 's'} with ${config.model}`,
+				status: 'running',
+				details: [this.wikiRunJsonDetail('Operation', {
+					operation: 'review',
+					workspace: root.uri.fsPath,
+					provider: config.provider,
+					model: config.model,
+					files: files.map((file) => ({ uri: file.uri.toString(), relativePath: file.relativePath, chunks: file.hunks.length })),
+				})],
+			}, 'review');
 			this.applyLlmWikiDashboardState({ status: 'reviewing', progress: 'Preparing AI review', error: undefined });
 			task.done = this.runAiReview(task, config, createLlmClient(config), session);
 			await task.done;
@@ -1557,14 +1576,34 @@ export class ReviewController implements vscode.Disposable {
 				signal: task.abortController.signal,
 				onProgress: (message) => this.currentWikiTask === task
 					&& this.applyLlmWikiDashboardState({ status: 'reviewing', progress: message, error: undefined }),
+				onTrace: (event, context) => {
+					if (this.currentWikiTask === task) {
+						this.appendWikiRunLog(event, this.reviewRunLogMetadata(context));
+					}
+				},
 			});
 			if (this.currentWikiTask === task) {
 				await this.aiReviewStore.save(session, result);
+				this.appendWikiRunLog({
+					kind: 'run_complete',
+					title: 'AI review completed',
+					summary: `${result.findings.length} finding${result.findings.length === 1 ? '' : 's'} accepted`,
+					status: 'success',
+					details: [this.wikiRunJsonDetail('Result', result)],
+				});
+				this.applyLlmWikiDashboardState({ progress: `AI review completed (${result.findings.length} findings).`, error: undefined });
 				vscode.window.showInformationMessage(`AI review completed (${result.findings.length} findings).`);
 			}
 		} catch (error) {
 			if (!isAbortError(error)) {
 				this.showError(error);
+				this.appendWikiRunLog({
+					kind: 'run_error',
+					title: 'AI review failed',
+					summary: error instanceof Error ? error.message : String(error),
+					status: 'error',
+					details: [this.wikiRunTextDetail('Error', error instanceof Error ? error.message : String(error))],
+				});
 				this.applyLlmWikiDashboardState({ status: 'failed', error: error instanceof Error ? error.message : String(error) });
 			}
 		} finally {
@@ -1594,6 +1633,14 @@ export class ReviewController implements vscode.Disposable {
 				summary: 'Wiki update cancelled.',
 				status: 'info',
 				details: [this.wikiRunTextDetail('Result', 'Wiki update cancelled.')],
+			});
+		} else if (task.kind === 'review') {
+			this.appendWikiRunLog({
+				kind: 'run_error',
+				title: 'AI review cancelled',
+				summary: 'AI review cancelled.',
+				status: 'info',
+				details: [this.wikiRunTextDetail('Result', 'AI review cancelled.')],
 			});
 		}
 		await this.refreshLlmWikiDashboardState({ progress: task.kind === 'update' ? 'Wiki update cancelled.' : 'AI review cancelled.' });
@@ -1849,17 +1896,23 @@ export class ReviewController implements vscode.Disposable {
 		void this.refreshLlmWikiDashboardState();
 	}
 
-	private startWikiRunLog(event: AgentTraceEvent): void {
+	private startWikiRunLog(event: AgentTraceEvent, source: RunLogSource = 'wiki'): void {
 		this.wikiRunLog = [];
 		this.wikiRunLogSequence = 0;
+		this.wikiRunLogSource = source;
 		this.appendWikiRunLog(event);
 	}
 
-	private appendWikiRunLog(event: AgentTraceEvent): void {
+	private appendWikiRunLog(event: AgentTraceEvent, metadata: RunLogMetadata = {}): void {
 		this.wikiRunLog = [...this.wikiRunLog, {
 			id: `wiki-run-${++this.wikiRunLogSequence}`,
 			sequence: this.wikiRunLogSequence,
 			timestamp: new Date().toISOString(),
+			source: metadata.source ?? this.wikiRunLogSource ?? 'wiki',
+			fileUri: metadata.fileUri,
+			relativePath: metadata.relativePath,
+			fileIndex: metadata.fileIndex,
+			fileCount: metadata.fileCount,
 			kind: event.kind,
 			title: event.title,
 			summary: event.summary,
@@ -1867,7 +1920,7 @@ export class ReviewController implements vscode.Disposable {
 			status: event.status,
 			details: event.details,
 		}];
-		this.applyLlmWikiDashboardState({ runLog: this.wikiRunLog });
+		this.applyLlmWikiDashboardState({ runLog: this.wikiRunLog, runLogSource: this.wikiRunLogSource });
 	}
 
 	private wikiRunTextDetail(label: string, content: string): AgentTraceEvent['details'][number] {
@@ -1882,8 +1935,24 @@ export class ReviewController implements vscode.Disposable {
 		}
 	}
 
+	private reviewRunLogMetadata(context: CodeReviewTraceContext): RunLogMetadata {
+		return {
+			source: 'review',
+			fileUri: context.fileUri,
+			relativePath: context.relativePath,
+			fileIndex: context.fileIndex,
+			fileCount: context.fileCount,
+		};
+	}
+
 	private applyLlmWikiDashboardState(update: Partial<LlmWikiDashboardState>): void {
-		this.llmWikiState = { ...this.llmWikiState, ...update, runLog: update.runLog ?? this.wikiRunLog };
+		this.llmWikiState = {
+			...this.llmWikiState,
+			...update,
+			runLog: update.runLog ?? this.wikiRunLog,
+			runLogSource: update.runLogSource ?? this.wikiRunLogSource,
+			reviewFindings: update.reviewFindings ?? this.llmWikiState.reviewFindings,
+		};
 		this.dashboardProvider.refresh();
 	}
 
@@ -1897,9 +1966,12 @@ export class ReviewController implements vscode.Disposable {
 		const hasPending = this.hasPendingReviewChanges();
 		const storedReview = this.aiReviewStore.load(this.activeSession);
 		const findingOrder = vscode.workspace.getConfiguration('cliDiff').get<'chunk' | 'severity'>('aiReviewFindingOrder', 'chunk');
-		const findings = this.currentReviewUri && storedReview && this.activeSession
+		const reviewFindings = storedReview && this.activeSession
+			? sortFindings(storedReview.findings, this.activeSession.files.values(), findingOrder)
+			: [];
+		const findings = this.currentReviewUri && this.activeSession
 			? sortFindings(
-				storedReview.findings.filter((finding) => uriKey(vscode.Uri.parse(finding.uri)) === uriKey(this.currentReviewUri as vscode.Uri)),
+				reviewFindings.filter((finding) => uriKey(vscode.Uri.parse(finding.uri)) === uriKey(this.currentReviewUri as vscode.Uri)),
 				this.activeSession.files.values(),
 				findingOrder,
 			)
@@ -1941,6 +2013,8 @@ export class ReviewController implements vscode.Disposable {
 			thinkingMode: this.llmConfigState.thinkingMode,
 			strictTools: this.llmConfigState.strictTools,
 			runLog: update.runLog ?? this.wikiRunLog,
+			runLogSource: update.runLogSource ?? this.wikiRunLogSource,
+			reviewFindings: update.reviewFindings ?? reviewFindings,
 		};
 		this.dashboardProvider.refresh();
 	}

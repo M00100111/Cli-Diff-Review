@@ -30,6 +30,16 @@ type DashboardMessage =
 	| { type: 'openFinding'; uri: string; hunkId: string }
 	| { type: 'cancelAgent' };
 
+export interface ReviewDashboardChunk {
+	hunkId: string;
+	kind: string;
+	line: number;
+	oldLines: number;
+	newLines: number;
+	preview: string;
+	findings: AiReviewFinding[];
+}
+
 export interface ReviewDashboardFile {
 	uri: string;
 	relativePath: string;
@@ -45,6 +55,7 @@ export interface ReviewDashboardFile {
 	acceptDisabled: boolean;
 	rejectDisabled: boolean;
 	undoDisabled: boolean;
+	chunks: ReviewDashboardChunk[];
 }
 
 export interface ReviewDashboardPayload {
@@ -61,6 +72,11 @@ export interface LlmWikiRunLogEntry {
 	id: string;
 	sequence: number;
 	timestamp: string;
+	source?: 'wiki' | 'review';
+	fileUri?: string;
+	relativePath?: string;
+	fileIndex?: number;
+	fileCount?: number;
 	kind: AgentTraceEventKind;
 	title: string;
 	summary: string;
@@ -87,6 +103,8 @@ export interface LlmWikiDashboardState {
 	thinkingMode: LlmThinkingMode;
 	strictTools: boolean;
 	runLog: LlmWikiRunLogEntry[];
+	runLogSource?: 'wiki' | 'review';
+	reviewFindings: AiReviewFinding[];
 }
 
 export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vscode.Disposable {
@@ -217,6 +235,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const iconUri = typeof webview.asWebviewUri === 'function' ? webview.asWebviewUri(iconFile).toString() : '';
 		const settingIconFile = vscode.Uri.joinPath(vscode.Uri.file(__dirname), '..', 'resources', 'setting.svg');
 		const settingIconUri = typeof webview.asWebviewUri === 'function' ? webview.asWebviewUri(settingIconFile).toString() : '';
+		const homeIconFile = vscode.Uri.joinPath(vscode.Uri.file(__dirname), '..', 'resources', 'home.svg');
+		const homeIconUri = typeof webview.asWebviewUri === 'function' ? webview.asWebviewUri(homeIconFile).toString() : '';
 		return /* html */`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -285,6 +305,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			gap: 2px;
 			margin-left: auto;
 		}
+		.home-button,
 		.settings-button,
 		.page-close {
 			width: 22px;
@@ -292,6 +313,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			display: inline-grid;
 			place-items: center;
 		}
+		.home-button img,
 		.settings-button svg,
 		.page-close svg {
 			width: 15px;
@@ -302,6 +324,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			stroke-linecap: round;
 			stroke-linejoin: round;
 		}
+		.home-button img,
 		.settings-button img {
 			width: 15px;
 			height: 15px;
@@ -362,7 +385,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			padding: 12px 8px;
 			color: var(--vscode-sideBar-foreground);
 		}
-		.wiki-panel.has-run-log {
+		.wiki-panel.has-run-log,
+		.wiki-panel.has-review-detail {
 			min-height: 0;
 			align-items: stretch;
 			justify-content: stretch;
@@ -384,7 +408,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			align-items: stretch;
 			gap: 7px;
 		}
-		.wiki-main.has-run-log {
+		.wiki-main.has-run-log,
+		.wiki-main.has-review-detail {
 			flex: 1 1 auto;
 			width: 100%;
 			max-width: none;
@@ -395,10 +420,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		.wiki-config[hidden],
 		.wiki-main[hidden],
 		.model-pill[hidden],
+		.home-button[hidden],
 		.page-close[hidden],
 		.wiki-logo[hidden],
 		.wiki-action[hidden],
 		.wiki-run-list[hidden],
+		.review-file-detail[hidden],
 		.findings[hidden] { display: none; }
 		.wiki-field {
 			display: flex;
@@ -453,7 +480,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			background: transparent;
 			border-color: var(--tree-border);
 		}
-		.wiki-main.has-run-log .wiki-action {
+		.wiki-main.has-run-log .wiki-action,
+		.wiki-main.has-review-detail .wiki-action {
 			flex: 0 0 auto;
 		}
 		.wiki-logo {
@@ -477,7 +505,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			max-height: min(46vh, 380px);
 			overflow: auto;
 		}
-		.wiki-main.has-run-log .wiki-run-list {
+		.wiki-main.has-run-log .wiki-run-list,
+		.wiki-main.has-review-detail .review-file-detail {
 			flex: 1 1 auto;
 			width: 100%;
 			min-height: 0;
@@ -566,6 +595,31 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			border-color: var(--tree-border);
 			background: var(--vscode-sideBar-background);
 		}
+		.wiki-run-file {
+			border: 1px solid var(--tree-border);
+			border-radius: 4px;
+			background: var(--vscode-sideBar-background);
+		}
+		.wiki-run-file[open] {
+			background: var(--vscode-list-hoverBackground, var(--vscode-sideBar-background));
+		}
+		.wiki-run-file-summary {
+			display: grid;
+			grid-template-columns: minmax(0, 1fr) auto;
+			gap: 5px;
+			padding: 5px 6px;
+			cursor: pointer;
+			list-style: none;
+		}
+		.wiki-run-file-summary::-webkit-details-marker { display: none; }
+		.wiki-run-file-items {
+			display: flex;
+			flex-direction: column;
+			gap: 4px;
+			margin: 0 4px 5px 7px;
+			padding-left: 7px;
+			border-left: 1px solid var(--tree-border);
+		}
 		.wiki-run-details {
 			display: flex;
 			flex-direction: column;
@@ -616,6 +670,98 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		.finding.suggestion .finding-marker { background: var(--vscode-editorInfo-foreground); }
 		.finding-title { display: block; font-weight: 600; overflow-wrap: anywhere; }
 		.finding-detail { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; line-height: 1.3; overflow-wrap: anywhere; }
+		.review-file-detail {
+			display: flex;
+			flex-direction: column;
+			gap: 5px;
+			overflow: auto;
+		}
+		.review-file-heading {
+			flex: 0 0 auto;
+			display: flex;
+			flex-direction: column;
+			gap: 2px;
+			padding: 0 1px 3px;
+		}
+		.review-file-title {
+			font-size: 11px;
+			font-weight: 700;
+			overflow-wrap: anywhere;
+		}
+		.review-file-meta {
+			color: var(--muted);
+			font-size: 9px;
+			line-height: 1.3;
+		}
+		.review-chunk {
+			border: 1px solid var(--tree-border);
+			border-radius: 4px;
+			background: var(--vscode-sideBar-background);
+		}
+		.review-chunk[open] {
+			background: var(--vscode-list-hoverBackground, var(--vscode-sideBar-background));
+		}
+		.review-chunk-summary {
+			display: grid;
+			grid-template-columns: minmax(0, 1fr) auto;
+			gap: 6px;
+			padding: 5px 6px;
+			cursor: pointer;
+			list-style: none;
+		}
+		.review-chunk-summary::-webkit-details-marker { display: none; }
+		.review-chunk-body {
+			display: flex;
+			flex-direction: column;
+			gap: 5px;
+			padding: 0 6px 6px;
+		}
+		.review-chunk-preview {
+			color: var(--muted);
+			font-size: 10px;
+			line-height: 1.35;
+			overflow-wrap: anywhere;
+		}
+		.review-finding {
+			display: grid;
+			grid-template-columns: 7px minmax(0, 1fr);
+			gap: 6px;
+			padding: 5px;
+			border: 1px solid var(--tree-border);
+			border-radius: 3px;
+			text-align: left;
+			background: transparent;
+		}
+		.review-finding-marker {
+			width: 7px;
+			height: 7px;
+			margin-top: 4px;
+			border-radius: 50%;
+			background: var(--muted);
+		}
+		.review-finding.critical .review-finding-marker { background: var(--vscode-errorForeground); }
+		.review-finding.warning .review-finding-marker { background: var(--vscode-editorWarning-foreground); }
+		.review-finding.suggestion .review-finding-marker { background: var(--vscode-editorInfo-foreground); }
+		.review-finding-title {
+			display: block;
+			font-size: 11px;
+			font-weight: 600;
+			overflow-wrap: anywhere;
+		}
+		.review-finding-text {
+			display: block;
+			margin-top: 3px;
+			color: var(--vscode-sideBar-foreground);
+			font-size: 10px;
+			line-height: 1.35;
+			overflow-wrap: anywhere;
+		}
+		.review-empty {
+			padding: 5px 6px;
+			color: var(--muted);
+			font-size: 10px;
+			line-height: 1.35;
+		}
 		.model-pill {
 			max-width: 132px;
 			padding: 1px 5px;
@@ -794,6 +940,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		<header class="page-header" id="pageHeader">
 			<button class="model-pill" id="modelPill" type="button" title="Configure LLM" hidden></button>
 			<div class="page-actions">
+				<button class="home-button" id="homeButton" type="button" title="Back to review overview" aria-label="Back to review overview" hidden>
+					<img src="${homeIconUri}" alt="" aria-hidden="true">
+				</button>
 				<button class="page-close" id="closeConfig" type="button" title="Close configuration" aria-label="Close configuration" hidden>
 					<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4L12 12"/><path d="M12 4L4 12"/></svg>
 				</button>
@@ -868,6 +1017,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			<div class="wiki-main" id="wikiMain" hidden>
 				<img class="wiki-logo" id="wikiLogo" src="${iconUri}" alt="">
 				<div class="findings" id="findings" hidden></div>
+				<div class="review-file-detail" id="reviewFileDetail" hidden></div>
 				<div class="wiki-run-list" id="wikiRunList" hidden></div>
 				<div class="wiki-status" id="wikiStatus"></div>
 				<button class="wiki-action" id="wikiAction" type="button">Initialize LLM Code Wiki</button>
@@ -897,6 +1047,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const toggle = document.getElementById('toggle');
 		const list = document.getElementById('list');
 		const modelPill = document.getElementById('modelPill');
+		const homeButton = document.getElementById('homeButton');
 		const closeConfig = document.getElementById('closeConfig');
 		const settingsButton = document.getElementById('settingsButton');
 		const settingsMenu = document.getElementById('settingsMenu');
@@ -905,6 +1056,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const wikiMain = document.getElementById('wikiMain');
 		const wikiLogo = document.getElementById('wikiLogo');
 		const findings = document.getElementById('findings');
+		const reviewFileDetail = document.getElementById('reviewFileDetail');
 		const wikiRunList = document.getElementById('wikiRunList');
 		const wikiStatus = document.getElementById('wikiStatus');
 		const wikiAction = document.getElementById('wikiAction');
@@ -924,6 +1076,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		modelPill.addEventListener('click', () => {
 			editingConfig = true;
 			populateConfig(lastWikiState || emptyWikiState());
+			renderWiki(lastWikiState || emptyWikiState());
+		});
+		homeButton.addEventListener('click', () => {
+			reviewDetailUri = undefined;
 			renderWiki(lastWikiState || emptyWikiState());
 		});
 		closeConfig.addEventListener('click', closeConfigEditor);
@@ -993,6 +1149,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		let expanded = true;
 		let lastChangeSignature;
 		let lastWikiState;
+		let lastFiles = [];
+		let reviewDetailUri;
 		toggle.addEventListener('click', () => setExpanded(!expanded));
 		toggle.addEventListener('keydown', (event) => {
 			if (event.key === 'Enter' || event.key === ' ') {
@@ -1025,6 +1183,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 
 		function render(payload) {
 			const files = payload.files || [];
+			lastFiles = files;
+			if (reviewDetailUri && !files.some((file) => file.uri === reviewDetailUri)) {
+				reviewDetailUri = undefined;
+			}
 			const changeSignature = payload.changeSignature || '';
 			if (lastChangeSignature !== undefined && lastChangeSignature !== changeSignature) {
 				setExpanded(true);
@@ -1055,9 +1217,14 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			wikiConfig.hidden = Boolean(wiki.configured) && !editingConfig;
 			wikiMain.hidden = !wiki.configured || editingConfig;
 			const runLog = wiki.runLog || [];
+			const reviewDetailFile = reviewDetailUri ? lastFiles.find((file) => file.uri === reviewDetailUri) : undefined;
 			const hasRunLog = runLog.length > 0 && Boolean(wiki.configured) && !editingConfig;
+			const hasReviewDetail = Boolean(reviewDetailFile) && Boolean(wiki.configured) && !editingConfig;
 			wikiPanel?.classList.toggle('has-run-log', hasRunLog);
+			wikiPanel?.classList.toggle('has-review-detail', hasReviewDetail);
 			wikiMain.classList.toggle('has-run-log', hasRunLog);
+			wikiMain.classList.toggle('has-review-detail', hasReviewDetail);
+			homeButton.hidden = !hasReviewDetail;
 			renderSettingsMenu(wiki);
 			if (!wiki.configured) {
 				return;
@@ -1066,9 +1233,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const initialized = wiki.status === 'initialized';
 			const running = isAgentRunning(wiki.status);
 			const currentFindings = wiki.findings || [];
-			renderFindings(currentFindings);
-			renderRunLog(runLog);
-			wikiLogo.hidden = running || currentFindings.length > 0 || hasRunLog;
+			renderFindings(hasReviewDetail || hasRunLog ? [] : currentFindings);
+			renderReviewFileDetail(reviewDetailFile);
+			renderRunLog(hasReviewDetail ? [] : runLog, wiki.runLogSource);
+			wikiLogo.hidden = running || currentFindings.length > 0 || hasRunLog || hasReviewDetail;
 			wikiAction.classList.toggle('secondary', running);
 			wikiAction.hidden = false;
 			wikiAction.disabled = !wiki.workspaceAvailable && !running;
@@ -1206,12 +1374,117 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			}
 		}
 
-		function renderRunLog(items) {
+		function renderReviewFileDetail(file) {
+			reviewFileDetail.replaceChildren();
+			reviewFileDetail.hidden = !file;
+			if (!file) {
+				return;
+			}
+
+			const heading = document.createElement('div');
+			heading.className = 'review-file-heading';
+			const title = document.createElement('div');
+			title.className = 'review-file-title';
+			title.textContent = file.relativePath;
+			const totalFindings = file.chunks.reduce((total, chunk) => total + (chunk.findings || []).length, 0);
+			const meta = document.createElement('div');
+			meta.className = 'review-file-meta';
+			meta.textContent = file.chunks.length + ' chunks | ' + totalFindings + ' findings';
+			heading.append(title, meta);
+			reviewFileDetail.appendChild(heading);
+
+			if (file.chunks.length === 0) {
+				const empty = document.createElement('div');
+				empty.className = 'review-empty';
+				empty.textContent = 'No pending chunks for this file.';
+				reviewFileDetail.appendChild(empty);
+				return;
+			}
+
+			for (const chunk of file.chunks) {
+				reviewFileDetail.appendChild(renderReviewChunk(file, chunk));
+			}
+		}
+
+		function renderReviewChunk(file, chunk) {
+			const details = document.createElement('details');
+			details.className = 'review-chunk';
+			if ((chunk.findings || []).length > 0) {
+				details.open = true;
+			}
+
+			const summary = document.createElement('summary');
+			summary.className = 'review-chunk-summary';
+			const main = document.createElement('span');
+			main.className = 'wiki-run-main';
+			const title = document.createElement('span');
+			title.className = 'wiki-run-title';
+			title.textContent = chunk.kind + ' ' + chunk.oldLines + '->' + chunk.newLines + ' lines';
+			const meta = document.createElement('span');
+			meta.className = 'wiki-run-meta';
+			meta.textContent = 'line ' + (chunk.line + 1) + ' | ' + ((chunk.findings || []).length || 'No') + ' findings';
+			main.append(title, meta);
+			const status = document.createElement('span');
+			status.className = 'wiki-run-status ' + ((chunk.findings || []).length > 0 ? 'success' : 'info');
+			status.textContent = (chunk.findings || []).length > 0 ? String((chunk.findings || []).length) : '0';
+			summary.append(main, status);
+			details.appendChild(summary);
+
+			const body = document.createElement('div');
+			body.className = 'review-chunk-body';
+			const preview = document.createElement('div');
+			preview.className = 'review-chunk-preview';
+			preview.textContent = chunk.preview || 'No preview available.';
+			body.appendChild(preview);
+
+			if ((chunk.findings || []).length === 0) {
+				const empty = document.createElement('div');
+				empty.className = 'review-empty';
+				empty.textContent = 'No findings for this chunk.';
+				body.appendChild(empty);
+			} else {
+				for (const finding of chunk.findings) {
+					body.appendChild(renderReviewChunkFinding(file, finding));
+				}
+			}
+			details.appendChild(body);
+			return details;
+		}
+
+		function renderReviewChunkFinding(file, finding) {
+			const button = document.createElement('button');
+			button.className = 'review-finding ' + finding.severity;
+			button.title = finding.explanation + '\\n\\n' + finding.recommendation;
+			button.addEventListener('click', () => vscode.postMessage({ type: 'openFinding', uri: file.uri, hunkId: finding.hunkId }));
+			const marker = document.createElement('span');
+			marker.className = 'review-finding-marker';
+			button.appendChild(marker);
+			const body = document.createElement('span');
+			const title = document.createElement('span');
+			title.className = 'review-finding-title';
+			title.textContent = finding.severity + ': ' + finding.title;
+			const explanation = document.createElement('span');
+			explanation.className = 'review-finding-text';
+			explanation.textContent = finding.explanation;
+			const recommendation = document.createElement('span');
+			recommendation.className = 'review-finding-text';
+			recommendation.textContent = finding.recommendation;
+			body.append(title, explanation, recommendation);
+			button.appendChild(body);
+			return button;
+		}
+
+		function renderRunLog(items, source) {
 			wikiRunList.replaceChildren();
 			wikiRunList.hidden = items.length === 0;
-			for (const block of groupRunLog(items)) {
+			const blocks = source === 'review' || items.some((item) => item.source === 'review' || item.fileUri)
+				? groupRunLogByFile(items)
+				: groupRunLog(items);
+			for (const block of blocks) {
 				wikiRunList.appendChild(block.type === 'round'
 					? renderRunLogRound(block)
+					: block.type === 'file'
+						? renderRunLogFile(block)
 					: renderRunLogEntry(block.item));
 			}
 		}
@@ -1239,6 +1512,73 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				}
 			}
 			return [...leading, ...rounds, ...trailing];
+		}
+
+		function groupRunLogByFile(items) {
+			const leading = [];
+			const trailing = [];
+			const files = [];
+			const fileByKey = new Map();
+			let seenFile = false;
+			for (const item of items) {
+				const fileKey = item.fileUri || item.relativePath;
+				if (fileKey) {
+					seenFile = true;
+					let file = fileByKey.get(fileKey);
+					if (!file) {
+						file = {
+							type: 'file',
+							fileUri: item.fileUri || '',
+							relativePath: item.relativePath || item.fileUri || 'File',
+							fileIndex: item.fileIndex,
+							fileCount: item.fileCount,
+							items: [],
+						};
+						fileByKey.set(fileKey, file);
+						files.push(file);
+					}
+					file.items.push(item);
+				} else if (!seenFile && item.kind !== 'run_complete' && item.kind !== 'run_error') {
+					leading.push({ type: 'entry', item });
+				} else {
+					trailing.push({ type: 'entry', item });
+				}
+			}
+			return [...leading, ...files, ...trailing];
+		}
+
+		function renderRunLogFile(group) {
+			const details = document.createElement('details');
+			const statusValue = runLogGroupStatus(group.items);
+			details.className = 'wiki-run-file ' + statusValue;
+
+			const summary = document.createElement('summary');
+			summary.className = 'wiki-run-file-summary';
+			const main = document.createElement('span');
+			main.className = 'wiki-run-main';
+			const title = document.createElement('span');
+			title.className = 'wiki-run-title';
+			title.textContent = group.relativePath || 'File';
+			const meta = document.createElement('span');
+			meta.className = 'wiki-run-meta';
+			const position = group.fileIndex && group.fileCount ? 'file ' + group.fileIndex + '/' + group.fileCount + ' | ' : '';
+			meta.textContent = position + group.items.length + ' events';
+			main.append(title, meta);
+			const status = document.createElement('span');
+			status.className = 'wiki-run-status ' + statusValue;
+			status.textContent = statusValue;
+			summary.append(main, status);
+			details.appendChild(summary);
+
+			const body = document.createElement('div');
+			body.className = 'wiki-run-file-items';
+			for (const block of groupRunLog(group.items)) {
+				body.appendChild(block.type === 'round'
+					? renderRunLogRound(block)
+					: renderRunLogEntry(block.item));
+			}
+			details.appendChild(body);
+			return details;
 		}
 
 		function renderRunLogRound(group) {
@@ -1321,13 +1661,18 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 
 		function roundStatus(items) {
+			return runLogGroupStatus(items);
+		}
+
+		function runLogGroupStatus(items) {
 			if (items.some((item) => item.status === 'error')) {
 				return 'error';
 			}
-			if (items.some((item) => item.status === 'running')) {
-				return 'running';
+			const lastStatus = [...items].reverse().find((item) => item.status !== 'info')?.status;
+			if (lastStatus) {
+				return lastStatus;
 			}
-			return 'success';
+			return items.length > 0 ? 'info' : 'success';
 		}
 
 		function runLogMeta(item) {
@@ -1404,6 +1749,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				thinkingMode: 'disabled',
 				strictTools: false,
 				runLog: [],
+				reviewFindings: [],
 			};
 		}
 
@@ -1412,11 +1758,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			row.className = 'file-row' + (file.active ? ' active' : '');
 			row.tabIndex = 0;
 			row.title = file.skippedReason ? file.relativePath + '\\n' + file.skippedReason : file.relativePath;
-			row.addEventListener('click', () => vscode.postMessage({ type: 'open', uri: file.uri }));
+			row.addEventListener('click', () => openReviewFile(file));
 			row.addEventListener('keydown', (event) => {
 				if (event.key === 'Enter' || event.key === ' ') {
 					event.preventDefault();
-					vscode.postMessage({ type: 'open', uri: file.uri });
+					openReviewFile(file);
 				}
 			});
 
@@ -1455,6 +1801,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			return row;
 		}
 
+		function openReviewFile(file) {
+			reviewDetailUri = file.uri;
+			renderWiki(lastWikiState || emptyWikiState());
+			vscode.postMessage({ type: 'open', uri: file.uri });
+		}
+
 		function actionButton(type, uri, disabled, title) {
 			const button = document.createElement('button');
 			button.className = 'icon-button';
@@ -1488,6 +1840,13 @@ export function buildReviewDashboardPayload(
 	llmWiki: LlmWikiDashboardState = defaultLlmWikiDashboardState(),
 ): ReviewDashboardPayload {
 	const currentKey = currentReviewUri ? uriKey(currentReviewUri) : undefined;
+	const findingsByChunk = new Map<string, AiReviewFinding[]>();
+	for (const finding of llmWiki.reviewFindings ?? []) {
+		const key = `${finding.uri}#${finding.hunkId}`;
+		const list = findingsByChunk.get(key) ?? [];
+		list.push(finding);
+		findingsByChunk.set(key, list);
+	}
 	const files = session
 		? [...session.files.values()]
 			.filter((file) => file.hunks.length > 0 || file.acceptedHunks.length > 0 || file.rejectedHunks.length > 0 || file.skippedReason)
@@ -1513,6 +1872,15 @@ export function buildReviewDashboardPayload(
 					acceptDisabled: mutationDisabled || pendingCount === 0,
 					rejectDisabled: mutationDisabled || pendingCount === 0,
 					undoDisabled: mutationDisabled || reviewedCount === 0,
+					chunks: file.hunks.map((hunk) => ({
+						hunkId: hunk.id,
+						kind: hunk.kind,
+						line: hunk.newStart,
+						oldLines: hunk.oldLines,
+						newLines: hunk.newLines,
+						preview: dashboardChunkPreview(hunk),
+						findings: findingsByChunk.get(`${file.uri.toString()}#${hunk.id}`) ?? [],
+					})),
 				};
 			})
 		: [];
@@ -1554,7 +1922,14 @@ export function defaultLlmWikiDashboardState(): LlmWikiDashboardState {
 		thinkingMode: 'disabled',
 		strictTools: false,
 		runLog: [],
+		reviewFindings: [],
 	};
+}
+
+function dashboardChunkPreview(hunk: ReviewFileState['hunks'][number]): string {
+	const text = hunk.newText || hunk.oldText;
+	const firstLine = text.split(/\r?\n/).find((line) => line.trim().length > 0)?.trim() ?? '';
+	return firstLine.length > 120 ? `${firstLine.slice(0, 117)}...` : firstLine;
 }
 
 function dashboardDescription(pendingCount: number, reviewedCount: number, dirty: boolean, skippedReason?: string): string {

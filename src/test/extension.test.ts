@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { reviewChangeSignature, sortFindings, validateReviewFindings } from '../agent/codeReview';
+import { CodeReviewAgentService, reviewChangeSignature, sortFindings, validateReviewFindings, validateReviewFindingsWithDiagnostics } from '../agent/codeReview';
 import { AgentRunner, type AgentTraceEvent, validateAgentResponse } from '../agent/runtime';
 import { createWikiAgentTools } from '../agent/tools';
 import { acceptHunkInBaseline, computeLineDiff } from '../diffEngine';
@@ -12,7 +12,7 @@ import { GitService } from '../gitService';
 import { AnthropicClient, DeepSeekClient, OpenAiCompatibleClient } from '../llm/client';
 import { LlmConfigStore } from '../llm/config';
 import { parseStrictJsonObject } from '../llm/json';
-import { buildReviewDashboardPayload, ReviewDashboardProvider } from '../reviewDashboard';
+import { buildReviewDashboardPayload, defaultLlmWikiDashboardState, ReviewDashboardProvider } from '../reviewDashboard';
 import { isDotReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
 import { ReviewTreeProvider } from '../reviewTree';
 import { normalizeMonacoThemeColor } from '../reviewWebview';
@@ -408,6 +408,8 @@ suite('Review state', () => {
 		assert.strictEqual(pending?.active, true);
 		assert.strictEqual(pending?.dirty, true);
 		assert.strictEqual(pending?.acceptDisabled, true);
+		assert.strictEqual(pending?.chunks.length, 1);
+		assert.strictEqual(pending?.chunks[0].hunkId, pendingHunk.id);
 		assert.strictEqual(reviewed?.undoDisabled, false);
 		assert.strictEqual(skipped?.acceptDisabled, true);
 		assert.strictEqual(skipped?.rejectDisabled, true);
@@ -417,6 +419,25 @@ suite('Review state', () => {
 		session.files.set(pendingUri.toString(), reviewFileState(pendingUri, 'src/pending.ts'));
 		const changed = buildReviewDashboardPayload(session, pendingUri, () => false);
 		assert.notStrictEqual(changed.changeSignature, payload.changeSignature);
+
+		session.files.set(pendingUri.toString(), reviewFileState(pendingUri, 'src/pending.ts', { hunks: [pendingHunk] }));
+		const findingPayload = buildReviewDashboardPayload(session, pendingUri, () => false, {
+			...defaultLlmWikiDashboardState(),
+			reviewFindings: [{
+				id: 'finding-1',
+				uri: pendingUri.toString(),
+				relativePath: 'src/pending.ts',
+				hunkId: pendingHunk.id,
+				line: pendingHunk.newStart,
+				severity: 'warning',
+				title: 'Mapped finding',
+				explanation: 'Risk',
+				recommendation: 'Fix',
+				evidence: [],
+				generationOrder: 0,
+			}],
+		});
+		assert.strictEqual(findingPayload.files.find((file) => file.relativePath === 'src/pending.ts')?.chunks[0].findings[0].title, 'Mapped finding');
 	});
 
 	test('posts dashboard state after file-level commands', async () => {
@@ -453,22 +474,36 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('<option value="deepseek">DeepSeek</option>'));
 		assert.ok(view.webview.html.includes('Strict Tools (Beta)'));
 		assert.ok(view.webview.html.includes('id="closeConfig"'));
+		assert.ok(view.webview.html.includes('id="homeButton"'));
+		assert.ok(view.webview.html.includes('home.svg'));
 		assert.ok(view.webview.html.includes('id="settingsButton"'));
 		assert.ok(view.webview.html.includes('id="settingsMenu"'));
 		assert.ok(view.webview.html.includes('id="wikiRunList"'));
+		assert.ok(view.webview.html.includes('id="reviewFileDetail"'));
 		assert.ok(view.webview.html.includes('function renderRunLog'));
 		assert.ok(view.webview.html.includes('function groupRunLog'));
+		assert.ok(view.webview.html.includes('function groupRunLogByFile'));
+		assert.ok(view.webview.html.includes('function renderRunLogFile'));
 		assert.ok(view.webview.html.includes('function renderRunLogRound'));
+		assert.ok(view.webview.html.includes('function renderReviewFileDetail'));
 		assert.ok(view.webview.html.includes("typeof item.round === 'number'"));
+		assert.ok(view.webview.html.includes('item.fileUri || item.relativePath'));
 		assert.ok(view.webview.html.includes('wiki-run-detail'));
 		assert.ok(view.webview.html.includes('wiki-run-round'));
+		assert.ok(view.webview.html.includes('wiki-run-file'));
+		assert.ok(view.webview.html.includes('review-file-detail'));
+		assert.ok(view.webview.html.includes('review-chunk'));
 		assert.ok(view.webview.html.includes('height: 100vh;'));
 		assert.ok(view.webview.html.includes('overflow: hidden;'));
 		assert.ok(view.webview.html.includes('.wiki-panel.has-run-log'));
+		assert.ok(view.webview.html.includes('.wiki-panel.has-review-detail'));
 		assert.ok(view.webview.html.includes('.wiki-main.has-run-log'));
+		assert.ok(view.webview.html.includes('.wiki-main.has-review-detail'));
 		assert.ok(view.webview.html.includes('.wiki-main.has-run-log .wiki-run-list'));
 		assert.ok(view.webview.html.includes("wikiPanel?.classList.toggle('has-run-log', hasRunLog)"));
+		assert.ok(view.webview.html.includes("wikiPanel?.classList.toggle('has-review-detail', hasReviewDetail)"));
 		assert.ok(view.webview.html.includes("wikiMain.classList.toggle('has-run-log', hasRunLog)"));
+		assert.ok(view.webview.html.includes("wikiMain.classList.toggle('has-review-detail', hasReviewDetail)"));
 		assert.ok(view.webview.html.includes('data-menu-action="initializeWiki"'));
 		assert.ok(view.webview.html.includes('data-menu-action="updateWiki"'));
 		assert.ok(view.webview.html.includes('data-menu-action="generateAiReview"'));
@@ -867,11 +902,13 @@ suite('LLM Code Wiki', () => {
 				status: 'running' as const,
 				details: [{ label: 'Request', format: 'json' as const, content: '{"model":"gpt-test"}' }],
 			}],
+			reviewFindings: [],
 		};
 		const defaultPayload = buildReviewDashboardPayload(undefined, undefined, () => false);
 		const payload = buildReviewDashboardPayload(undefined, undefined, () => false, wiki);
 
 		assert.deepStrictEqual(defaultPayload.llmWiki?.runLog, []);
+		assert.deepStrictEqual(defaultPayload.llmWiki?.reviewFindings, []);
 		assert.ok(payload.llmWiki);
 		assert.strictEqual(payload.llmWiki.configured, true);
 		assert.strictEqual(payload.llmWiki.model, 'gpt-test');
@@ -1138,6 +1175,46 @@ suite('Wiki state', () => {
 });
 
 suite('AI review findings', () => {
+	test('passes Agent trace events with file context through AI review', async () => {
+		const firstUri = vscode.Uri.file('/repo/src/a.ts');
+		const secondUri = vscode.Uri.file('/repo/src/b.ts');
+		const firstHunk = computeLineDiff(firstUri.toString(), 'a\n', 'aa\n')[0];
+		const secondHunk = computeLineDiff(secondUri.toString(), 'b\n', 'bb\n')[0];
+		const session: ReviewSession = {
+			id: 'ai-review-trace',
+			mode: 'git',
+			rootUri: vscode.Uri.file('/repo'),
+			createdAt: 1,
+			files: new Map([
+				[firstUri.toString(), reviewFileState(firstUri, 'src/a.ts', { hunks: [firstHunk] })],
+				[secondUri.toString(), reviewFileState(secondUri, 'src/b.ts', { hunks: [secondHunk] })],
+			]),
+		};
+		const responses = [
+			`{"type":"final","result":{"findings":[{"hunkId":"${firstHunk.id}","severity":"warning","title":"A","explanation":"Risk A","recommendation":"Fix A"}]}}`,
+			`{"type":"final","result":{"findings":[{"hunkId":"${secondHunk.id}","severity":"info","title":"B","explanation":"Risk B","recommendation":"Fix B"}]}}`,
+		];
+		const trace: Array<{ event: AgentTraceEvent; relativePath: string; fileIndex: number; fileCount: number }> = [];
+		const service = new CodeReviewAgentService();
+
+		const result = await service.review({
+			session,
+			root: workspaceFolder('/repo'),
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: { completeJson: async () => responses.shift() ?? '' },
+			onTrace: (event, context) => trace.push({
+				event,
+				relativePath: context.relativePath,
+				fileIndex: context.fileIndex,
+				fileCount: context.fileCount,
+			}),
+		});
+
+		assert.strictEqual(result.findings.length, 2);
+		assert.ok(trace.some((item) => item.event.kind === 'llm_request' && item.relativePath === 'src/a.ts' && item.fileIndex === 1 && item.fileCount === 2));
+		assert.ok(trace.some((item) => item.event.title === 'Review findings parsed' && item.relativePath === 'src/b.ts'));
+	});
+
 	test('drops findings that do not bind to a current pending hunk', () => {
 		const uri = vscode.Uri.file('/repo/src/app.ts');
 		const hunk = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
@@ -1151,6 +1228,28 @@ suite('AI review findings', () => {
 
 		assert.strictEqual(findings.length, 1);
 		assert.strictEqual(findings[0].title, 'Bound');
+	});
+
+	test('reports finding validation diagnostics for empty and invalid responses', () => {
+		const uri = vscode.Uri.file('/repo/src/app.ts');
+		const hunk = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
+		const file = reviewFileState(uri, 'src/app.ts', { hunks: [hunk] });
+		const empty = validateReviewFindingsWithDiagnostics({ findings: [] }, file);
+		const filtered = validateReviewFindingsWithDiagnostics({
+			findings: [
+				{ hunkId: 'missing', severity: 'warning', title: 'x', explanation: 'x', recommendation: 'x' },
+				{ hunkId: hunk.id, severity: 'bad', title: 'x', explanation: 'x', recommendation: 'x' },
+				{ hunkId: hunk.id, severity: 'warning', title: 'Bound', explanation: 'Risk', recommendation: 'Fix' },
+			],
+		}, file);
+
+		assert.strictEqual(empty.diagnostics.rawCount, 0);
+		assert.strictEqual(empty.diagnostics.acceptedCount, 0);
+		assert.strictEqual(filtered.findings.length, 1);
+		assert.strictEqual(filtered.diagnostics.rawCount, 3);
+		assert.strictEqual(filtered.diagnostics.dropped.length, 2);
+		assert.ok(filtered.diagnostics.dropped.some((item) => item.reason.includes('hunkId')));
+		assert.ok(filtered.diagnostics.dropped.some((item) => item.reason.includes('severity')));
 	});
 
 	test('sorts findings by chunk by default and severity when configured', () => {
