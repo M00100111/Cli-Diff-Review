@@ -4,9 +4,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { CodeReviewAgentService, reviewChangeSignature, sortFindings, validateReviewFindings, validateReviewFindingsWithDiagnostics } from '../agent/codeReview';
+import { AiReviewPartialError, CodeReviewAgentService, reviewChangeSignature, sortFindings, StoredAiReview, validateReviewFindings, validateReviewFindingsWithDiagnostics, validateReviewSuggestionsWithDiagnostics } from '../agent/codeReview';
 import { AgentRunner, type AgentTraceEvent, validateAgentResponse } from '../agent/runtime';
-import { createWikiAgentTools } from '../agent/tools';
+import { createReadOnlyAgentTools, createWikiAgentTools } from '../agent/tools';
 import { acceptHunkInBaseline, computeLineDiff } from '../diffEngine';
 import { GitService } from '../gitService';
 import { AnthropicClient, DeepSeekClient, OpenAiCompatibleClient } from '../llm/client';
@@ -176,9 +176,166 @@ suite('Review webview compatibility', () => {
 		assert.ok(source.includes("require(['vs/editor/editor.main']"));
 		assert.ok(source.includes('showInitializationError'));
 		assert.ok(source.includes('Review editor failed to initialize: '));
+		assert.ok(source.includes("private static readonly deletedDocumentScheme = 'cli-diff-review-deleted';"));
+		assert.ok(source.includes('vscode.workspace.registerTextDocumentContentProvider(ReviewWebviewManager.deletedDocumentScheme'));
+		assert.ok(source.includes('provideDeletedDocumentContent'));
+		assert.ok(source.includes('const originalUri = this.originalUriForDocumentUri(document.uri);'));
+		assert.ok(source.includes('const key = uriKey(originalUri);'));
+		assert.ok(source.includes('const documentUri = this.documentUriForReview(uri);'));
+		assert.ok(source.includes('vscode.openWith\', documentUri'));
+		assert.ok(source.includes('const existingHost = this.hosts.get(key);'));
+		assert.ok(source.includes('existingHost.panel.reveal(vscode.ViewColumn.Active);'));
+		assert.ok(source.includes('return file && !file.currentExists ? this.deletedDocumentUriForOriginalUri(uri) : uri;'));
+		assert.ok(source.includes("Buffer.from(uri.toString(), 'utf8').toString('base64url')"));
+		assert.ok(source.includes("Buffer.from(encoded, 'base64url').toString('utf8')"));
+		assert.ok(source.includes('uri: file.uri.toString()'));
+		assert.ok(source.includes('document.uri.scheme === ReviewWebviewManager.deletedDocumentScheme ? file.newText : document.getText()'));
+		assert.ok(source.includes('readOnly: document.uri.scheme === ReviewWebviewManager.deletedDocumentScheme'));
+		assert.ok(source.includes('if (host.document.uri.scheme === ReviewWebviewManager.deletedDocumentScheme)'));
+		assert.match(source, /host\.document\.uri\.scheme === ReviewWebviewManager\.deletedDocumentScheme[\s\S]*?await this\.postState\(host\);[\s\S]*?return;/);
+		assert.ok(source.includes('editor.updateOptions({ readOnly: Boolean(state.readOnly) });'));
+		assert.ok(source.includes('if (applyingState || state?.readOnly)'));
+		assert.ok(source.includes('appliedAiSuggestions: file.appliedAiSuggestions'));
+		assert.ok(source.includes("type: 'undoAiSuggestion'"));
+		assert.ok(source.includes("state: appliedSuggestion ? 'suggested' : 'pending'"));
+		assert.ok(source.includes("node.className = 'cli-hunk-zone ' + (entry.state === 'suggested'"));
+		assert.ok(source.includes("const lineClass = entry.state === 'suggested' ? 'suggested'"));
+		assert.ok(source.includes('.cli-line-suggested'));
+		assert.ok(source.includes('.cli-margin-suggested'));
+		assert.ok(source.includes('.cli-hunk-zone.suggested .cli-hunk-header::before'));
+		assert.ok(source.includes('const reviewedKeys = new Set(state.acceptedHunks.concat(state.rejectedHunks).map(hunkIdentity));'));
+		assert.ok(source.includes('return !reviewedKeys.has(hunkIdentity(hunk));'));
+		assert.ok(source.includes('function hunkIdentity(hunk)'));
+		assert.ok(source.includes("const oldLinesToShow = hunk.kind === 'delete' || hunk.kind === 'modify' ? splitLines(hunk.oldText) : [];"));
+		assert.ok(source.includes("oldLines.className = 'cli-old-lines';"));
+		assert.match(source, /\.cli-references-header\s*{[\s\S]*?min-width: 0;[\s\S]*?overflow: hidden;/);
+		assert.match(source, /\.cli-references-title\s*{[\s\S]*?flex: 1 1 auto;[\s\S]*?min-width: 0;[\s\S]*?text-overflow: ellipsis;/);
+		assert.match(source, /\.cli-references-count\s*{[\s\S]*?flex: 0 0 auto;/);
+		assert.match(source, /\.cli-references-actions\s*{[\s\S]*?transform: translateX\(var\(--cli-action-shift, 0px\)\);/);
+		assert.ok(source.includes('.cli-references-header button[data-reference-close]'));
+		assert.ok(source.includes("actions.className = 'cli-references-actions';"));
+		assert.ok(source.includes('actions.appendChild(count);'));
+		assert.ok(source.includes('actions.appendChild(close);'));
+		assert.match(source, /editor\.layout\(\);\s+updateActionOffset\(\);/);
 		const createEditorIndex = source.indexOf('createEditor();');
 		const readyIndex = source.indexOf('ready = true;', createEditorIndex);
 		assert.ok(createEditorIndex >= 0 && readyIndex > createEditorIndex);
+	});
+});
+
+suite('Extension configuration', () => {
+	test('declares bulk review commands in the manifest', () => {
+		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+			activationEvents?: string[];
+			contributes?: {
+				commands?: Array<{ command: string; title?: string; icon?: string }>;
+				menus?: { 'view/title'?: Array<{ command: string; when?: string; group?: string }> };
+			};
+		};
+		const commands = manifest.contributes?.commands ?? [];
+		const viewTitle = manifest.contributes?.menus?.['view/title'] ?? [];
+
+		for (const [command, icon] of [
+			['cli-diff.acceptAll', '$(check)'],
+			['cli-diff.rejectAll', '$(close)'],
+			['cli-diff.undoAll', '$(discard)'],
+		] as const) {
+			assert.ok(manifest.activationEvents?.includes(`onCommand:${command}`));
+			assert.strictEqual(commands.find((item) => item.command === command)?.icon, icon);
+			const menu = viewTitle.find((item) => item.command === command);
+			assert.ok(menu);
+			assert.strictEqual(menu.when, 'view == cli-diff.review');
+		}
+		assert.strictEqual(viewTitle.find((item) => item.command === 'cli-diff.acceptAll')?.group, 'navigation@1');
+		assert.strictEqual(viewTitle.find((item) => item.command === 'cli-diff.rejectAll')?.group, 'navigation@2');
+		assert.strictEqual(viewTitle.find((item) => item.command === 'cli-diff.undoAll')?.group, 'navigation@3');
+		assert.strictEqual(viewTitle.find((item) => item.command === 'cli-diff.refresh')?.group, 'navigation@4');
+	});
+
+	test('declares AI review language setting defaults', () => {
+		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+			contributes?: { configuration?: { properties?: Record<string, unknown> } };
+		};
+		const setting = manifest.contributes?.configuration?.properties?.['cliDiff.aiReviewLanguage'] as {
+			default?: unknown;
+			enum?: unknown[];
+		} | undefined;
+
+		assert.ok(setting);
+		assert.strictEqual(setting.default, 'zh-CN');
+		assert.deepStrictEqual(setting.enum, ['zh-CN', 'en']);
+	});
+
+	test('declares AI review max rounds setting defaults', () => {
+		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+			contributes?: { configuration?: { properties?: Record<string, unknown> } };
+		};
+		const setting = manifest.contributes?.configuration?.properties?.['cliDiff.aiReviewMaxRounds'] as {
+			default?: unknown;
+			minimum?: unknown;
+			maximum?: unknown;
+			description?: unknown;
+		} | undefined;
+
+		assert.ok(setting);
+		assert.strictEqual(setting.default, 64);
+		assert.strictEqual(setting.minimum, 0);
+		assert.strictEqual(Object.prototype.hasOwnProperty.call(setting, 'maximum'), false);
+		assert.match(String(setting.description), /0 means unlimited/);
+	});
+});
+
+suite('Review controller bulk actions', () => {
+	test('wires bulk review commands through confirmation and file-level cores', () => {
+		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
+
+		assert.ok(source.includes("this.registerCommand('cli-diff.acceptAll', () => this.acceptAll())"));
+		assert.ok(source.includes("this.registerCommand('cli-diff.rejectAll', () => this.rejectAll())"));
+		assert.ok(source.includes("this.registerCommand('cli-diff.undoAll', () => this.undoAll())"));
+		assert.ok(source.includes("await this.applyBulkFileOperation('accept')"));
+		assert.ok(source.includes("await this.applyBulkFileOperation('reject')"));
+		assert.ok(source.includes("await this.applyBulkFileOperation('undo')"));
+		assert.ok(source.includes('No pending Cli Diff Review changes.'));
+		assert.ok(source.includes('No reviewed Cli Diff Review changes.'));
+		assert.ok(source.includes('Save or revert target files before accepting, rejecting, or undoing all Cli Diff Review changes.'));
+		assert.ok(source.includes('vscode.window.showWarningMessage'));
+		assert.ok(source.includes('{ modal: true }'));
+		assert.strictEqual(source.includes("const cancelLabel = 'Cancel';"), false);
+		assert.strictEqual(source.includes('confirmationLabel,\n\t\t\tcancelLabel,'), false);
+		assert.ok(source.includes('Accept all ${chunkCount} pending changes across ${fileCount} files?'));
+		assert.ok(source.includes('Reject all ${chunkCount} pending changes across ${fileCount} files? This will modify working files.'));
+		assert.ok(source.includes('Undo all ${chunkCount} reviewed changes across ${fileCount} files? This will restore them to pending.'));
+		assert.ok(source.includes('await this.acceptFileCore(target.file)'));
+		assert.ok(source.includes('await this.rejectFileCore(target.file)'));
+		assert.ok(source.includes('await this.undoFileCore(target.file)'));
+		assert.ok(source.includes('this.removePendingHunk(target.file, target.hunk)'));
+		assert.ok(source.includes('file.hunks = [];'));
+		assert.ok(source.includes('refreshedFile.hunks = [];'));
+		assert.ok(source.includes('private isSameReviewHunk(left: ReviewHunk, right: ReviewHunk): boolean'));
+		assert.ok(source.includes("chunkCount: action === 'undo' ? file.acceptedHunks.length + file.rejectedHunks.length : file.hunks.length"));
+		assert.ok(source.includes('sort((left, right) => left.file.relativePath.localeCompare(right.file.relativePath))'));
+	});
+
+	test('wires AI review partial retry and max round configuration through the controller', () => {
+		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
+
+		assert.ok(source.includes("event.affectsConfiguration('cliDiff.aiReviewMaxRounds')"));
+		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewMaxRounds', 64)"));
+		assert.ok(source.includes("return 'unlimited';"));
+		assert.ok(source.includes('const existingReview = storedReview?.status === \'partial\' ? storedReview : undefined;'));
+		assert.ok(source.includes('existingReview,'));
+		assert.ok(source.includes('maxRounds,'));
+		assert.ok(source.includes('onFileComplete: async (review) =>'));
+		assert.ok(source.includes('await this.aiReviewStore.save(session, review);'));
+		assert.ok(source.includes('error instanceof AiReviewPartialError'));
+		assert.ok(source.includes('await this.aiReviewStore.save(session, error.review);'));
+		assert.ok(source.includes("maxRounds: maxRounds === 'unlimited' ? 'unlimited' : maxRounds"));
+		assert.ok(source.includes("this.registerCommand('cli-diff.applyAiSuggestion'"));
+		assert.ok(source.includes("this.registerCommand('cli-diff.undoAiSuggestion'"));
+		assert.ok(source.includes('private async applyAiSuggestionCore'));
+		assert.ok(source.includes('private async undoAiSuggestionCore'));
+		assert.ok(source.includes('await this.saveAiReviewWithCurrentSignature(storedReview);'));
+		assert.ok(source.includes('this.replacePendingHunkWithAppliedSuggestion'));
 	});
 });
 
@@ -277,6 +434,36 @@ suite('Review state', () => {
 		assert.strictEqual(editedHunks[0].newText, 'later\n');
 	});
 
+	test('keeps partially accepted Git baselines across manual refresh pairs', () => {
+		const uri = vscode.Uri.file('D:/repo/tracked.txt');
+		const indexText = 'a\nold-one\nb\nold-two\nc\n';
+		const currentText = 'a\nnew-one\nb\nnew-two\nc\n';
+		const hunks = computeLineDiff(uri.toString(), indexText, currentText);
+		assert.strictEqual(hunks.length, 2);
+		const acceptedBaseline = acceptHunkInBaseline(indexText, hunks[0]);
+		const reviewedFile = reviewFileState(uri, 'tracked.txt', {
+			oldText: acceptedBaseline,
+			newText: currentText,
+			hunks: [hunks[1]],
+			acceptedHunks: [reviewedHunkFrom(hunks[0], 'accept')],
+		});
+		const baseline = manualGitBaselineFromReviewedFile(reviewedFile);
+		assert.deepStrictEqual(baseline, { oldText: acceptedBaseline, baselineExists: true });
+
+		const refreshed = applyManualGitBaselineToPair({
+			uri,
+			relativePath: 'tracked.txt',
+			oldText: indexText,
+			newText: currentText,
+			baselineExists: true,
+			currentExists: true,
+		}, baseline);
+		const refreshedHunks = computeLineDiff(uri.toString(), refreshed.oldText, refreshed.newText);
+		assert.strictEqual(refreshedHunks.length, 1);
+		assert.strictEqual(refreshedHunks[0].oldText, 'old-two\n');
+		assert.strictEqual(refreshedHunks[0].newText, 'new-two\n');
+	});
+
 	test('does not apply manual Git baselines to skipped pairs', () => {
 		const uri = vscode.Uri.file('D:/repo/tracked.txt');
 		const baseline = { oldText: 'base\naccepted\n', baselineExists: true };
@@ -351,6 +538,7 @@ suite('Review state', () => {
 			hunks: [],
 			acceptedHunks: [],
 			rejectedHunks: [],
+			appliedAiSuggestions: [],
 			originalText: '',
 			originalExists: true,
 			baselineExists: true,
@@ -410,6 +598,7 @@ suite('Review state', () => {
 		assert.strictEqual(pending?.acceptDisabled, true);
 		assert.strictEqual(pending?.chunks.length, 1);
 		assert.strictEqual(pending?.chunks[0].hunkId, pendingHunk.id);
+		assert.strictEqual(Object.prototype.hasOwnProperty.call(pending?.chunks[0] ?? {}, 'preview'), false);
 		assert.strictEqual(reviewed?.undoDisabled, false);
 		assert.strictEqual(skipped?.acceptDisabled, true);
 		assert.strictEqual(skipped?.rejectDisabled, true);
@@ -438,6 +627,66 @@ suite('Review state', () => {
 			}],
 		});
 		assert.strictEqual(findingPayload.files.find((file) => file.relativePath === 'src/pending.ts')?.chunks[0].findings[0].title, 'Mapped finding');
+		session.files.set(pendingUri.toString(), reviewFileState(pendingUri, 'src/pending.ts', {
+			hunks: [pendingHunk],
+			appliedAiSuggestions: [{
+				suggestionId: 'suggestion-1',
+				hunkId: pendingHunk.id,
+				originalHunk: pendingHunk,
+				replacementText: 'suggested\n',
+				appliedHunk: { ...pendingHunk, newText: 'suggested\n' },
+				appliedAt: 1,
+			}],
+		}));
+		const suggestionPayload = buildReviewDashboardPayload(session, pendingUri, () => false, {
+			...defaultLlmWikiDashboardState(),
+			reviewSuggestions: [{
+				id: 'suggestion-1',
+				uri: pendingUri.toString(),
+				relativePath: 'src/pending.ts',
+				hunkId: pendingHunk.id,
+				line: pendingHunk.newStart,
+				replacementText: 'suggested\n',
+				rationale: 'Prefer this code.',
+				generationOrder: 0,
+			}],
+			aiReviewFileResults: [{
+				uri: pendingUri.toString(),
+				relativePath: 'src/pending.ts',
+				status: 'success',
+				rawFindingCount: 0,
+				acceptedFindingCount: 0,
+				droppedFindingCount: 0,
+				rawSuggestionCount: 1,
+				acceptedSuggestionCount: 1,
+				droppedSuggestionCount: 0,
+				summary: 'Model returned 0 findings. Accepted 1 of 1 suggestions.',
+			}],
+		});
+		const suggestionFile = suggestionPayload.files.find((file) => file.relativePath === 'src/pending.ts');
+		assert.strictEqual(suggestionFile?.chunks[0].suggestions[0].replacementText, 'suggested\n');
+		assert.strictEqual(suggestionFile?.chunks[0].appliedSuggestion?.suggestionId, 'suggestion-1');
+		assert.strictEqual(suggestionFile?.aiReviewResult?.summary, 'Model returned 0 findings. Accepted 1 of 1 suggestions.');
+		session.files.set(pendingUri.toString(), reviewFileState(pendingUri, 'src/pending.ts', { hunks: [pendingHunk] }));
+		const reviewedFindingPayload = buildReviewDashboardPayload(session, reviewedUri, () => false, {
+			...defaultLlmWikiDashboardState(),
+			reviewFindings: [{
+				id: 'finding-reviewed',
+				uri: reviewedUri.toString(),
+				relativePath: 'src/reviewed.ts',
+				hunkId: reviewedHunk.id,
+				line: reviewedHunk.newStart,
+				severity: 'warning',
+				title: 'Reviewed finding',
+				explanation: 'Risk',
+				recommendation: 'Fix',
+				evidence: [],
+				generationOrder: 0,
+			}],
+		});
+		const reviewedFindingChunk = reviewedFindingPayload.files.find((file) => file.relativePath === 'src/reviewed.ts')?.chunks[0];
+		assert.strictEqual(reviewedFindingChunk?.reviewStatus, 'reviewed');
+		assert.strictEqual(reviewedFindingChunk?.findings[0].title, 'Reviewed finding');
 	});
 
 	test('posts dashboard state after file-level commands', async () => {
@@ -478,6 +727,9 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('home.svg'));
 		assert.ok(view.webview.html.includes('id="settingsButton"'));
 		assert.ok(view.webview.html.includes('id="settingsMenu"'));
+		assert.ok(view.webview.html.includes('id="acceptAll"'));
+		assert.ok(view.webview.html.includes('id="rejectAll"'));
+		assert.ok(view.webview.html.includes('id="undoAll"'));
 		assert.ok(view.webview.html.includes('id="wikiRunList"'));
 		assert.ok(view.webview.html.includes('id="reviewFileDetail"'));
 		assert.ok(view.webview.html.includes('function renderRunLog'));
@@ -486,6 +738,12 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('function renderRunLogFile'));
 		assert.ok(view.webview.html.includes('function renderRunLogRound'));
 		assert.ok(view.webview.html.includes('function renderReviewFileDetail'));
+		assert.ok(view.webview.html.includes('function aiReviewActionLabel'));
+		assert.ok(view.webview.html.includes("return 'Generate AI review'"));
+		assert.ok(view.webview.html.includes("return 'Retry AI review'"));
+		assert.ok(view.webview.html.includes("return 'Continue AI review'"));
+		assert.ok(view.webview.html.includes("return 'Regenerate AI review'"));
+		assert.ok(view.webview.html.includes("wiki.aiReviewStatus === 'partial'"));
 		assert.ok(view.webview.html.includes("typeof item.round === 'number'"));
 		assert.ok(view.webview.html.includes('item.fileUri || item.relativePath'));
 		assert.ok(view.webview.html.includes('wiki-run-detail'));
@@ -493,6 +751,36 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('wiki-run-file'));
 		assert.ok(view.webview.html.includes('review-file-detail'));
 		assert.ok(view.webview.html.includes('review-chunk'));
+		assert.ok(view.webview.html.includes('acceptAllButton.addEventListener'));
+		assert.ok(view.webview.html.includes('rejectAllButton.addEventListener'));
+		assert.ok(view.webview.html.includes('undoAllButton.addEventListener'));
+		assert.ok(view.webview.html.includes("vscode.postMessage({ type: 'acceptAll' })"));
+		assert.ok(view.webview.html.includes("vscode.postMessage({ type: 'rejectAll' })"));
+		assert.ok(view.webview.html.includes("vscode.postMessage({ type: 'undoAll' })"));
+		assert.ok(view.webview.html.includes('function updateBulkActionButtons'));
+		assert.ok(view.webview.html.includes('acceptAllButton.disabled = pendingCount === 0'));
+		assert.ok(view.webview.html.includes('rejectAllButton.disabled = pendingCount === 0'));
+		assert.ok(view.webview.html.includes('undoAllButton.disabled = reviewedCount === 0'));
+		assert.ok(view.webview.html.includes('openChunk'));
+		assert.ok(view.webview.html.includes('.review-chunk.add'));
+		assert.ok(view.webview.html.includes('.review-chunk.delete'));
+		assert.ok(view.webview.html.includes('.review-chunk.modify'));
+		assert.ok(view.webview.html.includes('.review-chunk.has-findings'));
+		assert.ok(view.webview.html.includes('.review-chunk.has-suggestion'));
+		assert.ok(view.webview.html.includes('function renderReviewChunkSuggestion'));
+		assert.ok(view.webview.html.includes('review-suggestion-action'));
+		assert.ok(view.webview.html.includes("type: applied ? 'undoAiSuggestion' : 'applyAiSuggestion'"));
+		assert.ok(view.webview.html.includes('review-file-result'));
+		assert.ok(view.webview.html.includes("details.setAttribute('open', '')"));
+		assert.ok(view.webview.html.includes("chunk.reviewStatus === 'reviewed'"));
+		assert.strictEqual(view.webview.html.includes('review-chunk-preview'), false);
+		const dashboardSource = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewDashboard.ts'), 'utf8');
+		assert.strictEqual(dashboardSource.includes('dashboardChunkPreview'), false);
+		assert.match(view.webview.html, /\.wiki-run-title\s*{[\s\S]*?font-size: 12px;/);
+		assert.match(view.webview.html, /\.wiki-run-meta\s*{[\s\S]*?font-size: 10px;/);
+		assert.match(view.webview.html, /\.wiki-run-detail pre\s*{[\s\S]*?font-size: 11px;/);
+		assert.match(view.webview.html, /\.review-finding-title\s*{[\s\S]*?font-size: 12px;/);
+		assert.match(view.webview.html, /\.review-finding-text\s*{[\s\S]*?font-size: 11px;/);
 		assert.ok(view.webview.html.includes('height: 100vh;'));
 		assert.ok(view.webview.html.includes('overflow: hidden;'));
 		assert.ok(view.webview.html.includes('.wiki-panel.has-run-log'));
@@ -552,6 +840,29 @@ suite('Review state', () => {
 		assert.ok(commands.some((call) => call.command === 'cli-diff.openWikiIndex' && call.args.length === 0));
 		assert.ok(commands.some((call) => call.command === 'workbench.action.openSettings'
 			&& call.args[0] === '@ext:local.cli-diff-review'));
+		messageHandler({ type: 'acceptAll' });
+		messageHandler({ type: 'rejectAll' });
+		messageHandler({ type: 'undoAll' });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.ok(commands.some((call) => call.command === 'cli-diff.acceptAll'));
+		assert.ok(commands.some((call) => call.command === 'cli-diff.rejectAll'));
+		assert.ok(commands.some((call) => call.command === 'cli-diff.undoAll'));
+		messageHandler({ type: 'openChunk', uri: uri.toString(), hunkId: 'hunk-1' });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.ok(commands.some((call) => call.command === 'cli-diff.openAiReviewFinding'
+			&& call.args[0] === uri.toString()
+			&& call.args[1] === 'hunk-1'));
+		messageHandler({ type: 'applyAiSuggestion', uri: uri.toString(), hunkId: 'hunk-1', suggestionId: 'suggestion-1' });
+		messageHandler({ type: 'undoAiSuggestion', uri: uri.toString(), hunkId: 'hunk-1', suggestionId: 'suggestion-1' });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.ok(commands.some((call) => call.command === 'cli-diff.applyAiSuggestion'
+			&& call.args[0] === uri.toString()
+			&& call.args[1] === 'hunk-1'
+			&& call.args[2] === 'suggestion-1'));
+		assert.ok(commands.some((call) => call.command === 'cli-diff.undoAiSuggestion'
+			&& call.args[0] === uri.toString()
+			&& call.args[1] === 'hunk-1'
+			&& call.args[2] === 'suggestion-1'));
 		provider.dispose();
 	});
 
@@ -903,12 +1214,22 @@ suite('LLM Code Wiki', () => {
 				details: [{ label: 'Request', format: 'json' as const, content: '{"model":"gpt-test"}' }],
 			}],
 			reviewFindings: [],
+			reviewSuggestions: [],
+			aiReviewFileResults: [],
+			aiReviewStatus: 'none' as const,
+			aiReviewCompletedFileCount: 0,
+			aiReviewTotalFileCount: 0,
 		};
 		const defaultPayload = buildReviewDashboardPayload(undefined, undefined, () => false);
 		const payload = buildReviewDashboardPayload(undefined, undefined, () => false, wiki);
 
 		assert.deepStrictEqual(defaultPayload.llmWiki?.runLog, []);
 		assert.deepStrictEqual(defaultPayload.llmWiki?.reviewFindings, []);
+		assert.deepStrictEqual(defaultPayload.llmWiki?.reviewSuggestions, []);
+		assert.deepStrictEqual(defaultPayload.llmWiki?.aiReviewFileResults, []);
+		assert.strictEqual(defaultPayload.llmWiki?.aiReviewStatus, 'none');
+		assert.strictEqual(defaultPayload.llmWiki?.aiReviewCompletedFileCount, 0);
+		assert.strictEqual(defaultPayload.llmWiki?.aiReviewTotalFileCount, 0);
 		assert.ok(payload.llmWiki);
 		assert.strictEqual(payload.llmWiki.configured, true);
 		assert.strictEqual(payload.llmWiki.model, 'gpt-test');
@@ -972,7 +1293,7 @@ suite('Agent runtime', () => {
 		}), /unavailable tool/);
 	});
 
-	test('corrects invalid text JSON once without adding it to history', async () => {
+	test('corrects invalid text JSON with parse diagnostics and raw response', async () => {
 		const requests: unknown[] = [];
 		const responses = ['Now I have enough context.', '{"type":"final","result":{"summary":"done"}}'];
 		const trace: AgentTraceEvent[] = [];
@@ -993,8 +1314,44 @@ suite('Agent runtime', () => {
 
 		assert.strictEqual(result.result.summary, 'done');
 		assert.strictEqual(requests.length, 2);
-		assert.strictEqual(JSON.stringify(requests[1]).includes('Now I have enough context.'), false);
+		const correctionRequest = JSON.stringify(requests[1]);
+		assert.ok(correctionRequest.includes('Parser error:'));
+		assert.ok(correctionRequest.includes('Previous raw response:'));
+		assert.ok(correctionRequest.includes('Now I have enough context.'));
 		assert.ok(trace.some((event) => event.kind === 'parse_error' && event.summary.includes('Unexpected token')));
+		assert.ok(trace.some((event) => event.kind === 'parse_success' && event.summary === 'Parsed final result'));
+	});
+
+	test('retries malformed Agent JSON with two correction attempts', async () => {
+		const requests: unknown[] = [];
+		const responses = [
+			'{"type":"final","result":{"summary":"broken"',
+			'Still not JSON.',
+			'{"type":"final","result":{"summary":"fixed"}}',
+		];
+		const trace: AgentTraceEvent[] = [];
+		const runner = new AgentRunner();
+		const result = await runner.run({
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: {
+				completeJson: async (request) => {
+					requests.push(request);
+					return responses.shift() ?? '';
+				},
+			},
+			systemPrompt: 'test json',
+			userPrompt: 'test',
+			tools: [],
+			onTrace: (event) => trace.push(event),
+		});
+
+		assert.strictEqual(result.result.summary, 'fixed');
+		assert.strictEqual(requests.length, 3);
+		assert.ok(JSON.stringify(requests[1]).includes('Parser error:'));
+		assert.ok(JSON.stringify(requests[1]).includes('Previous raw response:'));
+		assert.ok(JSON.stringify(requests[1]).includes('broken'));
+		assert.ok(JSON.stringify(requests[2]).includes('Still not JSON.'));
+		assert.strictEqual(trace.filter((event) => event.kind === 'parse_error').length, 2);
 		assert.ok(trace.some((event) => event.kind === 'parse_success' && event.summary === 'Parsed final result'));
 	});
 
@@ -1091,7 +1448,7 @@ suite('Agent runtime', () => {
 		assert.strictEqual(result.result.summary, 'fixed arguments');
 	});
 
-	test('reports provider, model, and preview after correction retry fails', async () => {
+	test('reports provider, model, and preview after correction retries fail', async () => {
 		const runner = new AgentRunner();
 		await assert.rejects(() => runner.run({
 			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'broken-model', apiKey: 'secret' },
@@ -1099,7 +1456,7 @@ suite('Agent runtime', () => {
 			systemPrompt: 'test json',
 			userPrompt: 'test',
 			tools: [],
-		}), /OpenAI-compatible model "broken-model".*Now I have no JSON/);
+		}), /OpenAI-compatible model "broken-model".*two correction retries.*Now I have no JSON/);
 	});
 
 	test('enforces cancellation and runtime limits', async () => {
@@ -1126,6 +1483,75 @@ suite('Agent runtime', () => {
 			tools: [],
 			signal: abortController.signal,
 		}), /cancelled/i);
+	});
+
+	test('reports finite round limits and supports unlimited round mode', async () => {
+		const tool = {
+			name: 'echo',
+			description: 'Echo.',
+			parameters: { type: 'object', properties: {}, additionalProperties: false },
+			execute: async () => ({}),
+		};
+		const limitedRunner = new AgentRunner();
+		await assert.rejects(() => limitedRunner.run({
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: { completeJson: async () => '{"type":"tool_calls","calls":[{"id":"call-1","name":"echo","arguments":{}}]}' },
+			systemPrompt: 'test',
+			userPrompt: 'test',
+			tools: [tool],
+			maxRounds: 1,
+		}), /Agent exceeded its round limit \(1\)\./);
+
+		const responses = [
+			'{"type":"tool_calls","calls":[{"id":"call-1","name":"echo","arguments":{}}]}',
+			'{"type":"final","result":{"summary":"done"}}',
+		];
+		const unlimitedResult = await new AgentRunner().run({
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: { completeJson: async () => responses.shift() ?? '' },
+			systemPrompt: 'test',
+			userPrompt: 'test',
+			tools: [tool],
+			maxRounds: 'unlimited',
+			maxRunMs: 1000,
+		});
+
+		assert.strictEqual(unlimitedResult.rounds, 2);
+		assert.strictEqual(unlimitedResult.result.summary, 'done');
+	});
+
+	test('reads deleted review files from the review session snapshot', async () => {
+		const uri = vscode.Uri.file('/repo/src/deleted.ts');
+		const hunk = computeLineDiff(uri.toString(), 'export const removed = true;\n', '')[0];
+		const session: ReviewSession = {
+			id: 'deleted-read',
+			mode: 'git',
+			rootUri: vscode.Uri.file('/repo'),
+			createdAt: 1,
+			files: new Map([[uri.toString(), reviewFileState(uri, 'src/deleted.ts', {
+				oldText: 'export const removed = true;\n',
+				newText: '',
+				hunks: [hunk],
+				currentExists: false,
+			})]]),
+		};
+		const tools = createReadOnlyAgentTools({ root: workspaceFolder('/repo'), reviewSession: session });
+		const list = await tools.find((tool) => tool.name === 'list_workspace_files')?.execute({}, undefined) as { files: string[] };
+		const read = await tools.find((tool) => tool.name === 'read_workspace_file')?.execute({ path: 'src/deleted.ts' }, undefined) as {
+			content: string;
+			currentExists: boolean;
+			contentSource: string;
+		};
+		const search = await tools.find((tool) => tool.name === 'search_workspace')?.execute({ query: 'removed', limit: 10 }, undefined) as {
+			matches: Array<{ path: string; text: string }>;
+		};
+
+		assert.ok(list.files.includes('src/deleted.ts'));
+		assert.strictEqual(read.content, 'export const removed = true;\n');
+		assert.strictEqual(read.currentExists, false);
+		assert.strictEqual(read.contentSource, 'reviewOldText');
+		assert.strictEqual(search.matches[0].path, 'src/deleted.ts');
+		assert.ok(search.matches[0].text.includes('removed'));
 	});
 
 	test('protects Wiki template and state files from Agent writes', async () => {
@@ -1202,6 +1628,7 @@ suite('AI review findings', () => {
 			root: workspaceFolder('/repo'),
 			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
 			client: { completeJson: async () => responses.shift() ?? '' },
+			language: 'en',
 			onTrace: (event, context) => trace.push({
 				event,
 				relativePath: context.relativePath,
@@ -1213,6 +1640,166 @@ suite('AI review findings', () => {
 		assert.strictEqual(result.findings.length, 2);
 		assert.ok(trace.some((item) => item.event.kind === 'llm_request' && item.relativePath === 'src/a.ts' && item.fileIndex === 1 && item.fileCount === 2));
 		assert.ok(trace.some((item) => item.event.title === 'Review findings parsed' && item.relativePath === 'src/b.ts'));
+	});
+
+	test('keeps completed file findings after a later AI review file fails and resumes from partial review', async () => {
+		const firstUri = vscode.Uri.file('/repo/src/a.ts');
+		const secondUri = vscode.Uri.file('/repo/src/b.ts');
+		const firstHunk = computeLineDiff(firstUri.toString(), 'a\n', 'aa\n')[0];
+		const secondHunk = computeLineDiff(secondUri.toString(), 'b\n', 'bb\n')[0];
+		const session: ReviewSession = {
+			id: 'ai-review-partial',
+			mode: 'git',
+			rootUri: vscode.Uri.file('/repo'),
+			createdAt: 1,
+			files: new Map([
+				[firstUri.toString(), reviewFileState(firstUri, 'src/a.ts', { hunks: [firstHunk] })],
+				[secondUri.toString(), reviewFileState(secondUri, 'src/b.ts', { hunks: [secondHunk] })],
+			]),
+		};
+		const completions: StoredAiReview[] = [];
+		let partial: StoredAiReview | undefined;
+
+		try {
+			await new CodeReviewAgentService().review({
+				session,
+				root: workspaceFolder('/repo'),
+				config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+				client: {
+					completeJson: async (request) => {
+						const userPrompt = request.messages?.find((message) => message.role === 'user')?.content ?? '';
+						if (userPrompt.includes('src/a.ts')) {
+							return `{"type":"final","result":{"findings":[{"hunkId":"${firstHunk.id}","severity":"warning","title":"A","explanation":"Risk A","recommendation":"Fix A"}]}}`;
+						}
+						return '{"type":"final","result":{"findings":"bad"}}';
+					},
+				},
+				language: 'en',
+				maxRounds: 64,
+				onFileComplete: (review) => {
+					completions.push(review);
+				},
+			});
+			assert.fail('Expected partial AI review failure.');
+		} catch (error) {
+			assert.ok(error instanceof AiReviewPartialError);
+			partial = error.review;
+		}
+
+		assert.ok(partial);
+		assert.strictEqual(completions.length, 1);
+		assert.strictEqual(completions[0].status, 'partial');
+		assert.deepStrictEqual(completions[0].completedFiles, [firstUri.toString()]);
+		assert.strictEqual(completions[0].findings[0].title, 'A');
+		assert.strictEqual(partial.status, 'partial');
+		assert.strictEqual(partial.failedFile, secondUri.toString());
+		assert.strictEqual(partial.findings[0].title, 'A');
+
+		const retryPrompts: string[] = [];
+		const retried = await new CodeReviewAgentService().review({
+			session,
+			root: workspaceFolder('/repo'),
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: {
+				completeJson: async (request) => {
+					retryPrompts.push(request.messages?.find((message) => message.role === 'user')?.content ?? '');
+					return `{"type":"final","result":{"findings":[{"hunkId":"${secondHunk.id}","severity":"info","title":"B","explanation":"Risk B","recommendation":"Fix B"}]}}`;
+				},
+			},
+			language: 'en',
+			existingReview: partial,
+			maxRounds: 'unlimited',
+		});
+
+		assert.deepStrictEqual(retryPrompts.map((prompt) => prompt.includes('src/b.ts')), [true]);
+		assert.strictEqual(retryPrompts.some((prompt) => prompt.includes('src/a.ts')), false);
+		assert.strictEqual(retried.status, 'complete');
+		assert.deepStrictEqual(retried.completedFiles, [firstUri.toString(), secondUri.toString()]);
+		assert.deepStrictEqual(retried.findings.map((finding) => finding.title), ['A', 'B']);
+	});
+
+	test('adds configured finding language instruction to AI review prompts', async () => {
+		const uri = vscode.Uri.file('/repo/src/app.ts');
+		const hunk = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
+		const file = reviewFileState(uri, 'src/app.ts', { hunks: [hunk] });
+		const session: ReviewSession = {
+			id: 'ai-review-language',
+			mode: 'git',
+			rootUri: vscode.Uri.file('/repo'),
+			createdAt: 1,
+			files: new Map([[uri.toString(), file]]),
+		};
+		const reviewWithLanguage = async (language: 'zh-CN' | 'en'): Promise<string> => {
+			let systemPrompt = '';
+			await new CodeReviewAgentService().review({
+				session,
+				root: workspaceFolder('/repo'),
+				config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+				client: {
+					completeJson: async (request) => {
+						systemPrompt = request.messages?.find((message) => message.role === 'system')?.content ?? '';
+						return '{"type":"final","result":{"findings":[]}}';
+					},
+				},
+				language,
+			});
+			return systemPrompt;
+		};
+
+		const zhPrompt = await reviewWithLanguage('zh-CN');
+		const enPrompt = await reviewWithLanguage('en');
+		assert.ok(zhPrompt.includes('Simplified Chinese'));
+		assert.ok(enPrompt.includes('English'));
+		assert.ok(zhPrompt.includes('Do not translate hunkId values'));
+		assert.ok(enPrompt.includes('Do not translate hunkId values'));
+		assert.ok(zhPrompt.includes('Keep finding title, explanation, and recommendation concise'));
+		assert.ok(enPrompt.includes('valid JSON string content'));
+		assert.ok(enPrompt.includes('replacementText replaces the entire current newText'));
+		assert.ok(enPrompt.includes('Do not create suggestions for delete hunks'));
+	});
+
+	test('stores AI code suggestions and file-level no-finding diagnostics', async () => {
+		const uri = vscode.Uri.file('/repo/src/app.ts');
+		const hunk = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
+		const session: ReviewSession = {
+			id: 'ai-review-suggestion',
+			mode: 'git',
+			rootUri: vscode.Uri.file('/repo'),
+			createdAt: 1,
+			files: new Map([[uri.toString(), reviewFileState(uri, 'src/app.ts', { hunks: [hunk] })]]),
+		};
+
+		const result = await new CodeReviewAgentService().review({
+			session,
+			root: workspaceFolder('/repo'),
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: {
+				completeJson: async () => `{"type":"final","result":{"findings":[],"suggestions":[{"hunkId":"${hunk.id}","replacementText":"better\\n","rationale":"Tighter implementation."}]}}`,
+			},
+			language: 'en',
+		});
+
+		assert.strictEqual(result.findings.length, 0);
+		assert.strictEqual(result.suggestions.length, 1);
+		assert.strictEqual(result.suggestions[0].replacementText, 'better\n');
+		assert.strictEqual(result.fileResults[0].acceptedFindingCount, 0);
+		assert.strictEqual(result.fileResults[0].acceptedSuggestionCount, 1);
+		assert.ok(result.fileResults[0].summary.includes('Model returned 0 findings.'));
+	});
+
+	test('drops AI code suggestions for delete chunks', () => {
+		const uri = vscode.Uri.file('/repo/src/deleted.ts');
+		const hunk = computeLineDiff(uri.toString(), 'old\n', '')[0];
+		const file = reviewFileState(uri, 'src/deleted.ts', { hunks: [hunk] });
+		const validation = validateReviewSuggestionsWithDiagnostics({
+			findings: [],
+			suggestions: [{ hunkId: hunk.id, replacementText: 'restore\n', rationale: 'Restore it.' }],
+		}, file);
+
+		assert.strictEqual(validation.suggestions.length, 0);
+		assert.strictEqual(validation.diagnostics.rawCount, 1);
+		assert.strictEqual(validation.diagnostics.dropped.length, 1);
+		assert.ok(validation.diagnostics.dropped[0].reason.includes('Delete chunks'));
 	});
 
 	test('drops findings that do not bind to a current pending hunk', () => {
@@ -1503,6 +2090,7 @@ function reviewFileState(
 		hunks: [],
 		acceptedHunks: [],
 		rejectedHunks: [],
+		appliedAiSuggestions: [],
 		originalText: '',
 		originalExists: true,
 		baselineExists: true,

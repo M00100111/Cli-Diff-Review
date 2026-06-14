@@ -56,8 +56,8 @@ export interface AgentRunOptions {
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
 	onTrace?: (event: AgentTraceEvent) => void;
-	maxRounds?: number;
-	maxToolCalls?: number;
+	maxRounds?: number | 'unlimited';
+	maxToolCalls?: number | 'unlimited';
 	maxToolResultChars?: number;
 	maxContextChars?: number;
 	maxRunMs?: number;
@@ -97,6 +97,7 @@ const deepSeekProtocolPrompt = [
 export class AgentRunner {
 	public async run(options: AgentRunOptions): Promise<AgentRunResult> {
 		const maxRounds = options.maxRounds ?? 12;
+		const unlimitedRounds = maxRounds === 'unlimited';
 		const maxToolCalls = options.maxToolCalls ?? 40;
 		const maxToolResultChars = options.maxToolResultChars ?? 300000;
 		const maxContextChars = options.maxContextChars ?? 800000;
@@ -136,7 +137,7 @@ export class AgentRunner {
 		});
 
 		try {
-			for (let round = 1; round <= maxRounds; round += 1) {
+			for (let round = 1; unlimitedRounds || round <= maxRounds; round += 1) {
 				throwIfAborted(signal);
 				if (Date.now() - startedAt > maxRunMs) {
 					throw new Error('Agent exceeded its runtime limit.');
@@ -161,7 +162,7 @@ export class AgentRunner {
 					return result;
 				}
 
-				if (toolCalls + response.calls.length > maxToolCalls) {
+				if (maxToolCalls !== 'unlimited' && toolCalls + response.calls.length > maxToolCalls) {
 					throw new Error('Agent exceeded its tool call limit.');
 				}
 				const results: Array<{ id: string; name: string; ok: boolean; result?: unknown; error?: string }> = [];
@@ -233,7 +234,7 @@ export class AgentRunner {
 					messages.push({ role: 'user', content });
 				}
 			}
-			throw new Error('Agent exceeded its round limit.');
+			throw new Error(`Agent exceeded its round limit (${maxRounds}).`);
 		} catch (error) {
 			const reportedError = timedOut ? new Error('Agent exceeded its runtime limit.') : error;
 			emitTrace(options, {
@@ -298,13 +299,9 @@ async function requestAgentRound(
 ): Promise<ValidAgentRound> {
 	let failure: unknown;
 	let preview = '';
-	for (let attempt = 0; attempt < 2; attempt += 1) {
-		const correction = attempt === 0 ? [] : [{
-			role: 'user' as const,
-			content: nativeTools
-				? 'Your previous response was invalid. Use a provided native function tool, or return only valid JSON exactly shaped as {"type":"final","result":{}}.'
-				: 'Your previous response was invalid. Return only valid JSON matching either the tool_calls or final JSON example from the system prompt.',
-		}];
+	let previousRawResponse = '';
+	for (let attempt = 0; attempt < 3; attempt += 1) {
+		const correction = attempt === 0 ? [] : [jsonCorrectionMessage(nativeTools, failure, previousRawResponse)];
 		const request = {
 			model: options.config.model,
 			messages: [...messages, ...correction],
@@ -330,7 +327,8 @@ async function requestAgentRound(
 			status: 'success',
 			details: completionDetails(completion),
 		});
-		preview = (completion.content || JSON.stringify(completion.toolCalls)).slice(0, 240);
+		previousRawResponse = completion.content || JSON.stringify(completion.toolCalls);
+		preview = previousRawResponse.slice(0, 240);
 		try {
 			const response = nativeTools ? validateNativeRound(completion, options.tools) : validateTextRound(completion);
 			emitTrace(options, {
@@ -358,7 +356,28 @@ async function requestAgentRound(
 		}
 	}
 	const reason = failure instanceof Error ? failure.message : String(failure);
-	throw new Error(`${providerName(options.config.provider)} model "${options.config.model}" did not return valid Agent JSON after one correction retry: ${reason}. Response preview: ${preview || '<empty>'}`);
+	throw new Error(`${providerName(options.config.provider)} model "${options.config.model}" did not return valid Agent JSON after two correction retries: ${reason}. Response preview: ${preview || '<empty>'}`);
+}
+
+function jsonCorrectionMessage(nativeTools: boolean, failure: unknown, previousRawResponse: string): LlmMessage {
+	const shape = nativeTools
+		? 'Use a provided native function tool, or return only valid JSON exactly shaped as {"type":"final","result":{}}.'
+		: 'Return only valid JSON matching either the tool_calls or final JSON example from the system prompt.';
+	return {
+		role: 'user',
+		content: [
+			'Your previous response was invalid JSON.',
+			`Parser error: ${errorMessage(failure)}`,
+			shape,
+			'Repair the same semantic result as one strict JSON object.',
+			'Escape all quotes, newlines, carriage returns, tabs, and backslashes inside JSON strings.',
+			'Do not use markdown fences, prose, comments, or trailing commas.',
+			'Previous raw response:',
+			'<response>',
+			previousRawResponse || '<empty>',
+			'</response>',
+		].join('\n'),
+	};
 }
 
 function validateTextRound(completion: LlmCompletion): ValidAgentRound {

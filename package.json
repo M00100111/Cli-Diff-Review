@@ -21,6 +21,9 @@
     "onCommand:cli-diff.acceptFile",
     "onCommand:cli-diff.rejectFile",
     "onCommand:cli-diff.undoFile",
+    "onCommand:cli-diff.acceptAll",
+    "onCommand:cli-diff.rejectAll",
+    "onCommand:cli-diff.undoAll",
     "onCommand:cli-diff.nextChange",
     "onCommand:cli-diff.previousChange",
     "onCommand:cli-diff.openReviewView",
@@ -75,6 +78,24 @@
       {
         "command": "cli-diff.undoFile",
         "title": "Undo File",
+        "category": "Cli Diff Review",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "cli-diff.acceptAll",
+        "title": "Accept All",
+        "category": "Cli Diff Review",
+        "icon": "$(check)"
+      },
+      {
+        "command": "cli-diff.rejectAll",
+        "title": "Reject All",
+        "category": "Cli Diff Review",
+        "icon": "$(close)"
+      },
+      {
+        "command": "cli-diff.undoAll",
+        "title": "Undo All",
         "category": "Cli Diff Review",
         "icon": "$(discard)"
       },
@@ -191,9 +212,24 @@
       ],
       "view/title": [
         {
-          "command": "cli-diff.refresh",
+          "command": "cli-diff.acceptAll",
           "when": "view == cli-diff.review",
           "group": "navigation@1"
+        },
+        {
+          "command": "cli-diff.rejectAll",
+          "when": "view == cli-diff.review",
+          "group": "navigation@2"
+        },
+        {
+          "command": "cli-diff.undoAll",
+          "when": "view == cli-diff.review",
+          "group": "navigation@3"
+        },
+        {
+          "command": "cli-diff.refresh",
+          "when": "view == cli-diff.review",
+          "group": "navigation@4"
         }
       ]
     },
@@ -247,6 +283,21 @@
           ],
           "default": "chunk",
           "description": "Ordering used for AI review findings in the Activity Bar."
+        },
+        "cliDiff.aiReviewLanguage": {
+          "type": "string",
+          "enum": [
+            "zh-CN",
+            "en"
+          ],
+          "default": "zh-CN",
+          "description": "AI review findings language."
+        },
+        "cliDiff.aiReviewMaxRounds": {
+          "type": "number",
+          "default": 64,
+          "minimum": 0,
+          "description": "Maximum AI Review agent rounds per file. 0 means unlimited."
         }
       }
     }

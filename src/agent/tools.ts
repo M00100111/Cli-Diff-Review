@@ -2,6 +2,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { gitIgnoredReviewPaths, normalizeReviewPath } from '../reviewFileFilter';
 import { decodeUtf8, encodeUtf8, isProbablyBinary, relativePath } from '../text';
+import { ReviewFileState, ReviewSession } from '../types';
 import { throwIfAborted } from '../wiki/cancellation';
 import { AgentTool } from './runtime';
 
@@ -11,6 +12,7 @@ export interface AgentToolOptions {
 	maxFiles?: number;
 	maxFileBytes?: number;
 	maxReadChars?: number;
+	reviewSession?: ReviewSession;
 }
 
 const protectedWikiFiles = new Set(['llm-code-wiki.md', '.state.json']);
@@ -32,7 +34,7 @@ export function createReadOnlyAgentTools(options: AgentToolOptions): AgentTool[]
 			return { files: await listWorkspaceFiles(options, signal) };
 		}),
 		tool('read_workspace_file', 'Read one source file. Arguments: {"path":"src/app.ts"}.', objectSchema({ path: stringSchema('Repository-relative source path.') }), async (args, signal) => {
-			return readTextFile(options, workspaceFileUri(options.root.uri, stringArgument(args, 'path')), signal);
+			return readWorkspaceFile(options, stringArgument(args, 'path'), signal);
 		}),
 		tool('search_workspace', 'Search readable source files for a literal text query. Arguments: {"query":"symbol","limit":50}.', objectSchema({
 			query: stringSchema('Literal text query.'),
@@ -118,6 +120,11 @@ async function listWorkspaceFiles(options: AgentToolOptions, signal?: AbortSigna
 		}
 		files.push(candidate);
 	}
+	for (const file of reviewSnapshotFiles(options)) {
+		if (!files.includes(file.relativePath)) {
+			files.push(file.relativePath);
+		}
+	}
 	return files.sort();
 }
 
@@ -151,6 +158,33 @@ async function listWikiEntries(
 	return files.sort();
 }
 
+async function readWorkspaceFile(options: AgentToolOptions, candidate: string, signal?: AbortSignal): Promise<{
+	path: string;
+	content: string;
+	truncated: boolean;
+	currentExists: boolean;
+	contentSource: 'workspace' | 'reviewNewText' | 'reviewOldText';
+}> {
+	const normalized = normalizeSafeRelativePath(candidate);
+	if (normalized.split('/').some((segment) => segment.startsWith('.'))) {
+		throw new Error('Source tools cannot read dot-path files.');
+	}
+	const reviewFile = reviewSnapshotFiles(options).find((file) => file.relativePath === normalized);
+	if (reviewFile) {
+		const text = reviewFile.currentExists ? reviewFile.newText : reviewFile.oldText;
+		const maxChars = options.maxReadChars ?? 50000;
+		return {
+			path: reviewFile.relativePath,
+			content: text.slice(0, maxChars),
+			truncated: text.length > maxChars,
+			currentExists: reviewFile.currentExists,
+			contentSource: reviewFile.currentExists ? 'reviewNewText' : 'reviewOldText',
+		};
+	}
+	const result = await readTextFile(options, workspaceFileUri(options.root.uri, normalized), signal);
+	return { ...result, currentExists: true, contentSource: 'workspace' };
+}
+
 async function readTextFile(options: AgentToolOptions, uri: vscode.Uri, signal?: AbortSignal): Promise<{ path: string; content: string; truncated: boolean }> {
 	throwIfAborted(signal);
 	const data = await vscode.workspace.fs.readFile(uri);
@@ -174,11 +208,8 @@ async function searchWorkspace(options: AgentToolOptions, query: string, limit: 
 	for (const candidate of await listWorkspaceFiles(options, signal)) {
 		throwIfAborted(signal);
 		try {
-			const data = await vscode.workspace.fs.readFile(workspaceFileUri(options.root.uri, candidate));
-			if (data.length > (options.maxFileBytes ?? 300000) || isProbablyBinary(data)) {
-				continue;
-			}
-			for (const [index, line] of decodeUtf8(data).split(/\r?\n/).entries()) {
+			const read = await readWorkspaceFile(options, candidate, signal);
+			for (const [index, line] of read.content.split(/\r?\n/).entries()) {
 				if (line.includes(query)) {
 					matches.push({ path: candidate, line: index + 1, text: line.slice(0, 500) });
 					if (matches.length >= Math.max(1, Math.min(limit, 200))) {
@@ -191,6 +222,14 @@ async function searchWorkspace(options: AgentToolOptions, query: string, limit: 
 		}
 	}
 	return { matches };
+}
+
+function reviewSnapshotFiles(options: AgentToolOptions): ReviewFileState[] {
+	return options.reviewSession
+		? [...options.reviewSession.files.values()]
+			.filter((file) => !file.relativePath.replace(/\\/g, '/').split('/').some((segment) => segment.startsWith('.')))
+			.sort((left, right) => left.relativePath.localeCompare(right.relativePath))
+		: [];
 }
 
 function tool(name: string, description: string, parameters: Record<string, unknown>, execute: AgentTool['execute']): AgentTool {

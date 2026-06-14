@@ -1,6 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { AiReviewStore, CodeReviewAgentService, CodeReviewTraceContext, sortFindings, sourcePendingFiles } from './agent/codeReview';
+import { AiReviewLanguage, AiReviewPartialError, AiReviewStore, CodeReviewAgentService, CodeReviewTraceContext, reviewChangeSignature, StoredAiReview, sortFindings, sourcePendingFiles } from './agent/codeReview';
 import type { AgentTraceEvent } from './agent/runtime';
 import { acceptHunkInBaseline, computeLineDiff } from './diffEngine';
 import { GitService } from './gitService';
@@ -34,7 +34,7 @@ import {
 } from './reviewState';
 import { SnapshotStore } from './snapshotStore';
 import { decodeUtf8, encodeUtf8, isProbablyBinary, lineRange, relativePath, replaceLineBlock, splitLines } from './text';
-import { FilePair, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewSession, ReviewSource, uriKey } from './types';
+import { AppliedAiSuggestion, FilePair, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewSession, ReviewSource, uriKey } from './types';
 import { isAbortError } from './wiki/cancellation';
 import { WikiInitializationService } from './wiki/wikiInitializer';
 
@@ -144,7 +144,9 @@ export class ReviewController implements vscode.Disposable {
 			vscode.workspace.onDidChangeConfiguration((event) => {
 				if (event.affectsConfiguration('cliDiff.reviewWikiChanges')) {
 					void this.refreshAll();
-				} else if (event.affectsConfiguration('cliDiff.aiReviewFindingOrder')) {
+				} else if (event.affectsConfiguration('cliDiff.aiReviewFindingOrder')
+					|| event.affectsConfiguration('cliDiff.aiReviewLanguage')
+					|| event.affectsConfiguration('cliDiff.aiReviewMaxRounds')) {
 					void this.refreshLlmWikiDashboardState();
 				}
 			}),
@@ -160,6 +162,9 @@ export class ReviewController implements vscode.Disposable {
 			this.registerCommand('cli-diff.acceptFile', (uri?: string | ReviewFileState) => this.acceptFile(uri)),
 			this.registerCommand('cli-diff.rejectFile', (uri?: string | ReviewFileState) => this.rejectFile(uri)),
 			this.registerCommand('cli-diff.undoFile', (uri?: string | ReviewFileState) => this.undoFile(uri)),
+			this.registerCommand('cli-diff.acceptAll', () => this.acceptAll()),
+			this.registerCommand('cli-diff.rejectAll', () => this.rejectAll()),
+			this.registerCommand('cli-diff.undoAll', () => this.undoAll()),
 			this.registerCommand('cli-diff.nextChange', (uri?: string, hunkId?: string) => this.navigateChange(1, uri, hunkId)),
 			this.registerCommand('cli-diff.previousChange', (uri?: string, hunkId?: string) => this.navigateChange(-1, uri, hunkId)),
 			this.registerCommand('cli-diff.openReviewView', (uri?: string) => this.openReviewView(uri)),
@@ -172,6 +177,8 @@ export class ReviewController implements vscode.Disposable {
 			this.registerCommand('cli-diff.generateAiReview', () => this.generateAiReview()),
 			this.registerCommand('cli-diff.openWikiIndex', () => this.openWikiIndex()),
 			this.registerCommand('cli-diff.openAiReviewFinding', (uri: string, hunkId: string) => this.openAiReviewFinding(uri, hunkId)),
+			this.registerCommand('cli-diff.applyAiSuggestion', (uri: string, hunkId: string, suggestionId: string) => this.applyAiSuggestion(uri, hunkId, suggestionId)),
+			this.registerCommand('cli-diff.undoAiSuggestion', (uri: string, hunkId: string, suggestionId: string) => this.undoAiSuggestion(uri, hunkId, suggestionId)),
 			this.registerCommand('cli-diff.cancelAgent', () => this.cancelCurrentAgent()),
 		);
 		void vscode.commands.executeCommand('setContext', 'cliDiff:hasSession', false);
@@ -381,6 +388,7 @@ export class ReviewController implements vscode.Disposable {
 				hunks: [],
 				acceptedHunks: [],
 				rejectedHunks: [],
+				appliedAiSuggestions: [],
 				originalText: pair.oldText,
 				originalExists: pair.baselineExists,
 				baselineExists: pair.baselineExists,
@@ -400,6 +408,7 @@ export class ReviewController implements vscode.Disposable {
 				hunks: [],
 				acceptedHunks: [],
 				rejectedHunks: [],
+				appliedAiSuggestions: [],
 				originalText: pair.oldText,
 				originalExists: pair.baselineExists,
 				baselineExists: pair.baselineExists,
@@ -417,6 +426,7 @@ export class ReviewController implements vscode.Disposable {
 			hunks: diff.hunks,
 			acceptedHunks: [],
 			rejectedHunks: [],
+			appliedAiSuggestions: [],
 			originalText: pair.oldText,
 			originalExists: pair.baselineExists,
 			baselineExists: pair.baselineExists,
@@ -435,6 +445,7 @@ export class ReviewController implements vscode.Disposable {
 			hunks: [],
 			acceptedHunks: [],
 			rejectedHunks: [],
+			appliedAiSuggestions: [],
 			originalText: text,
 			originalExists: true,
 			baselineExists: true,
@@ -501,6 +512,7 @@ export class ReviewController implements vscode.Disposable {
 				newLines: target.hunk.newLines,
 			}]);
 			this.recordDecisionHunk(target.file, target.hunk, 'accept', target.hunk.newStart, target.hunk.newLines, target.hunk.oldStart, target.hunk.newStart);
+			this.removePendingHunk(target.file, target.hunk);
 			this.syncBaselineExistsAfterAccept(target.file);
 			this.touchFileRevision(target.file);
 			if (this.activeSession?.mode === 'snapshot') {
@@ -550,6 +562,7 @@ export class ReviewController implements vscode.Disposable {
 					newLines: target.hunk.oldLines,
 				}]);
 				this.recordDecisionHunk(target.file, target.hunk, 'reject', target.hunk.oldStart, target.hunk.oldLines, target.hunk.oldStart, target.hunk.oldStart);
+				this.removePendingHunk(target.file, target.hunk);
 				this.touchFileRevision(target.file);
 				await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 				return;
@@ -583,6 +596,7 @@ export class ReviewController implements vscode.Disposable {
 				newLines: target.hunk.oldLines,
 			}]);
 			this.recordDecisionHunk(target.file, target.hunk, 'reject', target.hunk.newStart, target.hunk.oldLines, target.hunk.oldStart, target.hunk.newStart);
+			this.removePendingHunk(target.file, target.hunk);
 			this.touchFileRevision(target.file);
 			await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 		} catch (error) {
@@ -692,6 +706,8 @@ export class ReviewController implements vscode.Disposable {
 			for (const hunk of pendingHunks) {
 				this.recordDecisionHunk(file, hunk, 'accept', hunk.newStart, hunk.newLines, hunk.newStart, hunk.newStart);
 			}
+			file.hunks = [];
+			file.appliedAiSuggestions = [];
 			this.touchFileRevision(file);
 			if (this.activeSession?.mode === 'snapshot') {
 				await this.updateSnapshotBaselineFile(file);
@@ -744,6 +760,8 @@ export class ReviewController implements vscode.Disposable {
 			for (const hunk of pendingHunks) {
 				this.recordDecisionHunk(refreshedFile, hunk, 'reject', hunk.oldStart, hunk.oldLines, hunk.oldStart, hunk.oldStart);
 			}
+			refreshedFile.hunks = [];
+			refreshedFile.appliedAiSuggestions = [];
 			this.touchFileRevision(refreshedFile);
 
 			await this.writeCurrentFileText(refreshedFile.uri, currentText);
@@ -777,6 +795,94 @@ export class ReviewController implements vscode.Disposable {
 		} catch (error) {
 			this.showError(error);
 		}
+	}
+
+	private async acceptAll(): Promise<void> {
+		await this.applyBulkFileOperation('accept');
+	}
+
+	private async rejectAll(): Promise<void> {
+		await this.applyBulkFileOperation('reject');
+	}
+
+	private async undoAll(): Promise<void> {
+		await this.applyBulkFileOperation('undo');
+	}
+
+	private async applyBulkFileOperation(action: 'accept' | 'reject' | 'undo'): Promise<void> {
+		const targets = this.bulkFileTargets(action);
+		if (targets.length === 0) {
+			vscode.window.showInformationMessage(action === 'undo'
+				? 'No reviewed Cli Diff Review changes.'
+				: 'No pending Cli Diff Review changes.');
+			return;
+		}
+
+		const dirtyTargets = targets.filter((target) => this.isOpenDocumentDirty(target.file.uri));
+		if (dirtyTargets.length > 0) {
+			for (const target of dirtyTargets) {
+				this.reviewWebview.refresh(target.file.uri);
+			}
+			vscode.window.showInformationMessage('Save or revert target files before accepting, rejecting, or undoing all Cli Diff Review changes.');
+			return;
+		}
+
+		const chunkCount = targets.reduce((sum, target) => sum + target.chunkCount, 0);
+		const confirmationLabel = this.bulkConfirmationLabel(action);
+		const confirmed = await vscode.window.showWarningMessage(
+			this.bulkConfirmationMessage(action, targets.length, chunkCount),
+			{ modal: true },
+			confirmationLabel,
+		);
+		if (confirmed !== confirmationLabel) {
+			return;
+		}
+
+		for (const target of targets) {
+			await this.enqueueFileOperation(target.file.uri, async () => {
+				if (action === 'accept') {
+					await this.acceptFileCore(target.file);
+				} else if (action === 'reject') {
+					await this.rejectFileCore(target.file);
+				} else {
+					await this.undoFileCore(target.file);
+				}
+			});
+		}
+	}
+
+	private bulkFileTargets(action: 'accept' | 'reject' | 'undo'): Array<{ file: ReviewFileState; chunkCount: number }> {
+		if (!this.activeSession) {
+			return [];
+		}
+
+		return [...this.activeSession.files.values()]
+			.map((file) => ({
+				file,
+				chunkCount: action === 'undo' ? file.acceptedHunks.length + file.rejectedHunks.length : file.hunks.length,
+			}))
+			.filter((target) => target.chunkCount > 0)
+			.sort((left, right) => left.file.relativePath.localeCompare(right.file.relativePath));
+	}
+
+	private bulkConfirmationMessage(action: 'accept' | 'reject' | 'undo', fileCount: number, chunkCount: number): string {
+		if (action === 'accept') {
+			return `Accept all ${chunkCount} pending changes across ${fileCount} files?`;
+		}
+		if (action === 'reject') {
+			return `Reject all ${chunkCount} pending changes across ${fileCount} files? This will modify working files.`;
+		}
+		return `Undo all ${chunkCount} reviewed changes across ${fileCount} files? This will restore them to pending.`;
+	}
+
+	private bulkConfirmationLabel(action: 'accept' | 'reject' | 'undo'): string {
+		if (action === 'accept') {
+			return 'Accept All';
+		}
+		if (action === 'reject') {
+			return 'Reject All';
+		}
+		return 'Undo All';
 	}
 
 	private async saveEditedCurrent(uriString: string, editedText: string, editedRanges: EditedRange[]): Promise<void> {
@@ -1545,6 +1651,13 @@ export class ReviewController implements vscode.Disposable {
 				done: Promise.resolve(),
 			};
 			this.currentWikiTask = task;
+			const language = vscode.workspace.getConfiguration('cliDiff').get<AiReviewLanguage>('aiReviewLanguage', 'zh-CN');
+			const maxRounds = this.aiReviewMaxRounds();
+			const storedReview = this.aiReviewStore.load(session);
+			const existingReview = storedReview?.status === 'partial' ? storedReview : undefined;
+			if (!existingReview) {
+				await this.aiReviewStore.clear(session.rootUri);
+			}
 			this.startWikiRunLog({
 				kind: 'run_start',
 				title: 'AI review started',
@@ -1555,30 +1668,55 @@ export class ReviewController implements vscode.Disposable {
 					workspace: root.uri.fsPath,
 					provider: config.provider,
 					model: config.model,
+					language,
+					maxRounds: maxRounds === 'unlimited' ? 'unlimited' : maxRounds,
+					mode: existingReview ? 'continue' : 'generate',
+					completedFiles: existingReview?.completedFiles.length ?? 0,
 					files: files.map((file) => ({ uri: file.uri.toString(), relativePath: file.relativePath, chunks: file.hunks.length })),
 				})],
 			}, 'review');
 			this.applyLlmWikiDashboardState({ status: 'reviewing', progress: 'Preparing AI review', error: undefined });
-			task.done = this.runAiReview(task, config, createLlmClient(config), session);
+			task.done = this.runAiReview(task, config, createLlmClient(config), session, language, maxRounds, existingReview);
 			await task.done;
 		} catch (error) {
 			this.showError(error);
 		}
 	}
 
-	private async runAiReview(task: WikiInitializationTask, config: LlmRuntimeConfig, client: LlmClient, session: ReviewSession): Promise<void> {
+	private async runAiReview(
+		task: WikiInitializationTask,
+		config: LlmRuntimeConfig,
+		client: LlmClient,
+		session: ReviewSession,
+		language: AiReviewLanguage,
+		maxRounds: number | 'unlimited',
+		existingReview?: StoredAiReview,
+	): Promise<void> {
 		try {
 			const result = await this.codeReviewAgentService.review({
 				session,
 				root: task.root,
 				config,
 				client,
+				language,
+				existingReview,
+				maxRounds,
 				signal: task.abortController.signal,
 				onProgress: (message) => this.currentWikiTask === task
 					&& this.applyLlmWikiDashboardState({ status: 'reviewing', progress: message, error: undefined }),
 				onTrace: (event, context) => {
 					if (this.currentWikiTask === task) {
 						this.appendWikiRunLog(event, this.reviewRunLogMetadata(context));
+					}
+				},
+				onFileComplete: async (review) => {
+					if (this.currentWikiTask === task) {
+						await this.aiReviewStore.save(session, review);
+						await this.refreshLlmWikiDashboardState({
+							status: 'reviewing',
+							progress: `AI review progress: ${review.completedFiles.length} file${review.completedFiles.length === 1 ? '' : 's'} completed.`,
+							error: undefined,
+						});
 					}
 				},
 			});
@@ -1596,6 +1734,9 @@ export class ReviewController implements vscode.Disposable {
 			}
 		} catch (error) {
 			if (!isAbortError(error)) {
+				if (error instanceof AiReviewPartialError) {
+					await this.aiReviewStore.save(session, error.review);
+				}
 				this.showError(error);
 				this.appendWikiRunLog({
 					kind: 'run_error',
@@ -1648,12 +1789,113 @@ export class ReviewController implements vscode.Disposable {
 
 	private async openAiReviewFinding(uriString: string, hunkId: string): Promise<void> {
 		const file = this.activeSession?.files.get(uriKey(vscode.Uri.parse(uriString)));
-		const hunk = file?.hunks.find((candidate) => candidate.id === hunkId);
-		if (!file || !hunk) {
+		if (!file) {
 			return;
 		}
-		await this.reviewWebview.open(file.uri, { line: hunk.newStart, column: 0 });
+		const hunk = file.hunks.find((candidate) => candidate.id === hunkId);
+		const reviewed = hunk ? undefined : [...file.acceptedHunks, ...file.rejectedHunks]
+			.find((candidate) => candidate.id === hunkId || candidate.id.endsWith(`-${hunkId}`));
+		await this.reviewWebview.open(file.uri, { line: hunk?.newStart ?? reviewed?.displayStart ?? 0, column: 0 });
 		this.setCurrentReviewUri(file.uri);
+	}
+
+	private async applyAiSuggestion(uriString: string, hunkId: string, suggestionId: string): Promise<void> {
+		await this.enqueueFileOperation(this.operationUri(uriString), () => this.applyAiSuggestionCore(uriString, hunkId, suggestionId));
+	}
+
+	private async applyAiSuggestionCore(uriString: string, hunkId: string, suggestionId: string): Promise<void> {
+		try {
+			if (!this.activeSession) {
+				return;
+			}
+			const file = this.resolveFile(uriString);
+			const storedReview = this.aiReviewStore.load(this.activeSession);
+			const suggestion = storedReview?.suggestions.find((item) => item.id === suggestionId && item.uri === uriString && item.hunkId === hunkId);
+			const hunk = file?.hunks.find((item) => item.id === hunkId);
+			if (!file || !suggestion || !hunk) {
+				vscode.window.showInformationMessage('No AI suggestion selected.');
+				return;
+			}
+			if (hunk.kind === 'delete') {
+				vscode.window.showInformationMessage('AI code suggestions are not available for deleted chunks.');
+				return;
+			}
+			if (!this.ensureFileCleanForReviewMutation(file)) {
+				return;
+			}
+			const current = await this.readCurrentText(file.uri);
+			if (!current.exists || !this.originalHunkSideMatches(current.text, hunk, 'new', hunk.newStart)) {
+				await this.refreshFile(file.uri, { reconcileExternalChanges: false });
+				return;
+			}
+
+			const replacementText = suggestion.replacementText;
+			const currentText = replaceLineBlock(current.text, hunk.newStart, hunk.newLines, replacementText);
+			const updatedHunk = this.aiSuggestionHunk(hunk, currentText, replacementText);
+			await this.writeCurrentFileText(file.uri, currentText);
+			file.newText = currentText;
+			file.currentExists = true;
+			this.replacePendingHunkWithAppliedSuggestion(file, hunk, updatedHunk, {
+				suggestionId,
+				hunkId,
+				originalHunk: { ...hunk },
+				replacementText,
+				appliedHunk: { ...updatedHunk },
+				appliedAt: Date.now(),
+			});
+			this.touchFileRevision(file);
+			await this.saveAiReviewWithCurrentSignature(storedReview);
+			this.reviewWebview.refresh(file.uri);
+			await this.refreshLlmWikiDashboardState();
+		} catch (error) {
+			this.showError(error);
+		}
+	}
+
+	private async undoAiSuggestion(uriString: string, hunkId: string, suggestionId: string): Promise<void> {
+		await this.enqueueFileOperation(this.operationUri(uriString), () => this.undoAiSuggestionCore(uriString, hunkId, suggestionId));
+	}
+
+	private async undoAiSuggestionCore(uriString: string, hunkId: string, suggestionId: string): Promise<void> {
+		try {
+			if (!this.activeSession) {
+				return;
+			}
+			const file = this.resolveFile(uriString);
+			const applied = file?.appliedAiSuggestions.find((item) => item.suggestionId === suggestionId && item.hunkId === hunkId);
+			const hunk = file?.hunks.find((item) => item.id === hunkId);
+			if (!file || !applied || !hunk) {
+				vscode.window.showInformationMessage('No applied AI suggestion selected.');
+				return;
+			}
+			if (!this.ensureFileCleanForReviewMutation(file)) {
+				return;
+			}
+			const storedReview = this.aiReviewStore.load(this.activeSession);
+			const current = await this.readCurrentText(file.uri);
+			if (!current.exists || !this.lineBlockMatches(current.text, hunk.newStart, hunk.newLines, hunk.newText)) {
+				await this.refreshFile(file.uri, { reconcileExternalChanges: false });
+				return;
+			}
+
+			const restoredText = replaceLineBlock(current.text, hunk.newStart, hunk.newLines, applied.originalHunk.newText);
+			const restoredHunk = this.aiSuggestionHunk({
+				...applied.originalHunk,
+				newStart: hunk.newStart,
+				zoneAfterLineNumber: hunk.zoneAfterLineNumber,
+			}, restoredText, applied.originalHunk.newText);
+			await this.writeCurrentFileText(file.uri, restoredText);
+			file.newText = restoredText;
+			file.currentExists = true;
+			this.replacePendingHunkWithAppliedSuggestion(file, hunk, restoredHunk, undefined);
+			file.appliedAiSuggestions = file.appliedAiSuggestions.filter((item) => item.suggestionId !== suggestionId);
+			this.touchFileRevision(file);
+			await this.saveAiReviewWithCurrentSignature(storedReview);
+			this.reviewWebview.refresh(file.uri);
+			await this.refreshLlmWikiDashboardState();
+		} catch (error) {
+			this.showError(error);
+		}
 	}
 
 	private async openWikiIndex(): Promise<void> {
@@ -1680,6 +1922,14 @@ export class ReviewController implements vscode.Disposable {
 			vscode.window.showInformationMessage('Configure an LLM provider first.');
 		}
 		return config;
+	}
+
+	private aiReviewMaxRounds(): number | 'unlimited' {
+		const configured = vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewMaxRounds', 64);
+		if (configured === 0) {
+			return 'unlimited';
+		}
+		return Math.max(1, Math.floor(configured));
 	}
 
 	private hasPendingReviewChanges(): boolean {
@@ -1848,6 +2098,10 @@ export class ReviewController implements vscode.Disposable {
 			this.manualGitBaselines.delete(key);
 		}
 		file.hunks = diff.hunks;
+		file.appliedAiSuggestions = file.appliedAiSuggestions.filter((suggestion) => file.hunks.some((hunk) => (
+			hunk.id === suggestion.hunkId
+			&& hunk.newText === suggestion.appliedHunk.newText
+		)));
 		file.skippedReason = diff.skippedReason;
 		if (file.hunks.length === 0 && this.decisionHunks(file).length === 0 && !file.skippedReason && !this.manualGitBaselines.has(key)) {
 			this.activeSession.files.delete(key);
@@ -1952,6 +2206,8 @@ export class ReviewController implements vscode.Disposable {
 			runLog: update.runLog ?? this.wikiRunLog,
 			runLogSource: update.runLogSource ?? this.wikiRunLogSource,
 			reviewFindings: update.reviewFindings ?? this.llmWikiState.reviewFindings,
+			reviewSuggestions: update.reviewSuggestions ?? this.llmWikiState.reviewSuggestions,
+			aiReviewFileResults: update.aiReviewFileResults ?? this.llmWikiState.aiReviewFileResults,
 		};
 		this.dashboardProvider.refresh();
 	}
@@ -1962,12 +2218,24 @@ export class ReviewController implements vscode.Disposable {
 		const root = this.dashboardWikiRootFolder();
 		const wikiExists = root ? await this.wikiInitializationService.wikiExists(root.uri) : false;
 		const wikiState = root ? await this.wikiInitializationService.state(root.uri) : undefined;
-		const pendingSourceCount = sourcePendingFiles(this.activeSession).reduce((total, file) => total + file.hunks.length, 0);
+		const pendingSourceFiles = sourcePendingFiles(this.activeSession);
+		const pendingSourceCount = pendingSourceFiles.reduce((total, file) => total + file.hunks.length, 0);
 		const hasPending = this.hasPendingReviewChanges();
 		const storedReview = this.aiReviewStore.load(this.activeSession);
+		const aiReviewStatus = storedReview?.status ?? 'none';
+		const aiReviewCompletedFileCount = storedReview?.completedFiles.length ?? 0;
+		const aiReviewTotalFileCount = pendingSourceFiles.length;
 		const findingOrder = vscode.workspace.getConfiguration('cliDiff').get<'chunk' | 'severity'>('aiReviewFindingOrder', 'chunk');
 		const reviewFindings = storedReview && this.activeSession
 			? sortFindings(storedReview.findings, this.activeSession.files.values(), findingOrder)
+			: [];
+		const reviewSuggestions = storedReview
+			? [...storedReview.suggestions].sort((left, right) => left.relativePath.localeCompare(right.relativePath)
+				|| left.line - right.line
+				|| left.generationOrder - right.generationOrder)
+			: [];
+		const aiReviewFileResults = storedReview
+			? [...storedReview.fileResults].sort((left, right) => left.relativePath.localeCompare(right.relativePath))
 			: [];
 		const findings = this.currentReviewUri && this.activeSession
 			? sortFindings(
@@ -2015,6 +2283,12 @@ export class ReviewController implements vscode.Disposable {
 			runLog: update.runLog ?? this.wikiRunLog,
 			runLogSource: update.runLogSource ?? this.wikiRunLogSource,
 			reviewFindings: update.reviewFindings ?? reviewFindings,
+			reviewSuggestions: update.reviewSuggestions ?? reviewSuggestions,
+			aiReviewFileResults: update.aiReviewFileResults ?? aiReviewFileResults,
+			aiReviewStatus: update.aiReviewStatus ?? aiReviewStatus,
+			aiReviewCompletedFileCount: update.aiReviewCompletedFileCount ?? aiReviewCompletedFileCount,
+			aiReviewTotalFileCount: update.aiReviewTotalFileCount ?? aiReviewTotalFileCount,
+			aiReviewError: update.aiReviewError ?? storedReview?.error,
 		};
 		this.dashboardProvider.refresh();
 	}
@@ -2115,6 +2389,81 @@ export class ReviewController implements vscode.Disposable {
 		file.revision += 1;
 	}
 
+	private aiSuggestionHunk(base: ReviewHunk, fileText: string, replacementText: string): ReviewHunk {
+		const newLines = splitLines(replacementText).length;
+		const kind = base.oldLines === 0 ? 'add' : newLines === 0 ? 'delete' : 'modify';
+		const newContext = captureLineBlockContext(fileText, base.newStart, newLines);
+		return {
+			...base,
+			kind,
+			newLines,
+			newText: replacementText,
+			newContextBefore: newContext.before,
+			newContextAfter: newContext.after,
+			zoneAfterLineNumber: base.newStart,
+		};
+	}
+
+	private replacePendingHunkWithAppliedSuggestion(
+		file: ReviewFileState,
+		previousHunk: ReviewHunk,
+		nextHunk: ReviewHunk,
+		applied: AppliedAiSuggestion | undefined,
+	): void {
+		const delta = nextHunk.newLines - previousHunk.newLines;
+		file.hunks = file.hunks.map((hunk) => {
+			if (hunk.id === previousHunk.id) {
+				return nextHunk;
+			}
+			return hunk.newStart > previousHunk.newStart ? this.shiftPendingHunkNewSide(file, hunk, delta) : hunk;
+		});
+		file.appliedAiSuggestions = file.appliedAiSuggestions.map((item) => {
+			if (item.hunkId === previousHunk.id) {
+				return item;
+			}
+			if (item.appliedHunk.newStart <= previousHunk.newStart) {
+				return item;
+			}
+			const appliedHunk = this.shiftPendingHunkNewSide(file, item.appliedHunk, delta);
+			return { ...item, appliedHunk };
+		});
+		if (applied) {
+			file.appliedAiSuggestions = [
+				...file.appliedAiSuggestions.filter((item) => item.hunkId !== applied.hunkId),
+				applied,
+			];
+		}
+	}
+
+	private shiftPendingHunkNewSide(file: ReviewFileState, hunk: ReviewHunk, delta: number): ReviewHunk {
+		if (delta === 0) {
+			return hunk;
+		}
+		const newStart = Math.max(0, hunk.newStart + delta);
+		const newContext = captureLineBlockContext(file.newText, newStart, hunk.newLines);
+		return {
+			...hunk,
+			newStart,
+			zoneAfterLineNumber: newStart,
+			newContextBefore: newContext.before,
+			newContextAfter: newContext.after,
+		};
+	}
+
+	private async saveAiReviewWithCurrentSignature(review: StoredAiReview | undefined): Promise<void> {
+		if (!review || !this.activeSession) {
+			return;
+		}
+		await this.aiReviewStore.save(this.activeSession, {
+			...review,
+			signature: reviewChangeSignature(this.activeSession),
+			findings: [...review.findings],
+			suggestions: [...review.suggestions],
+			fileResults: [...review.fileResults],
+			completedFiles: [...review.completedFiles],
+		});
+	}
+
 	private isStaleMutation(file: ReviewFileState, expectedRevision?: number): boolean {
 		return isStaleRevision(file.revision, expectedRevision);
 	}
@@ -2141,6 +2490,7 @@ export class ReviewController implements vscode.Disposable {
 			hunks: file.hunks,
 			acceptedHunks: file.acceptedHunks,
 			rejectedHunks: file.rejectedHunks,
+			appliedAiSuggestions: file.appliedAiSuggestions,
 		});
 	}
 
@@ -2428,16 +2778,24 @@ export class ReviewController implements vscode.Disposable {
 		}
 	}
 
+	private removePendingHunk(file: ReviewFileState, hunk: ReviewHunk): void {
+		file.hunks = file.hunks.filter((item) => !this.isSameReviewHunk(item, hunk));
+		file.appliedAiSuggestions = file.appliedAiSuggestions.filter((item) => item.hunkId !== hunk.id);
+	}
+
+	private isSameReviewHunk(left: ReviewHunk, right: ReviewHunk): boolean {
+		return left.fileUri === right.fileUri
+			&& left.kind === right.kind
+			&& left.oldStart === right.oldStart
+			&& left.oldLines === right.oldLines
+			&& left.newStart === right.newStart
+			&& left.newLines === right.newLines
+			&& left.oldText === right.oldText
+			&& left.newText === right.newText;
+	}
+
 	private isSameDecision(decision: ReviewedHunk, hunk: ReviewHunk, reviewSource: ReviewSource): boolean {
-		return decision.reviewSource === reviewSource
-			&& decision.fileUri === hunk.fileUri
-			&& decision.kind === hunk.kind
-			&& decision.oldStart === hunk.oldStart
-			&& decision.oldLines === hunk.oldLines
-			&& decision.newStart === hunk.newStart
-			&& decision.newLines === hunk.newLines
-			&& decision.oldText === hunk.oldText
-			&& decision.newText === hunk.newText;
+		return decision.reviewSource === reviewSource && this.isSameReviewHunk(decision, hunk);
 	}
 
 	private createDecisionHunk(

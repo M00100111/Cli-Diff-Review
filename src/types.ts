@@ -39,6 +39,15 @@ export interface ReviewedHunk extends ReviewHunk {
 	reviewedAt: number;
 }
 
+export interface AppliedAiSuggestion {
+	suggestionId: string;
+	hunkId: string;
+	originalHunk: ReviewHunk;
+	replacementText: string;
+	appliedHunk: ReviewHunk;
+	appliedAt: number;
+}
+
 export interface ReviewFileState {
 	uri: vscode.Uri;
 	relativePath: string;
@@ -47,6 +56,7 @@ export interface ReviewFileState {
 	hunks: ReviewHunk[];
 	acceptedHunks: ReviewedHunk[];
 	rejectedHunks: ReviewedHunk[];
+	appliedAiSuggestions: AppliedAiSuggestion[];
 	originalText: string;
 	originalExists: boolean;
 	baselineExists: boolean;

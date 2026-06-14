@@ -52,18 +52,24 @@ export function shouldMergeReviewedFileOnRefresh(
 }
 
 export function manualGitBaselineFromReviewedFile(file: ReviewFileState): GitManualBaseline | undefined {
-	if ((!file.currentExists && file.acceptedHunks.length === 0) || !shouldMergeReviewedFileOnRefresh(
-		file.hunks.length,
-		file.acceptedHunks.length,
-		file.rejectedHunks.length,
-		file.skippedReason,
-	)) {
+	if (file.skippedReason || (!file.currentExists && file.acceptedHunks.length === 0)) {
+		return undefined;
+	}
+
+	if (shouldMergeReviewedFileOnRefresh(file.hunks.length, file.acceptedHunks.length, file.rejectedHunks.length)) {
+		return {
+			oldText: file.newText,
+			baselineExists: file.currentExists,
+		};
+	}
+
+	if (file.acceptedHunks.length === 0) {
 		return undefined;
 	}
 
 	return {
-		oldText: file.newText,
-		baselineExists: file.currentExists,
+		oldText: file.oldText,
+		baselineExists: file.baselineExists,
 	};
 }
 
