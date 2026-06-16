@@ -34,7 +34,22 @@ import {
 } from './reviewState';
 import { SnapshotStore } from './snapshotStore';
 import { decodeUtf8, encodeUtf8, isProbablyBinary, lineRange, relativePath, replaceLineBlock, splitLines } from './text';
-import { AppliedAiSuggestion, FilePair, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewSession, ReviewSource, uriKey } from './types';
+import {
+	AppliedAiSuggestion,
+	currentReviewProject,
+	FilePair,
+	hasAggregateReviewTarget,
+	projectReviewSession,
+	ReviewedHunk,
+	ReviewFileState,
+	ReviewHunk,
+	ReviewProject,
+	reviewProjectFolder,
+	ReviewSession,
+	ReviewSource,
+	uriKey,
+	visibleReviewFiles,
+} from './types';
 import { isAbortError } from './wiki/cancellation';
 import { WikiInitializationService } from './wiki/wikiInitializer';
 
@@ -42,7 +57,7 @@ type InternalWriteSource = 'plugin' | 'human';
 
 type GitSessionRefreshRequest =
 	| { source: 'manual' }
-	| { source: 'gitIndexChanged'; indexStateSignature: string };
+	| { source: 'gitIndexChanged' };
 
 interface ReviewNavigationTarget extends vscode.QuickPickItem {
 	uri: vscode.Uri;
@@ -80,7 +95,7 @@ export class ReviewController implements vscode.Disposable {
 	private readonly fileOperationQueue = new SerialOperationQueue<string>();
 	private readonly manualGitBaselines = new Map<string, GitManualBaseline>();
 	private gitRefreshTimer: NodeJS.Timeout | undefined;
-	private gitIndexStateSignature: string | undefined;
+	private readonly gitIndexStateSignatures = new Map<string, string>();
 	private currentReviewUri: vscode.Uri | undefined;
 	private activeSession: ReviewSession | undefined;
 	private wikiRunLog: LlmWikiRunLogEntry[] = [];
@@ -165,6 +180,7 @@ export class ReviewController implements vscode.Disposable {
 			this.registerCommand('cli-diff.acceptAll', () => this.acceptAll()),
 			this.registerCommand('cli-diff.rejectAll', () => this.rejectAll()),
 			this.registerCommand('cli-diff.undoAll', () => this.undoAll()),
+			this.registerCommand('cli-diff.selectTrackingTarget', () => this.selectTrackingTarget()),
 			this.registerCommand('cli-diff.nextChange', (uri?: string, hunkId?: string) => this.navigateChange(1, uri, hunkId)),
 			this.registerCommand('cli-diff.previousChange', (uri?: string, hunkId?: string) => this.navigateChange(-1, uri, hunkId)),
 			this.registerCommand('cli-diff.openReviewView', (uri?: string) => this.openReviewView(uri)),
@@ -317,8 +333,11 @@ export class ReviewController implements vscode.Disposable {
 				return;
 			}
 
-			const pairs = await this.gitService.createFilePairs(folder);
-			await this.startSession('git', pairs, folder.uri);
+			const projects = await this.gitService.discoverProjects(folder);
+			if (projects.length === 0) {
+				throw new Error('No Git project found in the workspace root or its direct child folders.');
+			}
+			await this.startSession('git', await this.createProjectFilePairs(projects), folder.uri, true, projects);
 		} catch (error) {
 			this.showError(error);
 		}
@@ -332,8 +351,11 @@ export class ReviewController implements vscode.Disposable {
 		const folders = vscode.workspace.workspaceFolders ?? [];
 		for (const folder of folders) {
 			try {
-				const pairs = await this.gitService.createFilePairs(folder);
-				await this.startSession('git', pairs, folder.uri, false);
+				const projects = await this.gitService.discoverProjects(folder);
+				if (projects.length === 0) {
+					continue;
+				}
+				await this.startSession('git', await this.createProjectFilePairs(projects), folder.uri, false, projects);
 				await this.ensureVisibleEditorsReviewed();
 				return;
 			} catch {
@@ -342,7 +364,13 @@ export class ReviewController implements vscode.Disposable {
 		}
 	}
 
-	private async startSession(mode: 'git' | 'snapshot', pairs: FilePair[], rootUri?: vscode.Uri, notify = true): Promise<void> {
+	private async startSession(
+		mode: 'git' | 'snapshot',
+		pairs: FilePair[],
+		rootUri?: vscode.Uri,
+		notify = true,
+		projects?: ReviewProject[],
+	): Promise<void> {
 		const workspaceRoot = rootUri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
 		if (!workspaceRoot) {
 			throw new Error('Open a workspace folder before starting a review.');
@@ -363,11 +391,13 @@ export class ReviewController implements vscode.Disposable {
 			rootUri: workspaceRoot,
 			createdAt: Date.now(),
 			files,
+			projects,
+			trackingTarget: mode === 'git' ? await this.restoredTrackingTarget(workspaceRoot, projects ?? []) : undefined,
 		};
 		if (mode === 'git') {
-			await this.updateGitIndexStateSignature();
+			await this.updateGitIndexStateSignatures();
 		} else {
-			this.gitIndexStateSignature = undefined;
+			this.gitIndexStateSignatures.clear();
 		}
 
 		await vscode.commands.executeCommand('setContext', 'cliDiff:hasSession', true);
@@ -378,11 +408,104 @@ export class ReviewController implements vscode.Disposable {
 		}
 	}
 
+	private async initializeGitSessionForFolder(folder: vscode.WorkspaceFolder): Promise<void> {
+		const projects = await this.gitService.discoverProjects(folder);
+		if (projects.length === 0) {
+			return;
+		}
+		await this.startSession('git', await this.createProjectFilePairs(projects), folder.uri, false, projects);
+	}
+
+	private async createProjectFilePairs(projects: ReviewProject[]): Promise<FilePair[]> {
+		const pairs: FilePair[] = [];
+		for (const [index, project] of projects.entries()) {
+			const projectPairs = await this.gitService.createFilePairs(reviewProjectFolder(project, index));
+			pairs.push(...projectPairs.map((pair) => ({
+				...pair,
+				projectId: project.id,
+				projectName: project.name,
+			})));
+		}
+		return pairs;
+	}
+
+	private async restoredTrackingTarget(rootUri: vscode.Uri, projects: ReviewProject[]): Promise<ReviewSession['trackingTarget']> {
+		if (projects.length === 0) {
+			return undefined;
+		}
+		if (projects.some((project) => uriKey(project.rootUri) === uriKey(rootUri))) {
+			return projects[0] ? { kind: 'project', projectId: projects[0].id } : undefined;
+		}
+		const savedProjectId = this.context.workspaceState.get<string>(trackingTargetStorageKey(rootUri));
+		return savedProjectId && projects.some((project) => project.id === savedProjectId)
+			? { kind: 'project', projectId: savedProjectId }
+			: { kind: 'aggregate' };
+	}
+
+	private async ensureTrackingTargetAvailable(): Promise<void> {
+		const session = this.activeSession;
+		if (!session || session.mode !== 'git') {
+			return;
+		}
+		const projects = session.projects ?? [];
+		if (projects.length === 0) {
+			session.trackingTarget = undefined;
+			return;
+		}
+		if (!hasAggregateReviewTarget(session)) {
+			session.trackingTarget = projects[0] ? { kind: 'project', projectId: projects[0].id } : undefined;
+			return;
+		}
+		if (!session.trackingTarget) {
+			session.trackingTarget = { kind: 'aggregate' };
+			return;
+		}
+		const selectedProjectId = session.trackingTarget?.kind === 'project' ? session.trackingTarget.projectId : undefined;
+		if (selectedProjectId && !projects.some((project) => project.id === selectedProjectId)) {
+			session.trackingTarget = { kind: 'aggregate' };
+			await this.context.workspaceState.update(trackingTargetStorageKey(session.rootUri), undefined);
+		}
+	}
+
+	private async selectTrackingTarget(): Promise<void> {
+		const session = this.activeSession;
+		if (!session || !hasAggregateReviewTarget(session) || this.currentWikiTask) {
+			return;
+		}
+		const currentProject = currentReviewProject(session);
+		const picked = await vscode.window.showQuickPick([
+			{
+				label: path.basename(session.rootUri.fsPath),
+				description: 'All projects',
+				projectId: undefined,
+				picked: session.trackingTarget?.kind === 'aggregate',
+			},
+			...(session.projects ?? []).map((project) => ({
+				label: project.name,
+				description: project.rootUri.fsPath,
+				projectId: project.id,
+				picked: currentProject?.id === project.id,
+			})),
+		], { placeHolder: 'Select the project tracked by Cli Diff Review' });
+		if (!picked) {
+			return;
+		}
+
+		session.trackingTarget = picked.projectId ? { kind: 'project', projectId: picked.projectId } : { kind: 'aggregate' };
+		await this.context.workspaceState.update(trackingTargetStorageKey(session.rootUri), picked.projectId);
+		if (this.currentReviewUri && !visibleReviewFiles(session).some((file) => uriKey(file.uri) === uriKey(this.currentReviewUri as vscode.Uri))) {
+			this.currentReviewUri = undefined;
+		}
+		this.refreshUi();
+	}
+
 	private createFileState(pair: FilePair): ReviewFileState {
 		if (pair.skippedReason) {
 			return {
 				uri: pair.uri,
 				relativePath: pair.relativePath,
+				projectId: pair.projectId,
+				projectName: pair.projectName,
 				oldText: pair.oldText,
 				newText: pair.newText,
 				hunks: [],
@@ -403,6 +526,8 @@ export class ReviewController implements vscode.Disposable {
 			return {
 				uri: pair.uri,
 				relativePath: pair.relativePath,
+				projectId: pair.projectId,
+				projectName: pair.projectName,
 				oldText: pair.oldText,
 				newText: pair.newText,
 				hunks: [],
@@ -421,6 +546,8 @@ export class ReviewController implements vscode.Disposable {
 		return {
 			uri: pair.uri,
 			relativePath: pair.relativePath,
+			projectId: pair.projectId,
+			projectName: pair.projectName,
 			oldText: pair.oldText,
 			newText: pair.newText,
 			hunks: diff.hunks,
@@ -436,10 +563,13 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private createManualBaselineFileState(uri: vscode.Uri, text: string): ReviewFileState {
-		const rootUri = this.activeSession?.rootUri ?? vscode.workspace.getWorkspaceFolder(uri)?.uri ?? vscode.Uri.file(path.dirname(uri.fsPath));
+		const project = this.gitProjectForUri(uri);
+		const rootUri = project?.rootUri ?? this.activeSession?.rootUri ?? vscode.workspace.getWorkspaceFolder(uri)?.uri ?? vscode.Uri.file(path.dirname(uri.fsPath));
 		return {
 			uri,
 			relativePath: relativePath(rootUri, uri),
+			projectId: project?.id,
+			projectName: project?.name,
 			oldText: text,
 			newText: text,
 			hunks: [],
@@ -460,16 +590,9 @@ export class ReviewController implements vscode.Disposable {
 		}
 
 		const folder = vscode.workspace.getWorkspaceFolder(uri);
-		this.manualGitBaselines.clear();
-		this.activeSession = {
-			id: `git-${Date.now()}`,
-			mode: 'git',
-			rootUri: folder?.uri ?? vscode.Uri.file(path.dirname(uri.fsPath)),
-			createdAt: Date.now(),
-			files: new Map<string, ReviewFileState>(),
-		};
-		await this.updateGitIndexStateSignature();
-		await vscode.commands.executeCommand('setContext', 'cliDiff:hasSession', true);
+		if (folder) {
+			await this.initializeGitSessionForFolder(folder);
+		}
 	}
 
 	private async acceptChange(uriString?: string, hunkId?: string, expectedRevision?: number): Promise<void> {
@@ -856,7 +979,7 @@ export class ReviewController implements vscode.Disposable {
 			return [];
 		}
 
-		return [...this.activeSession.files.values()]
+		return visibleReviewFiles(this.activeSession)
 			.map((file) => ({
 				file,
 				chunkCount: action === 'undo' ? file.acceptedHunks.length + file.rejectedHunks.length : file.hunks.length,
@@ -1304,6 +1427,7 @@ export class ReviewController implements vscode.Disposable {
 		await this.ensureVisibleEditorsReviewed();
 
 		if (!this.activeSession) {
+			this.closeCompletedReviewEditorsAfterManualRefresh();
 			return;
 		}
 
@@ -1313,6 +1437,7 @@ export class ReviewController implements vscode.Disposable {
 				await this.deleteRejectedCurrentFileOnRefresh(file);
 			}
 			await this.refreshGitSessionFiles({ source: 'manual' });
+			this.closeCompletedReviewEditorsAfterManualRefresh();
 			return;
 		}
 
@@ -1329,6 +1454,18 @@ export class ReviewController implements vscode.Disposable {
 				await this.mergeReviewedSnapshotFileOnRefresh(refreshedFile);
 			}
 		}
+		this.closeCompletedReviewEditorsAfterManualRefresh();
+	}
+
+	private closeCompletedReviewEditorsAfterManualRefresh(): void {
+		const closedKeys = new Set(this.reviewWebview.closeCompleted().map(uriKey));
+		if (!this.currentReviewUri || !closedKeys.has(uriKey(this.currentReviewUri))) {
+			return;
+		}
+
+		this.currentReviewUri = undefined;
+		this.dashboardProvider.refresh();
+		void this.refreshLlmWikiDashboardState();
 	}
 
 	private async saveLlmWikiConfig(input: LlmConfigInput): Promise<void> {
@@ -1358,7 +1495,11 @@ export class ReviewController implements vscode.Disposable {
 				return;
 			}
 
-			const root = await this.pickWorkspaceFolder('Select a workspace folder for LLM Code Wiki');
+			const projectRoot = await this.pickAgentProjectFolder(
+				'Select a project for LLM Code Wiki initialization',
+				async (project) => (await this.wikiInitializationService.state(project.rootUri))?.status !== 'ready',
+			);
+			const root = this.hasGitProjects() ? projectRoot : await this.pickWorkspaceFolder('Select a workspace folder for LLM Code Wiki');
 			if (!root) {
 				await this.refreshLlmWikiDashboardState();
 				return;
@@ -1545,11 +1686,20 @@ export class ReviewController implements vscode.Disposable {
 		}
 		try {
 			const config = await this.requireLlmConfig();
-			const root = await this.pickWorkspaceFolder('Select a workspace folder for LLM Code Wiki update');
+			const projectRoot = await this.pickAgentProjectFolder(
+				'Select a project for LLM Code Wiki update',
+				async (project) => {
+					const session = this.projectSession(project);
+					return (await this.wikiInitializationService.state(project.rootUri))?.status === 'ready'
+						&& !sourcePendingFiles(session).length
+						&& await this.wikiInitializationService.needsUpdate(reviewProjectFolder(project));
+				},
+			);
+			const root = this.hasGitProjects() ? projectRoot : await this.pickWorkspaceFolder('Select a workspace folder for LLM Code Wiki update');
 			if (!config || !root) {
 				return;
 			}
-			if (this.hasPendingReviewChanges()) {
+			if (this.hasPendingReviewChangesForRoot(root.uri)) {
 				vscode.window.showInformationMessage('Finish all pending review changes before updating LLM Code Wiki.');
 				return;
 			}
@@ -1633,14 +1783,24 @@ export class ReviewController implements vscode.Disposable {
 		}
 		try {
 			const config = await this.requireLlmConfig();
-			const session = this.activeSession;
+			const project = await this.pickAgentProject(
+				'Select a project for AI review',
+				(candidate) => Promise.resolve(sourcePendingFiles(this.projectSession(candidate)).length > 0),
+			);
+			if (this.hasGitProjects() && !project) {
+				vscode.window.showInformationMessage('No pending source chunks to review in the selected project.');
+				return;
+			}
+			const session = project ? this.projectSession(project) : this.visibleReviewSession();
 			const files = session ? sourcePendingFiles(session) : [];
 			if (!config || !session || files.length === 0) {
 				vscode.window.showInformationMessage('No pending source chunks to review.');
 				return;
 			}
-			const root = vscode.workspace.getWorkspaceFolder(session.rootUri)
-				?? vscode.workspace.workspaceFolders?.find((folder) => uriKey(folder.uri) === uriKey(session.rootUri));
+			const root = project
+				? reviewProjectFolder(project)
+				: vscode.workspace.getWorkspaceFolder(session.rootUri)
+					?? vscode.workspace.workspaceFolders?.find((folder) => uriKey(folder.uri) === uriKey(session.rootUri));
 			if (!root) {
 				throw new Error('The active review workspace is not available.');
 			}
@@ -1809,7 +1969,8 @@ export class ReviewController implements vscode.Disposable {
 				return;
 			}
 			const file = this.resolveFile(uriString);
-			const storedReview = this.aiReviewStore.load(this.activeSession);
+			const reviewSession = file ? this.sessionForFile(file) : undefined;
+			const storedReview = this.aiReviewStore.load(reviewSession);
 			const suggestion = storedReview?.suggestions.find((item) => item.id === suggestionId && item.uri === uriString && item.hunkId === hunkId);
 			const hunk = file?.hunks.find((item) => item.id === hunkId);
 			if (!file || !suggestion || !hunk) {
@@ -1844,7 +2005,7 @@ export class ReviewController implements vscode.Disposable {
 				appliedAt: Date.now(),
 			});
 			this.touchFileRevision(file);
-			await this.saveAiReviewWithCurrentSignature(storedReview);
+			await this.saveAiReviewWithCurrentSignature(storedReview, reviewSession);
 			this.reviewWebview.refresh(file.uri);
 			await this.refreshLlmWikiDashboardState();
 		} catch (error) {
@@ -1871,7 +2032,8 @@ export class ReviewController implements vscode.Disposable {
 			if (!this.ensureFileCleanForReviewMutation(file)) {
 				return;
 			}
-			const storedReview = this.aiReviewStore.load(this.activeSession);
+			const reviewSession = this.sessionForFile(file);
+			const storedReview = this.aiReviewStore.load(reviewSession);
 			const current = await this.readCurrentText(file.uri);
 			if (!current.exists || !this.lineBlockMatches(current.text, hunk.newStart, hunk.newLines, hunk.newText)) {
 				await this.refreshFile(file.uri, { reconcileExternalChanges: false });
@@ -1890,7 +2052,7 @@ export class ReviewController implements vscode.Disposable {
 			this.replacePendingHunkWithAppliedSuggestion(file, hunk, restoredHunk, undefined);
 			file.appliedAiSuggestions = file.appliedAiSuggestions.filter((item) => item.suggestionId !== suggestionId);
 			this.touchFileRevision(file);
-			await this.saveAiReviewWithCurrentSignature(storedReview);
+			await this.saveAiReviewWithCurrentSignature(storedReview, reviewSession);
 			this.reviewWebview.refresh(file.uri);
 			await this.refreshLlmWikiDashboardState();
 		} catch (error) {
@@ -1899,7 +2061,11 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private async openWikiIndex(): Promise<void> {
-		const root = this.dashboardWikiRootFolder();
+		const projectRoot = await this.pickAgentProjectFolder(
+			'Select a project Wiki to open',
+			async (project) => this.wikiInitializationService.wikiExists(project.rootUri),
+		);
+		const root = this.hasGitProjects() ? projectRoot : this.dashboardWikiRootFolder();
 		if (!root) {
 			vscode.window.showInformationMessage('Open a workspace folder before opening the Wiki.');
 			return;
@@ -1913,6 +2079,94 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 		await vscode.commands.executeCommand('vscode.open', indexUri);
+	}
+
+	private visibleReviewSession(): ReviewSession | undefined {
+		const session = this.activeSession;
+		const project = currentReviewProject(session);
+		return session && project ? projectReviewSession(session, project) : session;
+	}
+
+	private dashboardStoredAiReview(): StoredAiReview | undefined {
+		const session = this.activeSession;
+		if (!session) {
+			return undefined;
+		}
+		if (session.mode !== 'git' || session.trackingTarget?.kind !== 'aggregate' || !session.projects?.length) {
+			return this.aiReviewStore.load(this.visibleReviewSession());
+		}
+		const reviews = session.projects
+			.map((project) => this.aiReviewStore.load(projectReviewSession(session, project)))
+			.filter((review): review is StoredAiReview => Boolean(review));
+		if (reviews.length === 0) {
+			return undefined;
+		}
+		return {
+			signature: reviews.map((review) => review.signature).join('\n'),
+			findings: reviews.flatMap((review) => review.findings),
+			suggestions: reviews.flatMap((review) => review.suggestions),
+			fileResults: reviews.flatMap((review) => review.fileResults),
+			generatedAt: reviews.map((review) => review.generatedAt).sort().at(-1) ?? new Date(0).toISOString(),
+			status: reviews.every((review) => review.status === 'complete') ? 'complete' : 'partial',
+			completedFiles: reviews.flatMap((review) => review.completedFiles),
+			failedFile: reviews.find((review) => review.failedFile)?.failedFile,
+			error: reviews.find((review) => review.error)?.error,
+		};
+	}
+
+	private projectSession(project: ReviewProject): ReviewSession | undefined {
+		return this.activeSession ? projectReviewSession(this.activeSession, project) : undefined;
+	}
+
+	private async pickAgentProject(
+		placeHolder: string,
+		isEligible: (project: ReviewProject) => Promise<boolean>,
+	): Promise<ReviewProject | undefined> {
+		const session = this.activeSession;
+		if (!session || session.mode !== 'git' || !session.projects?.length) {
+			return undefined;
+		}
+		const selected = currentReviewProject(session);
+		if (selected) {
+			if (await isEligible(selected)) {
+				return selected;
+			}
+			vscode.window.showInformationMessage(`${selected.name} is not currently eligible for this action.`);
+			return undefined;
+		}
+		const eligible: ReviewProject[] = [];
+		for (const project of session.projects) {
+			if (await isEligible(project)) {
+				eligible.push(project);
+			}
+		}
+		if (eligible.length === 0) {
+			vscode.window.showInformationMessage('No project is currently eligible for this action.');
+			return undefined;
+		}
+		const picked = await vscode.window.showQuickPick(eligible.map((project) => ({
+			label: project.name,
+			description: project.rootUri.fsPath,
+			project,
+		})), { placeHolder });
+		return picked?.project;
+	}
+
+	private async pickAgentProjectFolder(
+		placeHolder: string,
+		isEligible: (project: ReviewProject) => Promise<boolean>,
+	): Promise<vscode.WorkspaceFolder | undefined> {
+		const project = await this.pickAgentProject(placeHolder, isEligible);
+		return project ? reviewProjectFolder(project) : undefined;
+	}
+
+	private hasGitProjects(): boolean {
+		return this.activeSession?.mode === 'git' && Boolean(this.activeSession.projects?.length);
+	}
+
+	private hasPendingReviewChangesForRoot(rootUri: vscode.Uri): boolean {
+		const project = this.activeSession?.projects?.find((candidate) => uriKey(candidate.rootUri) === uriKey(rootUri));
+		return project ? sourcePendingFiles(this.projectSession(project)).length > 0 : this.hasPendingReviewChanges();
 	}
 
 	private async requireLlmConfig(): Promise<LlmRuntimeConfig | undefined> {
@@ -1933,7 +2187,7 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private hasPendingReviewChanges(): boolean {
-		return Boolean(this.activeSession && [...this.activeSession.files.values()].some((file) => file.hunks.length > 0));
+		return visibleReviewFiles(this.activeSession).some((file) => file.hunks.length > 0);
 	}
 
 	private async mergeReviewedSnapshotFileOnRefresh(file: ReviewFileState): Promise<void> {
@@ -1964,8 +2218,8 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 
-		const folder = this.activeGitWorkspaceFolder();
-		if (!folder) {
+		const workspaceRoot = this.activeGitWorkspaceFolder();
+		if (!workspaceRoot) {
 			return;
 		}
 
@@ -1975,7 +2229,8 @@ export class ReviewController implements vscode.Disposable {
 		} else {
 			this.manualGitBaselines.clear();
 		}
-		const pairs = await this.gitService.createFilePairs(folder);
+		const projects = await this.gitService.discoverProjects(workspaceRoot);
+		const pairs = await this.createProjectFilePairs(projects);
 		const nextFiles = new Map<string, ReviewFileState>();
 		const seenKeys = new Set<string>();
 		for (const pair of pairs) {
@@ -2003,9 +2258,9 @@ export class ReviewController implements vscode.Disposable {
 			this.pruneManualGitBaselines(seenKeys);
 		}
 		this.activeSession.files = nextFiles;
-		this.gitIndexStateSignature = request.source === 'gitIndexChanged'
-			? request.indexStateSignature
-			: await this.gitService.indexStateSignature(folder);
+		this.activeSession.projects = projects;
+		await this.ensureTrackingTargetAvailable();
+		await this.updateGitIndexStateSignatures();
 		this.refreshUi();
 	}
 
@@ -2216,18 +2471,29 @@ export class ReviewController implements vscode.Disposable {
 		this.llmConfigState = await this.llmConfigStore.savedConfig();
 		const workspaceAvailable = Boolean(vscode.workspace.workspaceFolders?.length);
 		const root = this.dashboardWikiRootFolder();
-		const wikiExists = root ? await this.wikiInitializationService.wikiExists(root.uri) : false;
+		const aggregateProjects = this.activeSession?.mode === 'git' && this.activeSession.trackingTarget?.kind === 'aggregate'
+			? this.activeSession.projects ?? []
+			: [];
+		const aggregateWikiStates = await Promise.all(aggregateProjects.map(async (project) => ({
+			project,
+			exists: await this.wikiInitializationService.wikiExists(project.rootUri),
+			state: await this.wikiInitializationService.state(project.rootUri),
+		})));
+		const wikiExists = root
+			? await this.wikiInitializationService.wikiExists(root.uri)
+			: aggregateWikiStates.some((item) => item.exists);
 		const wikiState = root ? await this.wikiInitializationService.state(root.uri) : undefined;
-		const pendingSourceFiles = sourcePendingFiles(this.activeSession);
+		const visibleSession = this.visibleReviewSession();
+		const pendingSourceFiles = sourcePendingFiles(visibleSession);
 		const pendingSourceCount = pendingSourceFiles.reduce((total, file) => total + file.hunks.length, 0);
 		const hasPending = this.hasPendingReviewChanges();
-		const storedReview = this.aiReviewStore.load(this.activeSession);
+		const storedReview = this.dashboardStoredAiReview();
 		const aiReviewStatus = storedReview?.status ?? 'none';
 		const aiReviewCompletedFileCount = storedReview?.completedFiles.length ?? 0;
 		const aiReviewTotalFileCount = pendingSourceFiles.length;
 		const findingOrder = vscode.workspace.getConfiguration('cliDiff').get<'chunk' | 'severity'>('aiReviewFindingOrder', 'chunk');
-		const reviewFindings = storedReview && this.activeSession
-			? sortFindings(storedReview.findings, this.activeSession.files.values(), findingOrder)
+		const reviewFindings = storedReview && visibleSession
+			? sortFindings(storedReview.findings, visibleSession.files.values(), findingOrder)
 			: [];
 		const reviewSuggestions = storedReview
 			? [...storedReview.suggestions].sort((left, right) => left.relativePath.localeCompare(right.relativePath)
@@ -2237,22 +2503,32 @@ export class ReviewController implements vscode.Disposable {
 		const aiReviewFileResults = storedReview
 			? [...storedReview.fileResults].sort((left, right) => left.relativePath.localeCompare(right.relativePath))
 			: [];
-		const findings = this.currentReviewUri && this.activeSession
+		const findings = this.currentReviewUri && visibleSession
 			? sortFindings(
 				reviewFindings.filter((finding) => uriKey(vscode.Uri.parse(finding.uri)) === uriKey(this.currentReviewUri as vscode.Uri)),
-				this.activeSession.files.values(),
+				visibleSession.files.values(),
 				findingOrder,
 			)
 			: [];
-		const wikiNeedsUpdate = Boolean(root && wikiState?.status === 'ready' && !hasPending && !this.currentWikiTask
+		let wikiNeedsUpdate = Boolean(root && wikiState?.status === 'ready' && !hasPending && !this.currentWikiTask
 			&& await this.wikiInitializationService.needsUpdate(root));
+		if (!root && !this.currentWikiTask) {
+			for (const item of aggregateWikiStates) {
+				if (item.state?.status === 'ready'
+					&& sourcePendingFiles(this.projectSession(item.project)).length === 0
+					&& await this.wikiInitializationService.needsUpdate(reviewProjectFolder(item.project))) {
+					wikiNeedsUpdate = true;
+					break;
+				}
+			}
+		}
 		let status = update.status ?? this.llmWikiState.status;
 
 		if (!this.llmConfigState.configured) {
 			status = 'unconfigured';
 		} else if (this.currentWikiTask) {
 			status = this.currentWikiTask.kind === 'review' ? 'reviewing' : this.currentWikiTask.kind === 'update' ? 'updating' : 'initializing';
-		} else if (wikiState?.status === 'ready') {
+		} else if (wikiState?.status === 'ready' || (aggregateWikiStates.length > 0 && aggregateWikiStates.every((item) => item.state?.status === 'ready'))) {
 			status = 'initialized';
 		} else if (wikiState?.status === 'paused') {
 			status = 'paused';
@@ -2276,6 +2552,11 @@ export class ReviewController implements vscode.Disposable {
 			error: update.error ?? (statusChanged ? undefined : this.llmWikiState.error),
 			pendingSourceCount,
 			wikiNeedsUpdate,
+			wikiInitializationAvailable: root
+				? wikiState?.status !== 'ready'
+				: aggregateWikiStates.some((item) => item.state?.status !== 'ready'),
+			wikiUpdateAvailable: wikiNeedsUpdate,
+			wikiOpenAvailable: wikiExists,
 			findings,
 			jsonOutputEnabled: this.llmConfigState.jsonOutputEnabled,
 			thinkingMode: this.llmConfigState.thinkingMode,
@@ -2300,6 +2581,13 @@ export class ReviewController implements vscode.Disposable {
 
 	private dashboardWikiRootUri(): vscode.Uri | undefined {
 		const folders = vscode.workspace.workspaceFolders ?? [];
+		const selectedProject = currentReviewProject(this.activeSession);
+		if (selectedProject) {
+			return selectedProject.rootUri;
+		}
+		if (this.activeSession?.mode === 'git' && this.activeSession.trackingTarget?.kind === 'aggregate') {
+			return undefined;
+		}
 		if (this.wikiRootUri && folders.some((folder) => uriKey(folder.uri) === uriKey(this.wikiRootUri as vscode.Uri))) {
 			return this.wikiRootUri;
 		}
@@ -2311,9 +2599,13 @@ export class ReviewController implements vscode.Disposable {
 
 	private dashboardWikiRootFolder(): vscode.WorkspaceFolder | undefined {
 		const rootUri = this.dashboardWikiRootUri();
-		return rootUri
-			? vscode.workspace.workspaceFolders?.find((folder) => uriKey(folder.uri) === uriKey(rootUri))
-			: undefined;
+		if (!rootUri) {
+			return undefined;
+		}
+		const project = this.activeSession?.projects?.find((candidate) => uriKey(candidate.rootUri) === uriKey(rootUri));
+		return project
+			? reviewProjectFolder(project)
+			: vscode.workspace.workspaceFolders?.find((folder) => uriKey(folder.uri) === uriKey(rootUri));
 	}
 
 	private setCurrentReviewUri(uri: vscode.Uri): void {
@@ -2334,17 +2626,28 @@ export class ReviewController implements vscode.Disposable {
 			?? vscode.workspace.workspaceFolders?.find((workspaceFolder) => uriKey(workspaceFolder.uri) === uriKey(this.activeSession?.rootUri ?? workspaceFolder.uri));
 	}
 
-	private async updateGitIndexStateSignature(): Promise<void> {
-		const folder = this.activeGitWorkspaceFolder();
-		if (!folder) {
-			this.gitIndexStateSignature = undefined;
+	private gitProjectForUri(uri: vscode.Uri): ReviewProject | undefined {
+		return this.activeSession?.projects?.find((project) => uriIsInside(project.rootUri, uri));
+	}
+
+	private async updateGitIndexStateSignatures(): Promise<void> {
+		const projects = this.activeSession?.projects ?? [];
+		if (projects.length === 0) {
+			this.gitIndexStateSignatures.clear();
 			return;
 		}
 
-		try {
-			this.gitIndexStateSignature = await this.gitService.indexStateSignature(folder);
-		} catch {
-			this.gitIndexStateSignature = undefined;
+		const next = new Map<string, string>();
+		for (const [index, project] of projects.entries()) {
+			try {
+				next.set(project.id, await this.gitService.indexStateSignature(reviewProjectFolder(project, index)));
+			} catch {
+				// A repository may disappear while the workspace is refreshing.
+			}
+		}
+		this.gitIndexStateSignatures.clear();
+		for (const [projectId, signature] of next) {
+			this.gitIndexStateSignatures.set(projectId, signature);
 		}
 	}
 
@@ -2368,18 +2671,28 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 
-		const folder = this.activeGitWorkspaceFolder();
-		if (!folder) {
+		const workspaceRoot = this.activeGitWorkspaceFolder();
+		if (!workspaceRoot) {
 			return;
 		}
+		const projects = this.activeSession.projects ?? [];
 
 		try {
-			const signature = await this.gitService.indexStateSignature(folder);
-			if (signature === this.gitIndexStateSignature) {
+			const discoveredProjects = await this.gitService.discoverProjects(workspaceRoot);
+			let changed = discoveredProjects.length !== projects.length
+				|| discoveredProjects.some((project) => !projects.some((current) => current.id === project.id));
+			for (const [index, project] of projects.entries()) {
+				const signature = await this.gitService.indexStateSignature(reviewProjectFolder(project, index));
+				if (signature !== this.gitIndexStateSignatures.get(project.id)) {
+					changed = true;
+					break;
+				}
+			}
+			if (!changed) {
 				return;
 			}
 
-			await this.refreshGitSessionFiles({ source: 'gitIndexChanged', indexStateSignature: signature });
+			await this.refreshGitSessionFiles({ source: 'gitIndexChanged' });
 		} catch {
 			// Git may be unavailable briefly while the repository is changing.
 		}
@@ -2450,18 +2763,26 @@ export class ReviewController implements vscode.Disposable {
 		};
 	}
 
-	private async saveAiReviewWithCurrentSignature(review: StoredAiReview | undefined): Promise<void> {
-		if (!review || !this.activeSession) {
+	private async saveAiReviewWithCurrentSignature(review: StoredAiReview | undefined, session = this.visibleReviewSession()): Promise<void> {
+		if (!review || !session) {
 			return;
 		}
-		await this.aiReviewStore.save(this.activeSession, {
+		await this.aiReviewStore.save(session, {
 			...review,
-			signature: reviewChangeSignature(this.activeSession),
+			signature: reviewChangeSignature(session),
 			findings: [...review.findings],
 			suggestions: [...review.suggestions],
 			fileResults: [...review.fileResults],
 			completedFiles: [...review.completedFiles],
 		});
+	}
+
+	private sessionForFile(file: ReviewFileState | undefined): ReviewSession | undefined {
+		if (!file || !this.activeSession) {
+			return undefined;
+		}
+		const project = this.activeSession.projects?.find((candidate) => candidate.id === file.projectId);
+		return project ? projectReviewSession(this.activeSession, project) : this.activeSession;
 	}
 
 	private isStaleMutation(file: ReviewFileState, expectedRevision?: number): boolean {
@@ -2638,20 +2959,11 @@ export class ReviewController implements vscode.Disposable {
 
 		const folder = vscode.workspace.getWorkspaceFolder(uri);
 
-		if (!this.activeSession) {
-			this.manualGitBaselines.clear();
-			this.activeSession = {
-				id: `git-${Date.now()}`,
-				mode: 'git',
-				rootUri: folder?.uri ?? vscode.Uri.file(path.dirname(uri.fsPath)),
-				createdAt: Date.now(),
-				files: new Map<string, ReviewFileState>(),
-			};
-			await this.updateGitIndexStateSignature();
-			await vscode.commands.executeCommand('setContext', 'cliDiff:hasSession', true);
+		if (!this.activeSession && folder) {
+			await this.initializeGitSessionForFolder(folder);
 		}
 
-		if (this.activeSession.mode !== 'git') {
+		if (!this.activeSession || this.activeSession.mode !== 'git') {
 			return;
 		}
 
@@ -2659,7 +2971,8 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private async createGitFilePair(uri: vscode.Uri, options: { preferDisk?: boolean } = {}): Promise<FilePair | undefined> {
-		const folder = vscode.workspace.getWorkspaceFolder(uri);
+		const project = this.gitProjectForUri(uri);
+		const folder = project ? reviewProjectFolder(project) : vscode.workspace.getWorkspaceFolder(uri);
 
 		try {
 			const pair = await this.gitService.createFilePairForUri(uri, folder, { preferDisk: options.preferDisk });
@@ -2667,7 +2980,8 @@ export class ReviewController implements vscode.Disposable {
 				this.manualGitBaselines.delete(uriKey(uri));
 				return undefined;
 			}
-			return applyManualGitBaselineToPair(pair, this.manualGitBaselineForPair(pair));
+			const projectPair = project ? { ...pair, projectId: project.id, projectName: project.name } : pair;
+			return applyManualGitBaselineToPair(projectPair, this.manualGitBaselineForPair(projectPair));
 		} catch {
 			return undefined;
 		}
@@ -2750,7 +3064,7 @@ export class ReviewController implements vscode.Disposable {
 			return [];
 		}
 
-		return [...this.activeSession.files.values()]
+		return visibleReviewFiles(this.activeSession)
 			.sort((left, right) => left.relativePath.localeCompare(right.relativePath))
 			.flatMap((file) => file.hunks.map((hunk) => ({ file, hunk })));
 	}
@@ -3342,4 +3656,13 @@ export class ReviewController implements vscode.Disposable {
 		const message = error instanceof Error ? error.message : String(error);
 		vscode.window.showErrorMessage(`Cli Diff Review: ${message}`);
 	}
+}
+
+function trackingTargetStorageKey(rootUri: vscode.Uri): string {
+	return `cliDiff.trackingTarget.${rootUri.toString()}`;
+}
+
+function uriIsInside(rootUri: vscode.Uri, uri: vscode.Uri): boolean {
+	const relative = path.relative(rootUri.fsPath, uri.fsPath);
+	return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }

@@ -15,7 +15,7 @@ import { parseStrictJsonObject } from '../llm/json';
 import { buildReviewDashboardPayload, defaultLlmWikiDashboardState, ReviewDashboardProvider } from '../reviewDashboard';
 import { isDotReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
 import { ReviewTreeProvider } from '../reviewTree';
-import { normalizeMonacoThemeColor } from '../reviewWebview';
+import { normalizeMonacoThemeColor, ReviewWebviewManager } from '../reviewWebview';
 import {
 	applyManualGitBaselineToPair,
 	captureLineBlockContext,
@@ -30,7 +30,7 @@ import {
 	skippedCurrentFile,
 } from '../reviewState';
 import { replaceLineBlock, splitLines } from '../text';
-import { FilePair, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewSession } from '../types';
+import { FilePair, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewProject, ReviewSession, visibleReviewFiles } from '../types';
 import { normalizeWikiFilePath, validateWikiInitializationResponse, WikiInitializationService } from '../wiki/wikiInitializer';
 import { WikiStateService } from '../wiki/state';
 
@@ -221,6 +221,49 @@ suite('Review webview compatibility', () => {
 		const readyIndex = source.indexOf('ready = true;', createEditorIndex);
 		assert.ok(createEditorIndex >= 0 && readyIndex > createEditorIndex);
 	});
+
+	test('closes Review editors without pending hunks after manual refresh', () => {
+		const pendingUri = vscode.Uri.file('D:/repo/src/pending.ts');
+		const reviewedUri = vscode.Uri.file('D:/repo/src/reviewed.ts');
+		const missingUri = vscode.Uri.file('D:/repo/src/missing.ts');
+		const pending = reviewFileState(pendingUri, 'src/pending.ts', {
+			hunks: computeLineDiff(pendingUri.toString(), 'old\n', 'new\n'),
+		});
+		const reviewed = reviewFileState(reviewedUri, 'src/reviewed.ts');
+		const session: ReviewSession = {
+			id: 'manual-refresh',
+			mode: 'git',
+			rootUri: vscode.Uri.file('D:/repo'),
+			createdAt: 1,
+			files: new Map([[pendingUri.toString(), pending], [reviewedUri.toString(), reviewed]]),
+		};
+		const disposed: string[] = [];
+		const host = (uri: vscode.Uri) => ({
+			uri,
+			panel: { dispose: () => disposed.push(uri.toString()) },
+		});
+		const manager = Object.create(ReviewWebviewManager.prototype) as ReviewWebviewManager;
+		Object.assign(manager as unknown as Record<string, unknown>, {
+			getSession: () => session,
+			hosts: new Map([
+				[pendingUri.toString(), host(pendingUri)],
+				[reviewedUri.toString(), host(reviewedUri)],
+				[missingUri.toString(), host(missingUri)],
+			]),
+			refreshTimers: new Map(),
+		});
+
+		const closed = manager.closeCompleted().map((uri) => uri.toString());
+
+		assert.deepStrictEqual(closed, [reviewedUri.toString(), missingUri.toString()]);
+		assert.deepStrictEqual(disposed, closed);
+	});
+
+	test('invokes completed Review editor cleanup only from the manual refresh flow', () => {
+		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
+		assert.match(source, /refreshGitSessionFiles\(\{ source: 'manual' \}\);\s+this\.closeCompletedReviewEditorsAfterManualRefresh\(\);/);
+		assert.doesNotMatch(source, /refreshGitSessionFiles\(\{ source: 'gitIndexChanged' \}\);\s+this\.closeCompletedReviewEditorsAfterManualRefresh\(\);/);
+	});
 });
 
 suite('Extension configuration', () => {
@@ -334,7 +377,7 @@ suite('Review controller bulk actions', () => {
 		assert.ok(source.includes("this.registerCommand('cli-diff.undoAiSuggestion'"));
 		assert.ok(source.includes('private async applyAiSuggestionCore'));
 		assert.ok(source.includes('private async undoAiSuggestionCore'));
-		assert.ok(source.includes('await this.saveAiReviewWithCurrentSignature(storedReview);'));
+		assert.ok(source.includes('await this.saveAiReviewWithCurrentSignature(storedReview, reviewSession);'));
 		assert.ok(source.includes('this.replacePendingHunkWithAppliedSuggestion'));
 	});
 });
@@ -562,6 +605,71 @@ suite('Review state', () => {
 		assert.strictEqual(item.contextValue, 'cliDiffFileSkipped');
 	});
 
+	test('groups aggregate Git review files by project and filters selected projects', () => {
+		const parent = vscode.Uri.file('D:/projects');
+		const projects: ReviewProject[] = [
+			{ id: 'api', name: 'api', rootUri: vscode.Uri.joinPath(parent, 'api') },
+			{ id: 'web', name: 'web', rootUri: vscode.Uri.joinPath(parent, 'web') },
+		];
+		const apiFile = reviewFileState(vscode.Uri.joinPath(projects[0].rootUri, 'src/app.ts'), 'src/app.ts', {
+			projectId: 'api',
+			projectName: 'api',
+			hunks: computeLineDiff('api', 'a\n', 'b\n'),
+		});
+		const webFile = reviewFileState(vscode.Uri.joinPath(projects[1].rootUri, 'src/app.ts'), 'src/app.ts', {
+			projectId: 'web',
+			projectName: 'web',
+			hunks: computeLineDiff('web', 'a\n', 'b\n'),
+		});
+		const session: ReviewSession = {
+			id: 'multi',
+			mode: 'git',
+			rootUri: parent,
+			createdAt: 1,
+			files: new Map([[apiFile.uri.toString(), apiFile], [webFile.uri.toString(), webFile]]),
+			projects,
+			trackingTarget: { kind: 'aggregate' },
+		};
+		const provider = new ReviewTreeProvider(() => session);
+		const groups = provider.getChildren();
+		assert.deepStrictEqual(groups.map((group) => provider.getTreeItem(group).label), ['api', 'web']);
+		assert.strictEqual(provider.getChildren(groups[0]).length, 1);
+		assert.strictEqual(provider.getChildren(groups[1]).length, 1);
+
+		const aggregate = buildReviewDashboardPayload(session, undefined, () => false);
+		assert.deepStrictEqual(aggregate.files.map((file) => file.relativePath), ['api/src/app.ts', 'web/src/app.ts']);
+		assert.strictEqual(aggregate.trackingTarget?.label, 'projects');
+		assert.strictEqual(aggregate.trackingTarget?.kind, 'aggregate');
+		assert.strictEqual(aggregate.trackingTarget?.canSwitch, true);
+
+		session.trackingTarget = { kind: 'project', projectId: 'web' };
+		assert.deepStrictEqual(visibleReviewFiles(session), [webFile]);
+		const selected = buildReviewDashboardPayload(session, undefined, () => false);
+		assert.deepStrictEqual(selected.files.map((file) => file.relativePath), ['src/app.ts']);
+		assert.strictEqual(selected.trackingTarget?.label, 'web');
+		assert.strictEqual(provider.getChildren().length, 1);
+
+		const singleChildParent: ReviewSession = {
+			...session,
+			projects: [projects[0]],
+			files: new Map([[apiFile.uri.toString(), apiFile]]),
+			trackingTarget: { kind: 'aggregate' },
+		};
+		const singleChildPayload = buildReviewDashboardPayload(singleChildParent, undefined, () => false);
+		assert.strictEqual(singleChildPayload.trackingTarget?.label, 'projects');
+		assert.strictEqual(singleChildPayload.trackingTarget?.canSwitch, true);
+		assert.strictEqual(singleChildPayload.files[0].relativePath, 'api/src/app.ts');
+
+		const rootProject: ReviewSession = {
+			...singleChildParent,
+			rootUri: projects[0].rootUri,
+			trackingTarget: { kind: 'project', projectId: projects[0].id },
+		};
+		const rootProjectPayload = buildReviewDashboardPayload(rootProject, undefined, () => false);
+		assert.strictEqual(rootProjectPayload.trackingTarget?.canSwitch, false);
+		assert.strictEqual(rootProjectPayload.files[0].relativePath, 'src/app.ts');
+	});
+
 	test('builds dashboard payload with current review and action states', () => {
 		const pendingUri = vscode.Uri.file('D:/repo/src/pending.ts');
 		const reviewedUri = vscode.Uri.file('D:/repo/src/reviewed.ts');
@@ -705,6 +813,7 @@ suite('Review state', () => {
 			webview: {
 				options: {},
 				html: '',
+				asWebviewUri: (resource: vscode.Uri) => resource,
 				onDidReceiveMessage: (handler: (message: unknown) => void) => {
 					messageHandler = handler;
 					return { dispose: () => undefined };
@@ -740,8 +849,8 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('function renderReviewFileDetail'));
 		assert.ok(view.webview.html.includes('function aiReviewActionLabel'));
 		assert.ok(view.webview.html.includes("return 'Generate AI review'"));
-		assert.ok(view.webview.html.includes("return 'Retry AI review'"));
-		assert.ok(view.webview.html.includes("return 'Continue AI review'"));
+		assert.ok(view.webview.html.includes("'Retry AI review'"));
+		assert.ok(view.webview.html.includes("'Continue AI review'"));
 		assert.ok(view.webview.html.includes("return 'Regenerate AI review'"));
 		assert.ok(view.webview.html.includes("wiki.aiReviewStatus === 'partial'"));
 		assert.ok(view.webview.html.includes("typeof item.round === 'number'"));
@@ -836,10 +945,12 @@ suite('Review state', () => {
 		});
 		messageHandler({ type: 'openWikiIndex' });
 		messageHandler({ type: 'openExtensionSettings' });
+		messageHandler({ type: 'selectTrackingTarget' });
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.openWikiIndex' && call.args.length === 0));
 		assert.ok(commands.some((call) => call.command === 'workbench.action.openSettings'
 			&& call.args[0] === '@ext:local.cli-diff-review'));
+		assert.ok(commands.some((call) => call.command === 'cli-diff.selectTrackingTarget'));
 		messageHandler({ type: 'acceptAll' });
 		messageHandler({ type: 'rejectAll' });
 		messageHandler({ type: 'undoAll' });
@@ -1870,6 +1981,34 @@ suite('AI review findings', () => {
 });
 
 suite('Git service', () => {
+	test('discovers the workspace Git root or direct child Git projects only', async function (this: Mocha.Context) {
+		this.timeout(10000);
+		const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-projects-'));
+		try {
+			const api = path.join(parent, 'api');
+			const web = path.join(parent, 'web');
+			const nested = path.join(api, 'nested');
+			const ordinary = path.join(parent, 'notes');
+			for (const folder of [api, web, nested, ordinary]) {
+				fs.mkdirSync(folder, { recursive: true });
+			}
+			git(api, 'init');
+			git(web, 'init');
+			git(nested, 'init');
+
+			const service = new GitService();
+			const childProjects = await service.discoverProjects(workspaceFolder(parent));
+			assert.deepStrictEqual(childProjects.map((project) => project.name), ['api', 'web']);
+
+			git(parent, 'init');
+			const rootProjects = await service.discoverProjects(workspaceFolder(parent));
+			assert.strictEqual(rootProjects.length, 1);
+			assert.strictEqual(rootProjects[0].rootUri.fsPath, vscode.Uri.file(parent).fsPath);
+		} finally {
+			removeTempRepo(parent);
+		}
+	});
+
 	test('uses the index as the Git review baseline', async function (this: Mocha.Context) {
 		this.timeout(10000);
 		const root = createTempGitRepo();

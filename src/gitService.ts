@@ -1,11 +1,40 @@
 import { execFile } from 'child_process';
-import { dirname as pathDirname, relative as pathRelative } from 'path';
+import { realpathSync } from 'fs';
+import { dirname as pathDirname, relative as pathRelative, resolve as pathResolve } from 'path';
 import * as vscode from 'vscode';
 import { gitIgnoredReviewPaths, isGitIgnoredReviewPath, normalizeReviewPath, shouldSkipReviewPath } from './reviewFileFilter';
-import { FilePair } from './types';
+import { FilePair, ReviewProject, uriKey } from './types';
 import { decodeUtf8, isProbablyBinary, uriFromRelativePath } from './text';
 
 export class GitService {
+	public async discoverProjects(workspaceRoot: vscode.WorkspaceFolder): Promise<ReviewProject[]> {
+		if (await this.isGitRoot(workspaceRoot.uri)) {
+			return [reviewProject(workspaceRoot.uri, workspaceRoot.name)];
+		}
+
+		const entries = await vscode.workspace.fs.readDirectory(workspaceRoot.uri);
+		const projects: ReviewProject[] = [];
+		for (const [name, type] of entries) {
+			if (type !== vscode.FileType.Directory) {
+				continue;
+			}
+			const uri = vscode.Uri.joinPath(workspaceRoot.uri, name);
+			if (await this.isGitRoot(uri)) {
+				projects.push(reviewProject(uri, name));
+			}
+		}
+		return projects.sort((left, right) => left.name.localeCompare(right.name));
+	}
+
+	public async isGitRoot(uri: vscode.Uri): Promise<boolean> {
+		try {
+			const topLevel = (await this.gitInPath(uri.fsPath, ['rev-parse', '--show-toplevel'])).trim();
+			return canonicalPath(topLevel) === canonicalPath(uri.fsPath);
+		} catch {
+			return false;
+		}
+	}
+
 	public async createFilePairs(root: vscode.WorkspaceFolder): Promise<FilePair[]> {
 		await this.git(root, ['rev-parse', '--show-toplevel']);
 		const tracked = await this.gitLines(root, ['diff', '--name-only', '--relative', '--']);
@@ -126,6 +155,18 @@ export class GitService {
 				resolve(stdout);
 			});
 		});
+	}
+}
+
+function reviewProject(rootUri: vscode.Uri, name: string): ReviewProject {
+	return { id: uriKey(rootUri), name, rootUri };
+}
+
+function canonicalPath(candidate: string): string {
+	try {
+		return pathResolve(realpathSync.native(candidate));
+	} catch {
+		return pathResolve(candidate);
 	}
 }
 

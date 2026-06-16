@@ -51,6 +51,8 @@ export interface AppliedAiSuggestion {
 export interface ReviewFileState {
 	uri: vscode.Uri;
 	relativePath: string;
+	projectId?: string;
+	projectName?: string;
 	oldText: string;
 	newText: string;
 	hunks: ReviewHunk[];
@@ -65,12 +67,24 @@ export interface ReviewFileState {
 	skippedReason?: string;
 }
 
+export interface ReviewProject {
+	id: string;
+	name: string;
+	rootUri: vscode.Uri;
+}
+
+export type ReviewTrackingTarget =
+	| { kind: 'aggregate' }
+	| { kind: 'project'; projectId: string };
+
 export interface ReviewSession {
 	id: string;
 	mode: ReviewMode;
 	rootUri: vscode.Uri;
 	createdAt: number;
 	files: Map<string, ReviewFileState>;
+	projects?: ReviewProject[];
+	trackingTarget?: ReviewTrackingTarget;
 }
 
 export interface BaselineFile {
@@ -83,6 +97,8 @@ export interface BaselineFile {
 export interface FilePair {
 	uri: vscode.Uri;
 	relativePath: string;
+	projectId?: string;
+	projectName?: string;
 	oldText: string;
 	newText: string;
 	baselineExists: boolean;
@@ -92,4 +108,40 @@ export interface FilePair {
 
 export function uriKey(uri: vscode.Uri): string {
 	return uri.toString();
+}
+
+export function reviewProjectFolder(project: ReviewProject, index = 0): vscode.WorkspaceFolder {
+	return { uri: project.rootUri, name: project.name, index };
+}
+
+export function hasAggregateReviewTarget(session: ReviewSession | undefined): boolean {
+	return Boolean(session?.mode === 'git'
+		&& session.projects?.length
+		&& !session.projects.some((project) => uriKey(project.rootUri) === uriKey(session.rootUri)));
+}
+
+export function currentReviewProject(session: ReviewSession | undefined): ReviewProject | undefined {
+	if (!session?.projects || session.trackingTarget?.kind !== 'project') {
+		return undefined;
+	}
+	const projectId = session.trackingTarget.projectId;
+	return session.projects.find((project) => project.id === projectId);
+}
+
+export function visibleReviewFiles(session: ReviewSession | undefined): ReviewFileState[] {
+	if (!session) {
+		return [];
+	}
+	const projectId = session.trackingTarget?.kind === 'project' ? session.trackingTarget.projectId : undefined;
+	return [...session.files.values()].filter((file) => !projectId || file.projectId === projectId);
+}
+
+export function projectReviewSession(session: ReviewSession, project: ReviewProject): ReviewSession {
+	return {
+		...session,
+		rootUri: project.rootUri,
+		files: new Map([...session.files].filter(([, file]) => file.projectId === project.id)),
+		projects: [project],
+		trackingTarget: { kind: 'project', projectId: project.id },
+	};
 }

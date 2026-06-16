@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import type { AiReviewChunkSuggestion, AiReviewFileResult, AiReviewFinding } from './agent/codeReview';
 import type { AgentTraceDetail, AgentTraceEventKind, AgentTraceStatus } from './agent/runtime';
 import type { LlmProvider, LlmThinkingMode } from './llm/config';
-import { ReviewFileState, ReviewSession, uriKey } from './types';
+import { currentReviewProject, hasAggregateReviewTarget, ReviewFileState, ReviewSession, uriKey, visibleReviewFiles } from './types';
 
 type DashboardMessage =
 	| { type: 'ready' }
@@ -15,6 +15,7 @@ type DashboardMessage =
 	| { type: 'acceptAll' }
 	| { type: 'rejectAll' }
 	| { type: 'undoAll' }
+	| { type: 'selectTrackingTarget' }
 	| {
 		type: 'saveLlmConfig';
 		provider: LlmProvider;
@@ -75,6 +76,13 @@ export interface ReviewDashboardPayload {
 	currentReviewLabel?: string;
 	changeSignature: string;
 	files: ReviewDashboardFile[];
+	trackingTarget?: {
+		label: string;
+		kind: 'none' | 'aggregate' | 'project';
+		canSwitch: boolean;
+		disabled: boolean;
+		projectCount: number;
+	};
 	llmWiki?: LlmWikiDashboardState;
 }
 
@@ -110,6 +118,9 @@ export interface LlmWikiDashboardState {
 	error?: string;
 	pendingSourceCount: number;
 	wikiNeedsUpdate: boolean;
+	wikiInitializationAvailable?: boolean;
+	wikiUpdateAvailable?: boolean;
+	wikiOpenAvailable?: boolean;
 	findings: AiReviewFinding[];
 	jsonOutputEnabled: boolean;
 	thinkingMode: LlmThinkingMode;
@@ -210,6 +221,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 		if (message.type === 'undoAll') {
 			await this.executeCommand('cli-diff.undoAll');
+			this.postState();
+			return;
+		}
+		if (message.type === 'selectTrackingTarget') {
+			await this.executeCommand('cli-diff.selectTrackingTarget');
 			this.postState();
 			return;
 		}
@@ -929,11 +945,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			gap: 2px;
 		}
 		.header-toggle {
-			min-width: 0;
+			flex: 0 0 auto;
+			width: 18px;
 			height: 20px;
-			display: flex;
-			align-items: center;
-			gap: 2px;
+			display: inline-grid;
+			place-items: center;
 			color: inherit;
 		}
 		.chevron {
@@ -958,10 +974,20 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			top: 4px;
 			transform: rotate(-45deg);
 		}
-		.tree-title {
+		.tracking-target {
+			min-width: 0;
+			max-width: min(220px, 45vw);
+			height: 20px;
+			padding: 0 3px;
+			color: inherit;
+			font-weight: 700;
 			overflow: hidden;
 			text-overflow: ellipsis;
 			white-space: nowrap;
+		}
+		.tracking-target:disabled {
+			opacity: 1;
+			cursor: default;
 		}
 		.header-actions {
 			display: flex;
@@ -1153,8 +1179,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				<div class="header-left">
 					<button class="header-toggle" id="toggle" aria-expanded="true" title="Toggle Cli Diff Review">
 						<span class="chevron" aria-hidden="true"></span>
-						<span class="tree-title">Cli Diff Review</span>
 					</button>
+					<button class="tracking-target" id="trackingTarget" type="button" title="Select tracked project" disabled></button>
 				</div>
 				<div class="header-actions">
 					<button class="refresh-button bulk-action-button" id="acceptAll" type="button" title="Accept all pending changes" aria-label="Accept all pending changes">
@@ -1179,6 +1205,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const tree = document.querySelector('.review-tree');
 		const wikiPanel = document.querySelector('.wiki-panel');
 		const toggle = document.getElementById('toggle');
+		const trackingTarget = document.getElementById('trackingTarget');
 		const list = document.getElementById('list');
 		const modelPill = document.getElementById('modelPill');
 		const homeButton = document.getElementById('homeButton');
@@ -1212,6 +1239,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		acceptAllButton.addEventListener('click', () => vscode.postMessage({ type: 'acceptAll' }));
 		rejectAllButton.addEventListener('click', () => vscode.postMessage({ type: 'rejectAll' }));
 		undoAllButton.addEventListener('click', () => vscode.postMessage({ type: 'undoAll' }));
+		trackingTarget.addEventListener('click', () => vscode.postMessage({ type: 'selectTrackingTarget' }));
 		document.getElementById('refresh').addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
 		modelPill.addEventListener('click', () => {
 			editingConfig = true;
@@ -1324,6 +1352,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		function render(payload) {
 			const files = payload.files || [];
 			lastFiles = files;
+			renderTrackingTarget(payload.trackingTarget);
 			updateBulkActionButtons(files);
 			if (reviewDetailUri && !files.some((file) => file.uri === reviewDetailUri)) {
 				reviewDetailUri = undefined;
@@ -1345,6 +1374,13 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			for (const file of files) {
 				list.appendChild(fileRow(file));
 			}
+		}
+
+		function renderTrackingTarget(target) {
+			const tracking = target || { label: '', canSwitch: false, disabled: false };
+			trackingTarget.textContent = tracking.label || '';
+			trackingTarget.title = tracking.canSwitch ? 'Select tracked project' : (tracking.label || 'No tracked project');
+			trackingTarget.disabled = !tracking.canSwitch || tracking.disabled;
 		}
 
 		function updateBulkActionButtons(files) {
@@ -1413,23 +1449,26 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const initializeLabel = wiki.status === 'paused'
 				? 'Resume Wiki Initialization'
 				: wiki.status === 'failed' ? 'Retry Wiki Initialization' : 'Initialize LLM Code Wiki';
-			setMenuAction('initializeWiki', initializeLabel, running || !wiki.configured || !wiki.workspaceAvailable || initialized,
+			const initializationAvailable = wiki.wikiInitializationAvailable ?? !initialized;
+			const updateAvailable = wiki.wikiUpdateAvailable ?? wiki.wikiNeedsUpdate;
+			const openAvailable = wiki.wikiOpenAvailable ?? initialized;
+			setMenuAction('initializeWiki', initializeLabel, running || !wiki.configured || !wiki.workspaceAvailable || !initializationAvailable,
 				running ? 'Agent is running'
 					: !wiki.configured ? 'Configure LLM first'
 						: !wiki.workspaceAvailable ? 'Open a workspace folder'
-							: initialized ? 'Wiki already initialized' : '');
+							: 'Wiki already initialized');
 			setMenuAction('updateWiki', 'Update LLM Code Wiki',
-				running || !wiki.configured || !wiki.workspaceAvailable || !initialized || !wiki.wikiNeedsUpdate,
+				running || !wiki.configured || !wiki.workspaceAvailable || !updateAvailable,
 				running ? 'Agent is running'
 					: !wiki.configured ? 'Configure LLM first'
 						: !wiki.workspaceAvailable ? 'Open a workspace folder'
-							: !initialized ? 'Initialize Wiki first' : 'Wiki is up to date');
+							: !wiki.wikiExists ? 'Initialize Wiki first' : 'Wiki is up to date');
 			setMenuAction('generateAiReview', aiReviewActionLabel(wiki),
 				running || !wiki.configured || !wiki.workspaceAvailable || (wiki.pendingSourceCount || 0) === 0,
 				running ? 'Agent is running'
 					: !wiki.configured ? 'Configure LLM first'
 						: !wiki.workspaceAvailable ? 'Open a workspace folder' : 'No pending source changes');
-			setMenuAction('openWikiIndex', 'Open Wiki home', !initialized, initialized ? '' : 'Initialize Wiki first');
+			setMenuAction('openWikiIndex', 'Open Wiki home', !openAvailable, openAvailable ? '' : 'Initialize Wiki first');
 			setMenuAction('openExtensionSettings', 'Open extension settings', false, '');
 		}
 
@@ -1959,6 +1998,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				workspaceAvailable: false,
 				pendingSourceCount: 0,
 				wikiNeedsUpdate: false,
+				wikiInitializationAvailable: true,
+				wikiUpdateAvailable: false,
+				wikiOpenAvailable: false,
 				findings: [],
 				jsonOutputEnabled: true,
 				thinkingMode: 'disabled',
@@ -2083,20 +2125,24 @@ export function buildReviewDashboardPayload(
 		fileList.push(suggestion);
 		suggestionsByFile.set(suggestion.uri, fileList);
 	}
+	const currentProject = currentReviewProject(session);
+	const aggregate = hasAggregateReviewTarget(session) && session?.trackingTarget?.kind === 'aggregate';
 	const files = session
-		? [...session.files.values()]
+		? visibleReviewFiles(session)
 			.filter((file) => file.hunks.length > 0 || file.acceptedHunks.length > 0 || file.rejectedHunks.length > 0 || file.skippedReason)
-			.sort((left, right) => left.relativePath.localeCompare(right.relativePath))
+			.sort((left, right) => (left.projectName ?? '').localeCompare(right.projectName ?? '')
+				|| left.relativePath.localeCompare(right.relativePath))
 			.map((file) => {
 				const pendingCount = file.hunks.length;
 				const reviewedCount = file.acceptedHunks.length + file.rejectedHunks.length;
 				const dirty = isDirty(file.uri);
 				const mutationDisabled = dirty || Boolean(file.skippedReason);
 				const status = dashboardStatus(file);
+				const displayPath = aggregate && file.projectName ? `${file.projectName}/${file.relativePath}` : file.relativePath;
 				return {
 					uri: file.uri.toString(),
-					relativePath: file.relativePath,
-					fileExtension: dashboardExtension(file.relativePath),
+					relativePath: displayPath,
+					fileExtension: dashboardExtension(displayPath),
 					description: dashboardDescription(pendingCount, reviewedCount, dirty, file.skippedReason),
 					statusLabel: status.label,
 					statusKind: status.kind,
@@ -2130,6 +2176,13 @@ export function buildReviewDashboardPayload(
 		currentReviewLabel,
 		changeSignature,
 		files,
+		trackingTarget: {
+			label: session ? currentProject?.name ?? path.basename(session.rootUri.fsPath) : '',
+			kind: !session ? 'none' : currentProject ? 'project' : session.trackingTarget?.kind === 'aggregate' ? 'aggregate' : 'project',
+			canSwitch: hasAggregateReviewTarget(session),
+			disabled: isDashboardAgentRunning(llmWiki.status),
+			projectCount: session?.projects?.length ?? (session ? 1 : 0),
+		},
 		llmWiki,
 	};
 }
@@ -2146,6 +2199,9 @@ export function defaultLlmWikiDashboardState(): LlmWikiDashboardState {
 		workspaceAvailable: Boolean(vscode.workspace.workspaceFolders?.length),
 		pendingSourceCount: 0,
 		wikiNeedsUpdate: false,
+		wikiInitializationAvailable: true,
+		wikiUpdateAvailable: false,
+		wikiOpenAvailable: false,
 		findings: [],
 		jsonOutputEnabled: true,
 		thinkingMode: 'disabled',
@@ -2223,6 +2279,10 @@ function dashboardDescription(pendingCount: number, reviewedCount: number, dirty
 
 function dashboardTitleFile(currentReviewLabel?: string): string {
 	return currentReviewLabel ?? '';
+}
+
+function isDashboardAgentRunning(status: LlmWikiStatus): boolean {
+	return status === 'initializing' || status === 'updating' || status === 'reviewing';
 }
 
 function dashboardExtension(relativePath: string): string {
