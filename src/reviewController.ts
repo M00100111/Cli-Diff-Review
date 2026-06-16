@@ -110,6 +110,7 @@ export class ReviewController implements vscode.Disposable {
 		jsonOutputEnabled: true,
 		thinkingMode: 'disabled',
 		strictTools: false,
+		profiles: [],
 	};
 	private llmWikiState: LlmWikiDashboardState = defaultLlmWikiDashboardState();
 	private currentWikiTask: WikiInitializationTask | undefined;
@@ -187,6 +188,8 @@ export class ReviewController implements vscode.Disposable {
 			this.registerCommand('cli-diff.openFileAtChange', (uri: string, hunkId: string) => this.openFileAtChange(uri, hunkId)),
 			this.registerCommand('cli-diff.refresh', () => this.refreshAll()),
 			this.registerCommand('cli-diff.saveLlmWikiConfig', (input: LlmConfigInput) => this.saveLlmWikiConfig(input)),
+			this.registerCommand('cli-diff.selectLlmConfigProfile', (profileId: string) => this.selectLlmConfigProfile(profileId)),
+			this.registerCommand('cli-diff.deleteLlmConfigProfile', (profileId: string) => this.deleteLlmConfigProfile(profileId)),
 			this.registerCommand('cli-diff.initializeLlmWiki', () => this.initializeLlmWiki()),
 			this.registerCommand('cli-diff.cancelLlmWikiInitialization', () => this.cancelLlmWikiInitialization()),
 			this.registerCommand('cli-diff.updateLlmWiki', () => this.updateLlmWiki()),
@@ -1481,6 +1484,41 @@ export class ReviewController implements vscode.Disposable {
 		}
 	}
 
+	private async selectLlmConfigProfile(profileId: string): Promise<void> {
+		try {
+			this.llmConfigState = await this.llmConfigStore.selectProfile(profileId);
+			await this.refreshLlmWikiDashboardState({ status: 'idle', progress: undefined, error: undefined });
+		} catch (error) {
+			this.showError(error);
+			await this.refreshLlmWikiDashboardState({
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	private async deleteLlmConfigProfile(profileId: string): Promise<void> {
+		try {
+			const profile = this.llmConfigState.profiles.find((item) => item.id === profileId)
+				?? (await this.llmConfigStore.savedConfig()).profiles.find((item) => item.id === profileId);
+			const label = profile?.model || 'this model configuration';
+			const confirmed = await vscode.window.showWarningMessage(
+				`Delete ${label}?`,
+				{ modal: true },
+				'Delete',
+			);
+			if (confirmed !== 'Delete') {
+				return;
+			}
+			this.llmConfigState = await this.llmConfigStore.deleteProfile(profileId);
+			await this.refreshLlmWikiDashboardState({ status: 'idle', progress: 'Model configuration deleted.', error: undefined });
+		} catch (error) {
+			this.showError(error);
+			await this.refreshLlmWikiDashboardState({
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
 	private async initializeLlmWiki(): Promise<void> {
 		if (this.currentWikiTask) {
 			await this.cancelLlmWikiInitialization();
@@ -2561,6 +2599,8 @@ export class ReviewController implements vscode.Disposable {
 			jsonOutputEnabled: this.llmConfigState.jsonOutputEnabled,
 			thinkingMode: this.llmConfigState.thinkingMode,
 			strictTools: this.llmConfigState.strictTools,
+			activeProfileId: this.llmConfigState.activeProfileId,
+			profiles: this.llmConfigState.profiles,
 			runLog: update.runLog ?? this.wikiRunLog,
 			runLogSource: update.runLogSource ?? this.wikiRunLogSource,
 			reviewFindings: update.reviewFindings ?? reviewFindings,
