@@ -7,9 +7,10 @@ import { throwIfAborted } from './cancellation';
 export type WikiAgentState = 'initializing' | 'ready' | 'paused' | 'updating' | 'failed';
 
 export interface WikiState {
-	version: 1;
+	version: 2;
 	status: WikiAgentState;
-	templateHash: string;
+	skillHash: string;
+	schemaHash: string;
 	generatedFiles: string[];
 	sourceFingerprints: Record<string, string>;
 	lastSyncedAt?: string;
@@ -24,7 +25,11 @@ export interface SourceFingerprintDiff {
 }
 
 const stateFileName = '.state.json';
-const templateFileName = 'llm-code-wiki.md';
+const skillsDirectoryName = '.skills';
+const skillDirectoryName = 'llm-code-wiki';
+const referencesDirectoryName = 'references';
+const skillFileName = 'SKILL.md';
+const schemaFileName = 'schema.md';
 const sourceMaxFiles = 5000;
 const sourceMaxFileBytes = 2 * 1024 * 1024;
 
@@ -32,15 +37,23 @@ export class WikiStateService {
 	public constructor(private readonly extensionUri: vscode.Uri) {}
 
 	public wikiUri(rootUri: vscode.Uri): vscode.Uri {
-		return vscode.Uri.joinPath(rootUri, '.wiki');
+		return vscode.Uri.joinPath(rootUri, skillsDirectoryName, skillDirectoryName);
+	}
+
+	public referencesUri(rootUri: vscode.Uri): vscode.Uri {
+		return vscode.Uri.joinPath(this.wikiUri(rootUri), referencesDirectoryName);
 	}
 
 	public stateUri(rootUri: vscode.Uri): vscode.Uri {
 		return vscode.Uri.joinPath(this.wikiUri(rootUri), stateFileName);
 	}
 
-	public templateUri(rootUri: vscode.Uri): vscode.Uri {
-		return vscode.Uri.joinPath(this.wikiUri(rootUri), templateFileName);
+	public skillUri(rootUri: vscode.Uri): vscode.Uri {
+		return vscode.Uri.joinPath(this.wikiUri(rootUri), skillFileName);
+	}
+
+	public schemaUri(rootUri: vscode.Uri): vscode.Uri {
+		return vscode.Uri.joinPath(this.referencesUri(rootUri), schemaFileName);
 	}
 
 	public async wikiExists(rootUri: vscode.Uri): Promise<boolean> {
@@ -69,22 +82,31 @@ export class WikiStateService {
 	public async ensureScaffold(root: vscode.WorkspaceFolder, status: WikiAgentState, signal?: AbortSignal): Promise<WikiState> {
 		throwIfAborted(signal);
 		await vscode.workspace.fs.createDirectory(this.wikiUri(root.uri));
-		const template = await this.readBundledTemplate();
+		await vscode.workspace.fs.createDirectory(this.referencesUri(root.uri));
+		const skill = await this.readBundledSkill();
+		const schema = await this.readBundledSchema();
 		try {
-			await vscode.workspace.fs.stat(this.templateUri(root.uri));
+			await vscode.workspace.fs.stat(this.skillUri(root.uri));
 		} catch {
-			await vscode.workspace.fs.writeFile(this.templateUri(root.uri), encodeUtf8(template));
+			await vscode.workspace.fs.writeFile(this.skillUri(root.uri), encodeUtf8(skill));
+		}
+		try {
+			await vscode.workspace.fs.stat(this.schemaUri(root.uri));
+		} catch {
+			await vscode.workspace.fs.writeFile(this.schemaUri(root.uri), encodeUtf8(schema));
 		}
 		const existing = await this.read(root.uri);
 		const state: WikiState = existing ?? {
-			version: 1,
+			version: 2,
 			status,
-			templateHash: hashText(template),
+			skillHash: hashText(skill),
+			schemaHash: hashText(schema),
 			generatedFiles: [],
 			sourceFingerprints: {},
 		};
 		state.status = status;
-		state.templateHash = hashText(template);
+		state.skillHash = hashText(skill);
+		state.schemaHash = hashText(schema);
 		await this.write(root.uri, state);
 		return state;
 	}
@@ -128,7 +150,7 @@ export class WikiStateService {
 		throwIfAborted(signal);
 		const uris = await vscode.workspace.findFiles(
 			new vscode.RelativePattern(root, '**/*'),
-			'**/{.git,.wiki,node_modules,dist,out,.vscode-test}/**',
+			'**/{.git,.skills,node_modules,dist,out,.vscode-test}/**',
 			sourceMaxFiles,
 		);
 		const paths = new Map(uris.map((uri) => [uri.toString(), normalizeReviewPath(relativePath(root.uri, uri))]));
@@ -153,8 +175,12 @@ export class WikiStateService {
 		return fingerprints;
 	}
 
-	public async readBundledTemplate(): Promise<string> {
-		return decodeUtf8(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(this.extensionUri, 'llm-code-wiki', templateFileName)));
+	public async readBundledSkill(): Promise<string> {
+		return decodeUtf8(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(this.extensionUri, 'llm-code-wiki', skillFileName)));
+	}
+
+	public async readBundledSchema(): Promise<string> {
+		return decodeUtf8(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(this.extensionUri, 'llm-code-wiki', schemaFileName)));
 	}
 }
 
@@ -167,9 +193,10 @@ function isWikiState(value: unknown): value is WikiState {
 		return false;
 	}
 	const state = value as Partial<WikiState>;
-	return state.version === 1
+	return state.version === 2
 		&& typeof state.status === 'string'
-		&& typeof state.templateHash === 'string'
+		&& typeof state.skillHash === 'string'
+		&& typeof state.schemaHash === 'string'
 		&& Array.isArray(state.generatedFiles)
 		&& typeof state.sourceFingerprints === 'object'
 		&& state.sourceFingerprints !== null;

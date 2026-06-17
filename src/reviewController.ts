@@ -1595,8 +1595,8 @@ export class ReviewController implements vscode.Disposable {
 		}
 
 		const picked = await vscode.window.showQuickPick([
-			{ label: 'Pause', description: 'Keep generated .wiki files', mode: 'pause' as const },
-			{ label: 'Revert', description: 'Delete the workspace .wiki folder', mode: 'revert' as const },
+			{ label: 'Pause', description: 'Keep generated Code Wiki skill files', mode: 'pause' as const },
+			{ label: 'Revert', description: 'Delete the workspace Code Wiki skill folder', mode: 'revert' as const },
 		], { placeHolder: 'Cancel LLM Code Wiki initialization' });
 		if (!picked) {
 			return;
@@ -1617,9 +1617,9 @@ export class ReviewController implements vscode.Disposable {
 				this.appendWikiRunLog({
 					kind: 'run_error',
 					title: 'Initialization reverted',
-					summary: 'Deleted the generated .wiki folder',
+					summary: 'Deleted the generated Code Wiki skill folder',
 					status: 'info',
-					details: [this.wikiRunTextDetail('Result', 'Initialization reverted and .wiki was removed.')],
+					details: [this.wikiRunTextDetail('Result', 'Initialization reverted and the Code Wiki skill was removed.')],
 				});
 				await this.refreshLlmWikiDashboardState({ status: 'idle', progress: 'Initialization reverted.', error: undefined });
 				vscode.window.showInformationMessage('LLM Code Wiki initialization reverted.');
@@ -2113,7 +2113,7 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 
-		const indexUri = vscode.Uri.joinPath(root.uri, '.wiki', 'index.md');
+		const indexUri = vscode.Uri.joinPath(root.uri, '.skills', 'llm-code-wiki', 'references', 'index.md');
 		try {
 			await vscode.workspace.fs.stat(indexUri);
 		} catch {

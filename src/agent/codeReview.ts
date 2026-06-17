@@ -320,7 +320,7 @@ function aiReviewRunLimits(maxRounds: number | 'unlimited' | undefined): {
 export function sourcePendingFiles(session: ReviewSession | undefined): ReviewFileState[] {
 	return session
 		? [...session.files.values()]
-			.filter((file) => file.hunks.length > 0 && !file.relativePath.replace(/\\/g, '/').startsWith('.wiki/'))
+			.filter((file) => file.hunks.length > 0 && !file.relativePath.replace(/\\/g, '/').startsWith('.skills/llm-code-wiki/'))
 			.sort((left, right) => left.relativePath.localeCompare(right.relativePath))
 		: [];
 }

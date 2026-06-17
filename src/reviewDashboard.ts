@@ -1205,7 +1205,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					</button>
 					<div class="settings-menu-divider" role="separator"></div>
 					<button class="settings-menu-item" type="button" role="menuitem" data-menu-action="openWikiIndex">
-						<span class="settings-menu-title">Open Wiki home</span>
+						<span class="settings-menu-title">Open Code Wiki home</span>
 						<span class="settings-menu-reason"></span>
 					</button>
 					<button class="settings-menu-item" type="button" role="menuitem" data-menu-action="openExtensionSettings">
@@ -1511,7 +1511,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const runLog = wiki.runLog || [];
 			const reviewDetailFile = reviewDetailUri ? lastFiles.find((file) => file.uri === reviewDetailUri) : undefined;
 			const hasRunLog = runLog.length > 0 && Boolean(wiki.configured) && wikiMode === 'main';
-			const hasReviewDetail = Boolean(reviewDetailFile) && Boolean(wiki.configured) && wikiMode === 'main';
+			const hasReviewDetail = Boolean(reviewDetailFile) && wikiMode === 'main';
 			wikiPanel?.classList.toggle('has-run-log', hasRunLog);
 			wikiPanel?.classList.toggle('has-review-detail', hasReviewDetail);
 			wikiMain.classList.toggle('has-run-log', hasRunLog);
@@ -1528,15 +1528,15 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			}
 			if (!wiki.configured) {
 				renderFindings([]);
-				renderReviewFileDetail(undefined);
+				renderReviewFileDetail(reviewDetailFile);
 				renderRunLog([], wiki.runLogSource);
-				wikiLogo.hidden = false;
+				wikiLogo.hidden = hasReviewDetail;
 				wikiAction.classList.remove('secondary');
-				wikiAction.hidden = false;
+				wikiAction.hidden = hasReviewDetail;
 				wikiAction.disabled = false;
 				wikiAction.dataset.action = 'addModelConfig';
 				wikiAction.textContent = 'Add model configuration';
-				wikiStatus.textContent = 'No model configured\\nConfigure a model to use Wiki and AI review';
+				wikiStatus.textContent = hasReviewDetail ? '' : 'No model configured\\nConfigure a model to use Wiki and AI review';
 				return;
 			}
 
@@ -1587,13 +1587,13 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				running ? 'Agent is running'
 					: !wiki.configured ? 'Configure LLM first'
 						: !wiki.workspaceAvailable ? 'Open a workspace folder'
-							: !wiki.wikiExists ? 'Initialize Wiki first' : 'Wiki is up to date');
+							: !wiki.wikiExists ? 'Initialize Code Wiki first' : 'Code Wiki is up to date');
 			setMenuAction('generateAiReview', aiReviewActionLabel(wiki),
 				running || !wiki.configured || !wiki.workspaceAvailable || (wiki.pendingSourceCount || 0) === 0,
 				running ? 'Agent is running'
 					: !wiki.configured ? 'Configure LLM first'
 						: !wiki.workspaceAvailable ? 'Open a workspace folder' : 'No pending source changes');
-			setMenuAction('openWikiIndex', 'Open Wiki home', !openAvailable, openAvailable ? '' : 'Initialize Wiki first');
+			setMenuAction('openWikiIndex', 'Open Code Wiki home', !openAvailable, openAvailable ? '' : 'Initialize Code Wiki first');
 			setMenuAction('openExtensionSettings', 'Open extension settings', false, '');
 		}
 
@@ -1785,7 +1785,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					: 'AI review partial: ' + completed + '/' + total + ' files';
 			}
 			if (initialized) {
-				return '.wiki initialized';
+				return 'Knowledge base initialized';
 			}
 			if (wiki.status === 'failed') {
 				return wiki.error || 'Initialization failed';

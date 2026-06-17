@@ -16,7 +16,7 @@ export interface AgentToolOptions {
 	includeWikiTools?: boolean;
 }
 
-const protectedWikiFiles = new Set(['llm-code-wiki.md', '.state.json']);
+const protectedWikiFiles = new Set(['schema.md', 'SKILL.md', '.state.json']);
 const requiredWikiFiles = new Set([
 	'index.md',
 	'overview.md',
@@ -49,10 +49,10 @@ export function createReadOnlyAgentTools(options: AgentToolOptions): AgentTool[]
 	}
 	return [
 		...tools,
-		tool('list_wiki_files', 'List existing Markdown files under .wiki. Arguments: {}.', objectSchema({}), async (_args, signal) => {
+		tool('list_wiki_files', 'List existing Markdown files under .skills/llm-code-wiki/references. Arguments: {}.', objectSchema({}), async (_args, signal) => {
 			return { files: await listWikiFiles(options.root.uri, signal) };
 		}),
-		tool('read_wiki_file', 'Read one Markdown file under .wiki. Arguments: {"path":"architecture.md"}.', objectSchema({ path: stringSchema('Path relative to .wiki.') }), async (args, signal) => {
+		tool('read_wiki_file', 'Read one Markdown file under .skills/llm-code-wiki/references. Arguments: {"path":"architecture.md"}.', objectSchema({ path: stringSchema('Path relative to the Wiki references directory.') }), async (args, signal) => {
 			return readTextFile(options, wikiFileUri(options.root.uri, stringArgument(args, 'path'), true), signal);
 		}),
 	];
@@ -61,8 +61,8 @@ export function createReadOnlyAgentTools(options: AgentToolOptions): AgentTool[]
 export function createWikiAgentTools(options: AgentToolOptions): AgentTool[] {
 	return [
 		...createReadOnlyAgentTools({ ...options, includeWikiTools: true }),
-		tool('write_wiki_file', 'Create or replace generated Markdown under .wiki. Arguments: {"path":"overview.md","content":"# Overview"}; protected files cannot be changed.', objectSchema({
-			path: stringSchema('Markdown path relative to .wiki.'),
+		tool('write_wiki_file', 'Create or replace generated Markdown under .skills/llm-code-wiki/references. Arguments: {"path":"overview.md","content":"# Overview"}; protected files cannot be changed.', objectSchema({
+			path: stringSchema('Markdown path relative to the Wiki references directory.'),
 			content: stringSchema('Complete Markdown file content.'),
 		}), async (args, signal) => {
 			throwIfAborted(signal);
@@ -75,7 +75,7 @@ export function createWikiAgentTools(options: AgentToolOptions): AgentTool[] {
 			options.generatedFiles?.add(relativePath);
 			return { path: relativePath, chars: content.length };
 		}),
-		tool('delete_generated_wiki_file', 'Delete one previously generated Markdown file under .wiki. Arguments: {"path":"modules/old.md"}.', objectSchema({ path: stringSchema('Generated Markdown path relative to .wiki.') }), async (args, signal) => {
+		tool('delete_generated_wiki_file', 'Delete one previously generated Markdown file under .skills/llm-code-wiki/references. Arguments: {"path":"modules/old.md"}.', objectSchema({ path: stringSchema('Generated Markdown path relative to the Wiki references directory.') }), async (args, signal) => {
 			throwIfAborted(signal);
 			const relativePath = normalizeWikiMarkdownPath(stringArgument(args, 'path'), false);
 			if (requiredWikiFiles.has(relativePath)) {
@@ -92,7 +92,7 @@ export function createWikiAgentTools(options: AgentToolOptions): AgentTool[] {
 			options.generatedFiles.delete(relativePath);
 			return { path: relativePath, deleted: true };
 		}),
-		tool('append_wiki_log', 'Append a short Markdown entry to .wiki/log.md. Arguments: {"content":"## Entry..."}.', objectSchema({ content: stringSchema('Short Markdown log entry.') }), async (args, signal) => {
+		tool('append_wiki_log', 'Append a short Markdown entry to .skills/llm-code-wiki/references/log.md. Arguments: {"content":"## Entry..."}.', objectSchema({ content: stringSchema('Short Markdown log entry.') }), async (args, signal) => {
 			throwIfAborted(signal);
 			const uri = wikiFileUri(options.root.uri, 'log.md', false);
 			let existing = '';
@@ -113,7 +113,7 @@ async function listWorkspaceFiles(options: AgentToolOptions, signal?: AbortSigna
 	throwIfAborted(signal);
 	const uris = await vscode.workspace.findFiles(
 		new vscode.RelativePattern(options.root, '**/*'),
-		'**/{.git,.wiki,node_modules,dist,out,.vscode-test}/**',
+		'**/{.git,.skills,node_modules,dist,out,.vscode-test}/**',
 		options.maxFiles ?? 2000,
 	);
 	const paths = new Map(uris.map((uri) => [uri.toString(), normalizeReviewPath(relativePath(options.root.uri, uri))]));
@@ -137,7 +137,7 @@ async function listWorkspaceFiles(options: AgentToolOptions, signal?: AbortSigna
 
 async function listWikiFiles(rootUri: vscode.Uri, signal?: AbortSignal): Promise<string[]> {
 	throwIfAborted(signal);
-	const wikiUri = vscode.Uri.joinPath(rootUri, '.wiki');
+	const wikiUri = wikiReferencesUri(rootUri);
 	try {
 		const entries = await vscode.workspace.fs.readDirectory(wikiUri);
 		return listWikiEntries(wikiUri, entries, '', signal);
@@ -279,7 +279,11 @@ function workspaceFileUri(rootUri: vscode.Uri, candidate: string): vscode.Uri {
 
 function wikiFileUri(rootUri: vscode.Uri, candidate: string, allowProtected: boolean): vscode.Uri {
 	const normalized = normalizeWikiMarkdownPath(candidate, allowProtected);
-	return containedUri(vscode.Uri.joinPath(rootUri, '.wiki'), normalized);
+	return containedUri(wikiReferencesUri(rootUri), normalized);
+}
+
+function wikiReferencesUri(rootUri: vscode.Uri): vscode.Uri {
+	return vscode.Uri.joinPath(rootUri, '.skills', 'llm-code-wiki', 'references');
 }
 
 function normalizeWikiMarkdownPath(candidate: string, allowProtected: boolean): string {

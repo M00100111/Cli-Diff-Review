@@ -389,10 +389,13 @@ suite('Review state', () => {
 		assert.strictEqual(isDotReviewPath('src/.cache/output.txt'), true);
 		assert.strictEqual(shouldSkipReviewPath('src/app.ts'), false);
 		assert.strictEqual(shouldSkipReviewPath('src/file.name.ts'), false);
-		assert.strictEqual(shouldSkipReviewPath('.wiki/overview.md', true), false);
-		assert.strictEqual(shouldSkipReviewPath('.wiki/overview.md', false), true);
-		assert.strictEqual(shouldSkipReviewPath('.wiki/.state.json', true), true);
-		assert.strictEqual(shouldSkipReviewPath('.wiki/private.json', true), true);
+		assert.strictEqual(shouldSkipReviewPath('.skills/llm-code-wiki/SKILL.md', true), false);
+		assert.strictEqual(shouldSkipReviewPath('.skills/llm-code-wiki/references/overview.md', true), false);
+		assert.strictEqual(shouldSkipReviewPath('.skills/llm-code-wiki/references/overview.md', false), true);
+		assert.strictEqual(shouldSkipReviewPath('.skills/llm-code-wiki/.state.json', true), true);
+		assert.strictEqual(shouldSkipReviewPath('.skills/llm-code-wiki/private.json', true), true);
+		assert.strictEqual(shouldSkipReviewPath('.skills/other-skill/SKILL.md', true), true);
+		assert.strictEqual(shouldSkipReviewPath('.wiki/overview.md', true), true);
 	});
 
 	test('treats mismatched expected revisions as stale', () => {
@@ -901,12 +904,15 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes("wikiPanel?.classList.toggle('has-review-detail', hasReviewDetail)"));
 		assert.ok(view.webview.html.includes("wikiMain.classList.toggle('has-run-log', hasRunLog)"));
 		assert.ok(view.webview.html.includes("wikiMain.classList.toggle('has-review-detail', hasReviewDetail)"));
+		assert.ok(view.webview.html.includes("const hasReviewDetail = Boolean(reviewDetailFile) && wikiMode === 'main';"));
+		assert.ok(view.webview.html.includes('renderReviewFileDetail(reviewDetailFile);'));
+		assert.strictEqual(view.webview.html.includes('renderReviewFileDetail(undefined);'), false);
 		assert.ok(view.webview.html.includes('data-menu-action="initializeWiki"'));
 		assert.ok(view.webview.html.includes('data-menu-action="updateWiki"'));
 		assert.ok(view.webview.html.includes('data-menu-action="generateAiReview"'));
 		assert.ok(view.webview.html.includes('data-menu-action="openWikiIndex"'));
 		assert.ok(view.webview.html.includes('data-menu-action="openExtensionSettings"'));
-		assert.ok(view.webview.html.includes('Wiki is up to date'));
+		assert.ok(view.webview.html.includes('Code Wiki is up to date'));
 		assert.ok(view.webview.html.includes('No pending source changes'));
 		assert.ok(view.webview.html.includes('Agent is running'));
 		assert.ok(view.webview.html.includes("llmApiKey.value = '********'"));
@@ -1068,7 +1074,8 @@ suite('LLM Code Wiki', () => {
 		const extensionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-extension-'));
 		const repositoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-wiki-init-'));
 		try {
-			writeRepoFile(extensionRoot, 'llm-code-wiki/llm-code-wiki.md', '# Generic Wiki\n');
+			writeRepoFile(extensionRoot, 'llm-code-wiki/SKILL.md', '# Skill\n');
+			writeRepoFile(extensionRoot, 'llm-code-wiki/schema.md', '# Schema\n');
 			writeRepoFile(repositoryRoot, 'src/app.ts', 'export const value = 1;\n');
 			const wiki = validWikiResponse();
 			const responses = [
@@ -1697,13 +1704,25 @@ suite('Agent runtime', () => {
 	test('protects Wiki template and state files from Agent writes', async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-agent-'));
 		try {
+			writeRepoFile(root, '.skills/llm-code-wiki/references/schema.md', '# Schema\n');
 			const tools = createWikiAgentTools({ root: workspaceFolder(root), generatedFiles: new Set() });
+			const list = tools.find((tool) => tool.name === 'list_wiki_files');
+			const read = tools.find((tool) => tool.name === 'read_wiki_file');
 			const write = tools.find((tool) => tool.name === 'write_wiki_file');
+			assert.ok(list);
+			assert.ok(read);
 			assert.ok(write);
-			await assert.rejects(() => write.execute({ path: 'llm-code-wiki.md', content: 'changed' }), /protected/);
+			assert.deepStrictEqual(await list.execute({}, undefined), { files: ['schema.md'] });
+			assert.deepStrictEqual(await read.execute({ path: 'schema.md' }, undefined), {
+				path: '.skills/llm-code-wiki/references/schema.md',
+				content: '# Schema\n',
+				truncated: false,
+			});
+			await assert.rejects(() => write.execute({ path: 'schema.md', content: 'changed' }), /protected/);
+			await assert.rejects(() => write.execute({ path: 'SKILL.md', content: 'changed' }), /protected/);
 			await assert.rejects(() => write.execute({ path: '../outside.md', content: 'changed' }), /Invalid relative path/);
 			await write.execute({ path: 'overview.md', content: '# Overview\n' });
-			assert.strictEqual(fs.readFileSync(path.join(root, '.wiki', 'overview.md'), 'utf8'), '# Overview\n');
+			assert.strictEqual(fs.readFileSync(path.join(root, '.skills', 'llm-code-wiki', 'references', 'overview.md'), 'utf8'), '# Overview\n');
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -1715,18 +1734,25 @@ suite('Wiki state', () => {
 		const extensionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-extension-'));
 		const repositoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-wiki-state-'));
 		try {
-			writeRepoFile(extensionRoot, 'llm-code-wiki/llm-code-wiki.md', '# Generic Wiki\n');
+			writeRepoFile(extensionRoot, 'llm-code-wiki/SKILL.md', '# Skill\n');
+			writeRepoFile(extensionRoot, 'llm-code-wiki/schema.md', '# Schema\n');
 			writeRepoFile(repositoryRoot, 'src/app.ts', 'export const value = 1;\n');
 			writeRepoFile(repositoryRoot, '.env', 'secret\n');
 			const folder = workspaceFolder(repositoryRoot);
 			const service = new WikiStateService(vscode.Uri.file(extensionRoot));
 			const state = await service.ensureScaffold(folder, 'initializing');
 
-			assert.strictEqual(fs.readFileSync(path.join(repositoryRoot, '.wiki', 'llm-code-wiki.md'), 'utf8'), '# Generic Wiki\n');
+			assert.strictEqual(fs.existsSync(path.join(repositoryRoot, '.wiki')), false);
+			assert.strictEqual(fs.readFileSync(path.join(repositoryRoot, '.skills', 'llm-code-wiki', 'SKILL.md'), 'utf8'), '# Skill\n');
+			assert.strictEqual(fs.readFileSync(path.join(repositoryRoot, '.skills', 'llm-code-wiki', 'references', 'schema.md'), 'utf8'), '# Schema\n');
+			assert.strictEqual(state.version, 2);
+			assert.ok(state.skillHash);
+			assert.ok(state.schemaHash);
 			const ready = await service.completeRun(folder, state, 'done', ['overview.md']);
 			assert.strictEqual(ready.status, 'ready');
 			assert.ok(ready.sourceFingerprints['src/app.ts']);
 			assert.strictEqual(ready.sourceFingerprints['.env'], undefined);
+			assert.strictEqual(ready.sourceFingerprints['.skills/llm-code-wiki/references/schema.md'], undefined);
 
 			writeRepoFile(repositoryRoot, 'src/app.ts', 'export const value = 2;\n');
 			writeRepoFile(repositoryRoot, 'src/new.ts', 'export const next = true;\n');
@@ -2002,9 +2028,9 @@ suite('AI review findings', () => {
 
 	test('changes review signature when pending chunks change and skips Wiki files', () => {
 		const sourceUri = vscode.Uri.file('/repo/src/app.ts');
-		const wikiUri = vscode.Uri.file('/repo/.wiki/overview.md');
+		const wikiUri = vscode.Uri.file('/repo/.skills/llm-code-wiki/references/overview.md');
 		const source = reviewFileState(sourceUri, 'src/app.ts', { hunks: computeLineDiff(sourceUri.toString(), 'a\n', 'b\n') });
-		const wiki = reviewFileState(wikiUri, '.wiki/overview.md', { hunks: computeLineDiff(wikiUri.toString(), 'a\n', 'b\n') });
+		const wiki = reviewFileState(wikiUri, '.skills/llm-code-wiki/references/overview.md', { hunks: computeLineDiff(wikiUri.toString(), 'a\n', 'b\n') });
 		const session: ReviewSession = { id: 'x', mode: 'git', rootUri: vscode.Uri.file('/repo'), createdAt: 1, files: new Map([[sourceUri.toString(), source], [wikiUri.toString(), wiki]]) };
 		const first = reviewChangeSignature(session);
 		source.revision += 1;
@@ -2099,16 +2125,20 @@ suite('Git service', () => {
 			writeRepoFile(root, '.cache/output.txt', 'cache\n');
 			writeRepoFile(root, '.gitignore', 'ignored.txt\n');
 			writeRepoFile(root, 'ignored.txt', 'ignored\n');
-			writeRepoFile(root, '.wiki/overview.md', '# Overview\n');
-			writeRepoFile(root, '.wiki/.state.json', '{}\n');
+			writeRepoFile(root, '.skills/llm-code-wiki/SKILL.md', '# Skill\n');
+			writeRepoFile(root, '.skills/llm-code-wiki/references/overview.md', '# Overview\n');
+			writeRepoFile(root, '.skills/llm-code-wiki/.state.json', '{}\n');
+			writeRepoFile(root, '.skills/other-skill/SKILL.md', '# Other\n');
 			pairs = await service.createFilePairs(folder);
 			byPath = filePairsByPath(pairs);
 			assert.strictEqual(byPath.has('.env'), false);
 			assert.strictEqual(byPath.has('.cache/output.txt'), false);
 			assert.strictEqual(byPath.has('.gitignore'), false);
 			assert.strictEqual(byPath.has('ignored.txt'), false);
-			assert.strictEqual(byPath.has('.wiki/overview.md'), true);
-			assert.strictEqual(byPath.has('.wiki/.state.json'), false);
+			assert.strictEqual(byPath.has('.skills/llm-code-wiki/SKILL.md'), true);
+			assert.strictEqual(byPath.has('.skills/llm-code-wiki/references/overview.md'), true);
+			assert.strictEqual(byPath.has('.skills/llm-code-wiki/.state.json'), false);
+			assert.strictEqual(byPath.has('.skills/other-skill/SKILL.md'), false);
 		} finally {
 			removeTempRepo(root);
 		}

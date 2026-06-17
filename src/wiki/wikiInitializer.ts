@@ -17,7 +17,6 @@ export interface WikiInitializationResult {
 	summary: string;
 	fileCount: number;
 	warnings: string[];
-	migrated?: boolean;
 }
 
 export interface WikiInitializationOptions {
@@ -64,18 +63,6 @@ export class WikiInitializationService {
 	public async initialize(options: WikiInitializationOptions): Promise<WikiInitializationResult> {
 		throwIfAborted(options.signal);
 		const existingState = await this.stateService.read(options.root.uri);
-		if (await this.wikiExists(options.root.uri) && !existingState) {
-			options.onProgress?.({ message: 'Adopting existing .wiki' });
-			const state = await this.stateService.ensureScaffold(options.root, 'ready', options.signal);
-			const generatedFiles = await this.listGeneratedWikiFiles(options.root.uri);
-			await this.stateService.completeRun(options.root, state, 'Adopted existing wiki without overwriting Markdown.', generatedFiles, options.signal);
-			return {
-				summary: 'Existing .wiki adopted and synchronized.',
-				fileCount: generatedFiles.length,
-				warnings: ['Existing Markdown was preserved; no initialization Agent was run.'],
-				migrated: true,
-			};
-		}
 		if (existingState?.status === 'ready') {
 			throw new Error('LLM Code Wiki is already initialized for this workspace.');
 		}
@@ -159,13 +146,13 @@ export class WikiInitializationService {
 
 	public async deleteWiki(rootUri: vscode.Uri): Promise<void> {
 		const target = this.stateService.wikiUri(rootUri);
-		if (path.resolve(target.fsPath) !== path.resolve(rootUri.fsPath, '.wiki')) {
-			throw new Error('Refusing to delete a path outside the workspace .wiki directory.');
+		if (path.resolve(target.fsPath) !== path.resolve(rootUri.fsPath, '.skills', 'llm-code-wiki')) {
+			throw new Error('Refusing to delete a path outside the workspace LLM Code Wiki skill directory.');
 		}
 		try {
 			await vscode.workspace.fs.delete(target, { recursive: true, useTrash: false });
 		} catch {
-			// Reverting is complete if .wiki is already absent.
+			// Reverting is complete if the skill directory is already absent.
 		}
 	}
 
@@ -176,11 +163,11 @@ export class WikiInitializationService {
 		systemPrompt: string,
 		userPrompt: string,
 	): Promise<{ summary: string; warnings: string[] }> {
-		const repositorySpecification = decodeUtf8(await vscode.workspace.fs.readFile(this.stateService.templateUri(options.root.uri)));
+		const repositorySpecification = decodeUtf8(await vscode.workspace.fs.readFile(this.stateService.schemaUri(options.root.uri)));
 		const result = await this.runner.run({
 			config: options.config,
 			client: options.client,
-			systemPrompt: `${systemPrompt}\n\nRepository Wiki specification:\n${repositorySpecification}`,
+			systemPrompt: `${systemPrompt}\n\nRepository Wiki skill schema:\n${repositorySpecification}`,
 			userPrompt,
 			tools: createWikiAgentTools({ root: options.root, generatedFiles }),
 			signal: options.signal,
@@ -200,7 +187,7 @@ export class WikiInitializationService {
 	private async ensureRequiredFiles(rootUri: vscode.Uri): Promise<void> {
 		for (const required of requiredWikiFiles) {
 			try {
-				await vscode.workspace.fs.stat(vscode.Uri.joinPath(this.stateService.wikiUri(rootUri), required));
+				await vscode.workspace.fs.stat(vscode.Uri.joinPath(this.stateService.referencesUri(rootUri), required));
 			} catch {
 				throw new Error(`Wiki Agent did not create required file: ${required}`);
 			}
@@ -208,7 +195,7 @@ export class WikiInitializationService {
 	}
 
 	private async appendRunLog(rootUri: vscode.Uri, operation: 'initialize' | 'update', summary: string, config: LlmRuntimeConfig): Promise<void> {
-		const logUri = vscode.Uri.joinPath(this.stateService.wikiUri(rootUri), 'log.md');
+		const logUri = vscode.Uri.joinPath(this.stateService.referencesUri(rootUri), 'log.md');
 		let existing = '# Log\n';
 		try {
 			existing = decodeUtf8(await vscode.workspace.fs.readFile(logUri));
@@ -231,22 +218,6 @@ export class WikiInitializationService {
 		await this.stateService.write(rootUri, state);
 	}
 
-	private async listGeneratedWikiFiles(rootUri: vscode.Uri): Promise<string[]> {
-		const wikiUri = this.stateService.wikiUri(rootUri);
-		const files: string[] = [];
-		const visit = async (parent: vscode.Uri, prefix: string): Promise<void> => {
-			for (const [name, type] of await vscode.workspace.fs.readDirectory(parent)) {
-				const relative = prefix ? `${prefix}/${name}` : name;
-				if (type === vscode.FileType.Directory) {
-					await visit(vscode.Uri.joinPath(parent, name), relative);
-				} else if (relative.endsWith('.md') && relative !== 'llm-code-wiki.md') {
-					files.push(relative);
-				}
-			}
-		};
-		await visit(wikiUri, '');
-		return files.sort();
-	}
 }
 
 export function validateWikiInitializationResponse(value: unknown): WikiInitializationResponse {
@@ -303,7 +274,7 @@ function initializationSystemPrompt(): string {
 	return [
 		'You are the Wiki Initialization Agent for an arbitrary software repository.',
 		'Source code is read-only. You may create only generated Markdown through wiki write tools.',
-		'First read .wiki/llm-code-wiki.md with read_wiki_file, then inspect the repository incrementally.',
+		'First read references/schema.md with read_wiki_file using path "schema.md", then inspect the repository incrementally.',
 		'Create every required initial page described by the specification.',
 		'Use source paths as evidence and record uncertainty in open-questions.md.',
 	].join('\n');
@@ -321,7 +292,7 @@ function updateSystemPrompt(): string {
 	return [
 		'You are the Wiki Update Agent for an arbitrary software repository.',
 		'Source code is read-only. Update only generated Markdown through wiki write tools.',
-		'Read .wiki/llm-code-wiki.md and relevant existing Wiki pages before editing.',
+		'Read references/schema.md with read_wiki_file using path "schema.md" and relevant existing Wiki pages before editing.',
 		'Keep accurate existing content and revise only what source evidence supports.',
 	].join('\n');
 }

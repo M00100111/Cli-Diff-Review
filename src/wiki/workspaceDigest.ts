@@ -22,7 +22,7 @@ export async function buildWorkspaceDigest(root: vscode.WorkspaceFolder, signal?
 	throwIfAborted(signal);
 	const uris = await vscode.workspace.findFiles(
 		new vscode.RelativePattern(root, '**/*'),
-		'**/{.git,.wiki,node_modules,dist,out,.vscode-test}/**',
+		'**/{.git,.skills,node_modules,dist,out,.vscode-test}/**',
 		digestMaxFiles,
 	);
 	throwIfAborted(signal);
@@ -73,7 +73,7 @@ function shouldSkipDigestPath(relativePath: string): boolean {
 		'dist',
 		'out',
 		'.git',
-		'.wiki',
+		'.skills',
 		'.vscode-test',
 	].includes(segment));
 }

@@ -273,7 +273,7 @@
         "cliDiff.reviewWikiChanges": {
           "type": "boolean",
           "default": true,
-          "description": "Include generated .wiki Markdown changes in Cli Diff Review."
+          "description": "Include generated LLM Code Wiki skill Markdown changes in Cli Diff Review."
         },
         "cliDiff.aiReviewFindingOrder": {
           "type": "string",
