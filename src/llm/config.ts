@@ -225,14 +225,15 @@ export class LlmConfigStore {
 			provider = 'deepseek';
 			await this.context.globalState.update(providerKey, provider);
 		}
+		const storedThinkingMode = this.thinkingModeFromValue(this.context.globalState.get<string>(thinkingModeKey));
 		return this.normalizeProfile({
 			id: 'default',
 			provider,
 			baseUrl,
 			model,
-			jsonOutputEnabled: this.context.globalState.get<boolean>(jsonOutputKey, provider === 'openai'),
-			thinkingMode: this.thinkingModeFromValue(this.context.globalState.get<string>(thinkingModeKey)) ?? 'disabled',
-			strictTools: this.context.globalState.get<boolean>(strictToolsKey, provider === 'deepseek'),
+			jsonOutputEnabled: provider === 'deepseek' ? true : this.context.globalState.get<boolean>(jsonOutputKey, provider === 'openai'),
+			thinkingMode: provider === 'deepseek' ? storedThinkingMode ?? 'high' : 'disabled',
+			strictTools: provider === 'deepseek' ? this.context.globalState.get<boolean>(strictToolsKey, true) : false,
 		});
 	}
 

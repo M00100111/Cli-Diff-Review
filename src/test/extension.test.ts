@@ -1227,6 +1227,8 @@ suite('LLM Code Wiki', () => {
 		assert.strictEqual(saved.baseUrl, 'https://api.anthropic.com');
 		assert.strictEqual(saved.model, 'claude-test');
 		assert.strictEqual(saved.configured, true);
+		assert.strictEqual(saved.profiles.length, 1);
+		assert.strictEqual(saved.profiles[0].id, saved.activeProfileId);
 		assert.strictEqual(runtime?.apiKey, 'secret-key');
 		assert.strictEqual(saved.jsonOutputEnabled, false);
 		assert.strictEqual(saved.thinkingMode, 'disabled');
@@ -1234,6 +1236,7 @@ suite('LLM Code Wiki', () => {
 		assert.strictEqual(globalState.values.has('cliDiff.llm.apiKey'), false);
 
 		await store.save({
+			profileId: saved.activeProfileId,
 			provider: 'anthropic',
 			baseUrl: 'https://api.anthropic.com',
 			model: 'claude-updated',
@@ -1266,17 +1269,26 @@ suite('LLM Code Wiki', () => {
 	test('migrates legacy provider config to capability defaults', async () => {
 		const openAiState = new TestMemento();
 		openAiState.values.set('cliDiff.llm.provider', 'openai');
+		openAiState.values.set('cliDiff.llm.baseUrl', 'https://api.openai.com/v1');
+		openAiState.values.set('cliDiff.llm.model', 'gpt-test');
 		const anthropicState = new TestMemento();
 		anthropicState.values.set('cliDiff.llm.provider', 'anthropic');
-		const secrets = new TestSecretStorage();
+		anthropicState.values.set('cliDiff.llm.baseUrl', 'https://api.anthropic.com');
+		anthropicState.values.set('cliDiff.llm.model', 'claude-test');
+		const openAiSecrets = new TestSecretStorage();
+		await openAiSecrets.store('cliDiff.llm.apiKey', 'openai-secret');
+		const anthropicSecrets = new TestSecretStorage();
+		await anthropicSecrets.store('cliDiff.llm.apiKey', 'anthropic-secret');
 
-		const openAi = await new LlmConfigStore({ globalState: openAiState, secrets } as unknown as vscode.ExtensionContext).savedConfig();
-		const anthropic = await new LlmConfigStore({ globalState: anthropicState, secrets } as unknown as vscode.ExtensionContext).savedConfig();
+		const openAi = await new LlmConfigStore({ globalState: openAiState, secrets: openAiSecrets } as unknown as vscode.ExtensionContext).savedConfig();
+		const anthropic = await new LlmConfigStore({ globalState: anthropicState, secrets: anthropicSecrets } as unknown as vscode.ExtensionContext).savedConfig();
 
 		assert.strictEqual(openAi.jsonOutputEnabled, true);
 		assert.strictEqual(anthropic.jsonOutputEnabled, false);
 		assert.strictEqual(openAi.thinkingMode, 'disabled');
 		assert.strictEqual(anthropic.strictTools, false);
+		assert.strictEqual(openAi.activeProfileId, 'default');
+		assert.strictEqual(anthropic.profiles[0].configured, true);
 	});
 
 	test('migrates legacy OpenAI-compatible official DeepSeek config', async () => {
@@ -1659,6 +1671,11 @@ suite('Agent runtime', () => {
 			})]]),
 		};
 		const tools = createReadOnlyAgentTools({ root: workspaceFolder('/repo'), reviewSession: session });
+		assert.strictEqual(tools.some((tool) => tool.name === 'list_wiki_files'), false);
+		assert.strictEqual(tools.some((tool) => tool.name === 'read_wiki_file'), false);
+		const toolsWithWiki = createReadOnlyAgentTools({ root: workspaceFolder('/repo'), reviewSession: session, includeWikiTools: true });
+		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'list_wiki_files'), true);
+		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'read_wiki_file'), true);
 		const list = await tools.find((tool) => tool.name === 'list_workspace_files')?.execute({}, undefined) as { files: string[] };
 		const read = await tools.find((tool) => tool.name === 'read_workspace_file')?.execute({ path: 'src/deleted.ts' }, undefined) as {
 			content: string;
@@ -1852,7 +1869,7 @@ suite('AI review findings', () => {
 			createdAt: 1,
 			files: new Map([[uri.toString(), file]]),
 		};
-		const reviewWithLanguage = async (language: 'zh-CN' | 'en'): Promise<string> => {
+		const reviewWithLanguage = async (language: 'zh-CN' | 'en', includeWikiTools = false): Promise<string> => {
 			let systemPrompt = '';
 			await new CodeReviewAgentService().review({
 				session,
@@ -1865,16 +1882,22 @@ suite('AI review findings', () => {
 					},
 				},
 				language,
+				includeWikiTools,
 			});
 			return systemPrompt;
 		};
 
 		const zhPrompt = await reviewWithLanguage('zh-CN');
 		const enPrompt = await reviewWithLanguage('en');
+		const wikiPrompt = await reviewWithLanguage('en', true);
 		assert.ok(zhPrompt.includes('Simplified Chinese'));
 		assert.ok(enPrompt.includes('English'));
 		assert.ok(zhPrompt.includes('Do not translate hunkId values'));
 		assert.ok(enPrompt.includes('Do not translate hunkId values'));
+		assert.ok(enPrompt.includes('Source files are read-only.'));
+		assert.strictEqual(enPrompt.includes('optional Wiki context'), false);
+		assert.ok(wikiPrompt.includes('Source and Wiki files are read-only.'));
+		assert.ok(wikiPrompt.includes('optional Wiki context'));
 		assert.ok(zhPrompt.includes('Keep finding title, explanation, and recommendation concise'));
 		assert.ok(enPrompt.includes('valid JSON string content'));
 		assert.ok(enPrompt.includes('replacementText replaces the entire current newText'));

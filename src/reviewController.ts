@@ -1842,6 +1842,7 @@ export class ReviewController implements vscode.Disposable {
 			if (!root) {
 				throw new Error('The active review workspace is not available.');
 			}
+			const includeWikiTools = (await this.wikiInitializationService.state(root.uri))?.status === 'ready';
 			const task: WikiInitializationTask = {
 				kind: 'review',
 				root,
@@ -1869,12 +1870,13 @@ export class ReviewController implements vscode.Disposable {
 					language,
 					maxRounds: maxRounds === 'unlimited' ? 'unlimited' : maxRounds,
 					mode: existingReview ? 'continue' : 'generate',
+					wikiContext: includeWikiTools ? 'enabled' : 'disabled',
 					completedFiles: existingReview?.completedFiles.length ?? 0,
 					files: files.map((file) => ({ uri: file.uri.toString(), relativePath: file.relativePath, chunks: file.hunks.length })),
 				})],
 			}, 'review');
 			this.applyLlmWikiDashboardState({ status: 'reviewing', progress: 'Preparing AI review', error: undefined });
-			task.done = this.runAiReview(task, config, createLlmClient(config), session, language, maxRounds, existingReview);
+			task.done = this.runAiReview(task, config, createLlmClient(config), session, language, maxRounds, includeWikiTools, existingReview);
 			await task.done;
 		} catch (error) {
 			this.showError(error);
@@ -1888,6 +1890,7 @@ export class ReviewController implements vscode.Disposable {
 		session: ReviewSession,
 		language: AiReviewLanguage,
 		maxRounds: number | 'unlimited',
+		includeWikiTools: boolean,
 		existingReview?: StoredAiReview,
 	): Promise<void> {
 		try {
@@ -1898,6 +1901,7 @@ export class ReviewController implements vscode.Disposable {
 				client,
 				language,
 				existingReview,
+				includeWikiTools,
 				maxRounds,
 				signal: task.abortController.signal,
 				onProgress: (message) => this.currentWikiTask === task

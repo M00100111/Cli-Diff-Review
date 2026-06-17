@@ -13,6 +13,7 @@ export interface AgentToolOptions {
 	maxFileBytes?: number;
 	maxReadChars?: number;
 	reviewSession?: ReviewSession;
+	includeWikiTools?: boolean;
 }
 
 const protectedWikiFiles = new Set(['llm-code-wiki.md', '.state.json']);
@@ -29,7 +30,7 @@ const requiredWikiFiles = new Set([
 ]);
 
 export function createReadOnlyAgentTools(options: AgentToolOptions): AgentTool[] {
-	return [
+	const tools = [
 		tool('list_workspace_files', 'List readable source files in the workspace. Arguments: {}.', objectSchema({}), async (_args, signal) => {
 			return { files: await listWorkspaceFiles(options, signal) };
 		}),
@@ -42,6 +43,12 @@ export function createReadOnlyAgentTools(options: AgentToolOptions): AgentTool[]
 		}), async (args, signal) => {
 			return searchWorkspace(options, stringArgument(args, 'query'), numberArgument(args, 'limit', 50), signal);
 		}),
+	];
+	if (!options.includeWikiTools) {
+		return tools;
+	}
+	return [
+		...tools,
 		tool('list_wiki_files', 'List existing Markdown files under .wiki. Arguments: {}.', objectSchema({}), async (_args, signal) => {
 			return { files: await listWikiFiles(options.root.uri, signal) };
 		}),
@@ -53,7 +60,7 @@ export function createReadOnlyAgentTools(options: AgentToolOptions): AgentTool[]
 
 export function createWikiAgentTools(options: AgentToolOptions): AgentTool[] {
 	return [
-		...createReadOnlyAgentTools(options),
+		...createReadOnlyAgentTools({ ...options, includeWikiTools: true }),
 		tool('write_wiki_file', 'Create or replace generated Markdown under .wiki. Arguments: {"path":"overview.md","content":"# Overview"}; protected files cannot be changed.', objectSchema({
 			path: stringSchema('Markdown path relative to .wiki.'),
 			content: stringSchema('Complete Markdown file content.'),

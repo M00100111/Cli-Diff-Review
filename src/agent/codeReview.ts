@@ -116,6 +116,7 @@ export interface CodeReviewAgentOptions {
 	client: LlmClient;
 	language: AiReviewLanguage;
 	existingReview?: StoredAiReview;
+	includeWikiTools?: boolean;
 	maxRounds?: number | 'unlimited';
 	signal?: AbortSignal;
 	onProgress?: (message: string) => void;
@@ -157,9 +158,13 @@ export class CodeReviewAgentService {
 				const result = await this.runner.run({
 					config: options.config,
 					client: options.client,
-					systemPrompt: reviewSystemPrompt(options.language),
+					systemPrompt: reviewSystemPrompt(options.language, Boolean(options.includeWikiTools)),
 					userPrompt: reviewUserPrompt(file),
-					tools: createReadOnlyAgentTools({ root: options.root, reviewSession: options.session }),
+					tools: createReadOnlyAgentTools({
+						root: options.root,
+						reviewSession: options.session,
+						includeWikiTools: Boolean(options.includeWikiTools),
+					}),
 					signal: options.signal,
 					onProgress: (progress) => options.onProgress?.(`${file.relativePath}: ${progress.message}`),
 					onTrace: (event) => options.onTrace?.(event, context),
@@ -496,11 +501,15 @@ export function sortFindings(
 		|| left.generationOrder - right.generationOrder);
 }
 
-function reviewSystemPrompt(language: AiReviewLanguage): string {
+function reviewSystemPrompt(language: AiReviewLanguage, includeWikiTools: boolean): string {
 	return [
 		'You are a source-grounded Code Review Agent.',
-		'Review only the supplied pending hunks. Source and Wiki files are read-only.',
-		'Use tools when needed to inspect callers, tests, configuration, and optional Wiki context.',
+		includeWikiTools
+			? 'Review only the supplied pending hunks. Source and Wiki files are read-only.'
+			: 'Review only the supplied pending hunks. Source files are read-only.',
+		includeWikiTools
+			? 'Use tools when needed to inspect callers, tests, configuration, and optional Wiki context.'
+			: 'Use tools when needed to inspect callers, tests, and configuration.',
 		'Report concrete correctness, reliability, security, or maintainability risks; avoid generic praise.',
 		'Every finding must bind to one supplied hunkId.',
 		'When a concise code change would help, include at most one suggestion per non-delete hunk. A suggestion replacementText replaces the entire current newText for that hunk. Do not create suggestions for delete hunks.',
