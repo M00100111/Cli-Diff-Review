@@ -1070,6 +1070,31 @@ suite('LLM Code Wiki', () => {
 		}));
 	});
 
+	test('documents normal coding agent collaboration boundaries', () => {
+		const root = path.join(__dirname, '..', '..');
+		const skill = fs.readFileSync(path.join(root, 'llm-code-wiki', 'SKILL.md'), 'utf8');
+		const schema = fs.readFileSync(path.join(root, 'llm-code-wiki', 'schema.md'), 'utf8');
+		const initializer = fs.readFileSync(path.join(root, 'src', 'wiki', 'wikiInitializer.ts'), 'utf8');
+
+		assert.ok(skill.includes('✨💬 我已阅读llm-code-wiki.SKILL.md'));
+		assert.ok(skill.includes('✨🎯 我已阅读llm-code-wiki/references：{references名称}'));
+		assert.ok(skill.includes('Do not read every reference page at once unless the task truly requires broad repository context.'));
+		assert.ok(skill.includes('Normal coding agents may help maintain business knowledge pages under `references/`'));
+		assert.ok(skill.includes('Do not modify `SKILL.md`, `references/schema.md`, or `.state.json`.'));
+		assert.ok(skill.includes('✨⚠️ 检测到较多知识库内容可能已过期，建议在 Cli Diff Review 中执行 Update LLM Code Wiki。'));
+
+		assert.ok(schema.includes('`Host Wiki Agent`: the Cli Diff Review plugin Agent'));
+		assert.ok(schema.includes('`Normal coding agent`: an external coding agent'));
+		assert.ok(schema.includes('`AI Review Agent`: the Cli Diff Review review Agent'));
+		assert.ok(schema.includes('Normal coding agents may edit business knowledge pages'));
+		assert.ok(schema.includes('Do not list `references/schema.md` as a normal knowledge page.'));
+		assert.ok(schema.includes('`.state.json`'));
+
+		assert.ok(initializer.includes('do not list schema.md in the main index catalog'));
+		assert.ok(initializer.includes('Preserve and integrate source-grounded Wiki updates already made by normal coding agents'));
+		assert.ok(initializer.includes('Do not add schema.md to the normal index.md catalog of business wiki pages.'));
+	});
+
 	test('passes Agent trace events through Wiki initialization', async () => {
 		const extensionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-extension-'));
 		const repositoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-wiki-init-'));

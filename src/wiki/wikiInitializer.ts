@@ -276,6 +276,7 @@ function initializationSystemPrompt(): string {
 		'Source code is read-only. You may create only generated Markdown through wiki write tools.',
 		'First read references/schema.md with read_wiki_file using path "schema.md", then inspect the repository incrementally.',
 		'Create every required initial page described by the specification.',
+		'Generate index.md as a normal coding-agent navigation page for business wiki content; do not list schema.md in the main index catalog.',
 		'Use source paths as evidence and record uncertainty in open-questions.md.',
 	].join('\n');
 }
@@ -294,6 +295,8 @@ function updateSystemPrompt(): string {
 		'Source code is read-only. Update only generated Markdown through wiki write tools.',
 		'Read references/schema.md with read_wiki_file using path "schema.md" and relevant existing Wiki pages before editing.',
 		'Keep accurate existing content and revise only what source evidence supports.',
+		'Preserve and integrate source-grounded Wiki updates already made by normal coding agents; do not overwrite them without evidence.',
+		'Do not add schema.md to the normal index.md catalog of business wiki pages.',
 	].join('\n');
 }
 

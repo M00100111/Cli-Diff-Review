@@ -7,7 +7,7 @@ The source tree is always the source of truth. `.skills/llm-code-wiki` is a comp
 ## Structure
 
 - `SKILL.md`: short entry point for coding agents.
-- `references/schema.md`: this maintenance schema.
+- `references/schema.md`: this maintenance schema, reserved for host plugin maintenance rules.
 - `references/index.md`: entry point and catalog of wiki pages.
 - `references/overview.md`: project purpose, users, and major capabilities.
 - `references/architecture.md`: subsystem boundaries and data flow.
@@ -19,6 +19,8 @@ The source tree is always the source of truth. `.skills/llm-code-wiki` is a comp
 - `references/log.md`: append-only history of wiki initialization and updates.
 
 Additional Markdown pages may be created under `references/` when they improve navigation. Prefer a small number of useful pages over many shallow pages.
+
+`references/index.md` should catalog business knowledge pages. Do not list `references/schema.md` as a normal knowledge page. If needed, mention that `schema.md` is reserved for host plugin maintenance.
 
 ## Goals
 
@@ -44,22 +46,33 @@ When documenting a workflow, include its trigger, main steps, state transitions,
 
 ## Agent rules
 
-The Agent may read source files and wiki pages through the tools provided by the host plugin.
+There are three agent roles:
 
-The Agent may write only generated Markdown files inside `.skills/llm-code-wiki/references`.
+- `Host Wiki Agent`: the Cli Diff Review plugin Agent that initializes, updates, validates, and synchronizes the wiki.
+- `Normal coding agent`: an external coding agent such as Codex or Claude Code that may use and improve business wiki pages while coding.
+- `AI Review Agent`: the Cli Diff Review review Agent that may read wiki context for code review but must not modify wiki files.
 
-The Agent must never:
+The Host Wiki Agent may read source files and wiki pages through the tools provided by the host plugin. It may write generated Markdown files inside `.skills/llm-code-wiki/references`.
 
-- Modify repository source files.
+Normal coding agents may edit business knowledge pages under `.skills/llm-code-wiki/references` when the edits are grounded in source evidence. They should update `references/index.md` when adding a new business knowledge page.
+
+The AI Review Agent treats source and wiki files as read-only.
+
+`.state.json` is private plugin state and may be updated only by the host plugin.
+
+When maintaining the wiki, agents must never:
+
+- Modify repository source files as part of wiki maintenance.
 - Modify `.skills/llm-code-wiki/SKILL.md`.
 - Modify `.skills/llm-code-wiki/references/schema.md`.
 - Modify `.skills/llm-code-wiki/.state.json`.
-- Write outside `.skills/llm-code-wiki/references`.
 - Invent repository facts that are not supported by source evidence.
 
 For initialization, inspect the repository before creating all required pages.
 
-For updates, inspect changed source files and related wiki pages, then revise only affected wiki content. Update cross-links and append an entry to `references/log.md`.
+For plugin-driven updates, inspect changed source files and related wiki pages, then revise only affected wiki content. Preserve and integrate source-grounded wiki edits made by normal coding agents. Update cross-links and append an entry to `references/log.md`.
+
+Normal coding agents should avoid deleting wiki pages. If content appears stale, update it, mark uncertainty, or tell the user that the wiki should be refreshed by the plugin.
 
 ## Host Agent protocol
 
