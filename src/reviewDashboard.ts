@@ -12,6 +12,9 @@ type DashboardMessage =
 	| { type: 'acceptFile'; uri: string }
 	| { type: 'rejectFile'; uri: string }
 	| { type: 'undoFile'; uri: string }
+	| { type: 'acceptChunk'; uri: string; hunkId: string }
+	| { type: 'rejectChunk'; uri: string; hunkId: string }
+	| { type: 'undoChunk'; uri: string; hunkId: string }
 	| { type: 'acceptAll' }
 	| { type: 'rejectAll' }
 	| { type: 'undoAll' }
@@ -53,6 +56,10 @@ export interface ReviewDashboardChunk {
 		replacementText: string;
 	};
 	reviewStatus?: 'pending' | 'reviewed';
+	reviewDecision?: 'accepted' | 'rejected';
+	canAccept: boolean;
+	canReject: boolean;
+	canUndo: boolean;
 }
 
 export interface ReviewDashboardFile {
@@ -211,6 +218,21 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 		if (message.type === 'undoFile') {
 			await this.executeCommand('cli-diff.undoFile', message.uri);
+			this.postState();
+			return;
+		}
+		if (message.type === 'acceptChunk') {
+			await this.executeCommand('cli-diff.acceptChange', message.uri, message.hunkId);
+			this.postState();
+			return;
+		}
+		if (message.type === 'rejectChunk') {
+			await this.executeCommand('cli-diff.rejectChange', message.uri, message.hunkId);
+			this.postState();
+			return;
+		}
+		if (message.type === 'undoChunk') {
+			await this.executeCommand('cli-diff.restoreChange', message.uri, message.hunkId);
 			this.postState();
 			return;
 		}
@@ -893,12 +915,47 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		.review-chunk-summary {
 			display: grid;
 			grid-template-columns: minmax(0, 1fr) auto;
+			align-items: start;
 			gap: 6px;
 			padding: 5px 6px;
 			cursor: pointer;
 			list-style: none;
 		}
 		.review-chunk-summary::-webkit-details-marker { display: none; }
+		.review-chunk-side {
+			display: flex;
+			align-items: flex-start;
+			gap: 4px;
+		}
+		.review-chunk-actions {
+			display: inline-flex;
+			align-items: center;
+			gap: 1px;
+		}
+		.review-chunk-action {
+			width: 18px;
+			height: 18px;
+			padding: 0;
+			display: inline-grid;
+			place-items: center;
+			border-radius: 3px;
+		}
+		.review-chunk-action svg {
+			width: 13px;
+			height: 13px;
+			stroke: currentColor;
+			fill: none;
+			stroke-width: 1.8;
+			stroke-linecap: round;
+			stroke-linejoin: round;
+		}
+		.review-chunk-action.accept { color: var(--untracked); }
+		.review-chunk-action.reject { color: var(--deleted); }
+		.review-chunk-action.undo { color: var(--muted); }
+		.review-chunk-action:disabled {
+			opacity: 0.45;
+			cursor: default;
+		}
 		.review-chunk-body {
 			display: flex;
 			flex-direction: column;
@@ -1438,6 +1495,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			acceptFile: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5L6.5 11.5L12.5 4.5"/></svg>',
 			rejectFile: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 4.5L11.5 11.5"/><path d="M11.5 4.5L4.5 11.5"/></svg>',
 			undoFile: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5H3.5V3.5"/><path d="M3.8 5.4A5 5 0 1 1 4.9 12"/></svg>',
+			acceptChunk: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5L6.5 11.5L12.5 4.5"/></svg>',
+			rejectChunk: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 4.5L11.5 11.5"/><path d="M11.5 4.5L4.5 11.5"/></svg>',
+			undoChunk: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5H3.5V3.5"/><path d="M3.8 5.4A5 5 0 1 1 4.9 12"/></svg>',
 		};
 		window.addEventListener('message', (event) => {
 			if (event.data?.type !== 'state') {
@@ -1878,16 +1938,25 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			main.className = 'wiki-run-main';
 			const title = document.createElement('span');
 			title.className = 'wiki-run-title';
-			title.textContent = (chunk.reviewStatus === 'reviewed' ? 'reviewed ' : '') + chunk.kind + ' ' + chunk.oldLines + '->' + chunk.newLines + ' lines';
+			const decisionLabel = chunk.reviewDecision || (chunk.reviewStatus === 'reviewed' ? 'reviewed' : '');
+			title.textContent = (decisionLabel ? decisionLabel + ' · ' : '') + chunk.kind + ' ' + chunk.oldLines + '->' + chunk.newLines + ' lines';
 			const meta = document.createElement('span');
 			meta.className = 'wiki-run-meta';
 			meta.textContent = 'line ' + (chunk.line + 1) + ' | ' + (findings.length || 'No') + ' findings'
 				+ (suggestions.length > 0 ? ' | ' + suggestions.length + ' suggestion' + (suggestions.length === 1 ? '' : 's') : '');
 			main.append(title, meta);
-			const status = document.createElement('span');
-			status.className = 'wiki-run-status ' + (findings.length > 0 ? 'success' : 'info');
-			status.textContent = findings.length > 0 ? String(findings.length) : '0';
-			summary.append(main, status);
+			const side = document.createElement('span');
+			side.className = 'review-chunk-side';
+			const actions = document.createElement('span');
+			actions.className = 'review-chunk-actions';
+			if (chunk.reviewStatus === 'reviewed') {
+				actions.appendChild(chunkActionButton('undoChunk', file.uri, chunk.hunkId, !chunk.canUndo, 'Undo chunk', 'undo'));
+			} else {
+				actions.appendChild(chunkActionButton('rejectChunk', file.uri, chunk.hunkId, !chunk.canReject, 'Reject chunk', 'reject'));
+				actions.appendChild(chunkActionButton('acceptChunk', file.uri, chunk.hunkId, !chunk.canAccept, 'Accept chunk', 'accept'));
+			}
+			side.append(actions);
+			summary.append(main, side);
 			details.appendChild(summary);
 
 			const body = document.createElement('div');
@@ -2329,6 +2398,25 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			return button;
 		}
 
+		function chunkActionButton(type, uri, hunkId, disabled, title, tone) {
+			const button = document.createElement('button');
+			button.type = 'button';
+			button.className = 'icon-button review-chunk-action ' + tone;
+			button.title = title;
+			button.setAttribute('aria-label', title);
+			button.innerHTML = icons[type] || '';
+			button.disabled = Boolean(disabled);
+			button.addEventListener('click', (event) => {
+				event.preventDefault();
+				event.stopPropagation();
+				if (button.disabled) {
+					return;
+				}
+				vscode.postMessage({ type, uri, hunkId });
+			});
+			return button;
+		}
+
 		function setExpanded(nextExpanded) {
 			expanded = Boolean(nextExpanded);
 			toggle.setAttribute('aria-expanded', String(expanded));
@@ -2400,7 +2488,7 @@ export function buildReviewDashboardPayload(
 					acceptDisabled: mutationDisabled || pendingCount === 0,
 					rejectDisabled: mutationDisabled || pendingCount === 0,
 					undoDisabled: mutationDisabled || reviewedCount === 0,
-					chunks: dashboardChunks(file, findingsByChunk, findingsByFile, suggestionsByChunk, suggestionsByFile),
+					chunks: dashboardChunks(file, findingsByChunk, findingsByFile, suggestionsByChunk, suggestionsByFile, mutationDisabled),
 					aiReviewResult: fileResultsByUri.get(file.uri.toString()),
 				};
 			})
@@ -2470,6 +2558,7 @@ function dashboardChunks(
 	findingsByFile: Map<string, AiReviewFinding[]>,
 	suggestionsByChunk: Map<string, AiReviewChunkSuggestion[]>,
 	suggestionsByFile: Map<string, AiReviewChunkSuggestion[]>,
+	mutationDisabled: boolean,
 ): ReviewDashboardChunk[] {
 	const uri = file.uri.toString();
 	const appliedByHunk = new Map(file.appliedAiSuggestions.map((suggestion) => [suggestion.hunkId, {
@@ -2486,8 +2575,32 @@ function dashboardChunks(
 		suggestions: suggestionsByChunk.get(`${uri}#${hunk.id}`) ?? [],
 		appliedSuggestion: appliedByHunk.get(hunk.id),
 		reviewStatus: 'pending',
+		canAccept: !mutationDisabled,
+		canReject: !mutationDisabled,
+		canUndo: false,
 	}));
 	const seen = new Set(chunks.map((chunk) => chunk.hunkId));
+	for (const hunk of [...file.acceptedHunks, ...file.rejectedHunks]) {
+		if (seen.has(hunk.id)) {
+			continue;
+		}
+		seen.add(hunk.id);
+		chunks.push({
+			hunkId: hunk.id,
+			kind: hunk.kind,
+			line: hunk.displayStart,
+			oldLines: hunk.oldLines,
+			newLines: hunk.newLines,
+			findings: findingsByChunk.get(`${uri}#${hunk.id}`) ?? [],
+			suggestions: suggestionsByChunk.get(`${uri}#${hunk.id}`) ?? [],
+			appliedSuggestion: appliedByHunk.get(hunk.id),
+			reviewStatus: 'reviewed',
+			reviewDecision: hunk.status,
+			canAccept: false,
+			canReject: false,
+			canUndo: !mutationDisabled,
+		});
+	}
 	for (const item of [...(findingsByFile.get(uri) ?? []), ...(suggestionsByFile.get(uri) ?? [])]) {
 		if (seen.has(item.hunkId)) {
 			continue;
@@ -2503,6 +2616,9 @@ function dashboardChunks(
 			suggestions: suggestionsByChunk.get(`${uri}#${item.hunkId}`) ?? [],
 			appliedSuggestion: appliedByHunk.get(item.hunkId),
 			reviewStatus: 'reviewed',
+			canAccept: false,
+			canReject: false,
+			canUndo: false,
 		});
 	}
 	return chunks.sort((left, right) => left.line - right.line || left.hunkId.localeCompare(right.hunkId));

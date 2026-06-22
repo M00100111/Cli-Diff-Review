@@ -709,8 +709,17 @@ suite('Review state', () => {
 		assert.strictEqual(pending?.acceptDisabled, true);
 		assert.strictEqual(pending?.chunks.length, 1);
 		assert.strictEqual(pending?.chunks[0].hunkId, pendingHunk.id);
+		assert.strictEqual(pending?.chunks[0].canAccept, false);
+		assert.strictEqual(pending?.chunks[0].canReject, false);
+		assert.strictEqual(pending?.chunks[0].canUndo, false);
 		assert.strictEqual(Object.prototype.hasOwnProperty.call(pending?.chunks[0] ?? {}, 'preview'), false);
 		assert.strictEqual(reviewed?.undoDisabled, false);
+		assert.strictEqual(reviewed?.chunks.length, 1);
+		assert.strictEqual(reviewed?.chunks[0].reviewStatus, 'reviewed');
+		assert.strictEqual(reviewed?.chunks[0].reviewDecision, 'accepted');
+		assert.strictEqual(reviewed?.chunks[0].canAccept, false);
+		assert.strictEqual(reviewed?.chunks[0].canReject, false);
+		assert.strictEqual(reviewed?.chunks[0].canUndo, true);
 		assert.strictEqual(skipped?.acceptDisabled, true);
 		assert.strictEqual(skipped?.rejectDisabled, true);
 		assert.strictEqual(skipped?.undoDisabled, true);
@@ -737,7 +746,10 @@ suite('Review state', () => {
 				generationOrder: 0,
 			}],
 		});
-		assert.strictEqual(findingPayload.files.find((file) => file.relativePath === 'src/pending.ts')?.chunks[0].findings[0].title, 'Mapped finding');
+		const mappedFindingChunk = findingPayload.files
+			.find((file) => file.relativePath === 'src/pending.ts')
+			?.chunks.find((chunk) => chunk.hunkId === pendingHunk.id);
+		assert.strictEqual(mappedFindingChunk?.findings[0].title, 'Mapped finding');
 		session.files.set(pendingUri.toString(), reviewFileState(pendingUri, 'src/pending.ts', {
 			hunks: [pendingHunk],
 			appliedAiSuggestions: [{
@@ -795,7 +807,9 @@ suite('Review state', () => {
 				generationOrder: 0,
 			}],
 		});
-		const reviewedFindingChunk = reviewedFindingPayload.files.find((file) => file.relativePath === 'src/reviewed.ts')?.chunks[0];
+		const reviewedFindingChunk = reviewedFindingPayload.files
+			.find((file) => file.relativePath === 'src/reviewed.ts')
+			?.chunks.find((chunk) => chunk.hunkId === reviewedHunk.id);
 		assert.strictEqual(reviewedFindingChunk?.reviewStatus, 'reviewed');
 		assert.strictEqual(reviewedFindingChunk?.findings[0].title, 'Reviewed finding');
 	});
@@ -863,6 +877,8 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('wiki-run-file'));
 		assert.ok(view.webview.html.includes('review-file-detail'));
 		assert.ok(view.webview.html.includes('review-chunk'));
+		assert.ok(view.webview.html.includes('review-chunk-action'));
+		assert.ok(view.webview.html.includes('function chunkActionButton'));
 		assert.ok(view.webview.html.includes('acceptAllButton.addEventListener'));
 		assert.ok(view.webview.html.includes('rejectAllButton.addEventListener'));
 		assert.ok(view.webview.html.includes('undoAllButton.addEventListener'));
@@ -874,6 +890,10 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('rejectAllButton.disabled = pendingCount === 0'));
 		assert.ok(view.webview.html.includes('undoAllButton.disabled = reviewedCount === 0'));
 		assert.ok(view.webview.html.includes('openChunk'));
+		assert.ok(view.webview.html.includes("chunkActionButton('acceptChunk'"));
+		assert.ok(view.webview.html.includes("chunkActionButton('rejectChunk'"));
+		assert.ok(view.webview.html.includes("chunkActionButton('undoChunk'"));
+		assert.ok(view.webview.html.includes('vscode.postMessage({ type, uri, hunkId })'));
 		assert.ok(view.webview.html.includes('.review-chunk.add'));
 		assert.ok(view.webview.html.includes('.review-chunk.delete'));
 		assert.ok(view.webview.html.includes('.review-chunk.modify'));
@@ -967,6 +987,19 @@ suite('Review state', () => {
 		messageHandler({ type: 'openChunk', uri: uri.toString(), hunkId: 'hunk-1' });
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.openAiReviewFinding'
+			&& call.args[0] === uri.toString()
+			&& call.args[1] === 'hunk-1'));
+		messageHandler({ type: 'acceptChunk', uri: uri.toString(), hunkId: 'hunk-1' });
+		messageHandler({ type: 'rejectChunk', uri: uri.toString(), hunkId: 'hunk-1' });
+		messageHandler({ type: 'undoChunk', uri: uri.toString(), hunkId: 'hunk-1' });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.ok(commands.some((call) => call.command === 'cli-diff.acceptChange'
+			&& call.args[0] === uri.toString()
+			&& call.args[1] === 'hunk-1'));
+		assert.ok(commands.some((call) => call.command === 'cli-diff.rejectChange'
+			&& call.args[0] === uri.toString()
+			&& call.args[1] === 'hunk-1'));
+		assert.ok(commands.some((call) => call.command === 'cli-diff.restoreChange'
 			&& call.args[0] === uri.toString()
 			&& call.args[1] === 'hunk-1'));
 		messageHandler({ type: 'applyAiSuggestion', uri: uri.toString(), hunkId: 'hunk-1', suggestionId: 'suggestion-1' });
