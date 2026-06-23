@@ -1,5 +1,5 @@
 import { splitLines } from './text';
-import type { FilePair, ReviewFileState } from './types';
+import type { FilePair, ReviewFileState, ReviewHunk } from './types';
 
 export function isStaleRevision(currentRevision: number, expectedRevision?: number): boolean {
 	return typeof expectedRevision === 'number' && currentRevision !== expectedRevision;
@@ -29,6 +29,19 @@ export interface GitManualBaseline {
 
 export function skippedCurrentFile(skippedReason: string): CurrentTextState {
 	return { text: '', exists: true, skippedReason };
+}
+
+export function reviewHunkIdentity(hunk: Pick<ReviewHunk, 'fileUri' | 'kind' | 'oldStart' | 'oldLines' | 'newStart' | 'newLines' | 'oldText' | 'newText'>): string {
+	return JSON.stringify([
+		hunk.fileUri,
+		hunk.kind,
+		hunk.oldStart,
+		hunk.oldLines,
+		hunk.newStart,
+		hunk.newLines,
+		hunk.oldText,
+		hunk.newText,
+	]);
 }
 
 export function shouldDeleteRejectedCurrentFileOnRefresh(

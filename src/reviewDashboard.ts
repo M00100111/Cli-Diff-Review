@@ -3,7 +3,8 @@ import * as vscode from 'vscode';
 import type { AiReviewChunkSuggestion, AiReviewFileResult, AiReviewFinding } from './agent/codeReview';
 import type { AgentTraceDetail, AgentTraceEventKind, AgentTraceStatus } from './agent/runtime';
 import type { LlmConfigProfile, LlmProvider, LlmThinkingMode } from './llm/config';
-import { currentReviewProject, hasAggregateReviewTarget, ReviewFileState, ReviewSession, uriKey, visibleReviewFiles } from './types';
+import { reviewHunkIdentity } from './reviewState';
+import { currentReviewProject, hasAggregateReviewTarget, ReviewFileState, ReviewHunk, ReviewSession, uriKey, visibleReviewFiles } from './types';
 
 type DashboardMessage =
 	| { type: 'ready' }
@@ -1919,21 +1920,33 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 
 		function renderReviewChunk(file, chunk) {
-			const details = document.createElement('details');
 			const findings = chunk.findings || [];
 			const suggestions = chunk.suggestions || [];
+			const expandable = findings.length > 0 || suggestions.length > 0;
+			const details = document.createElement(expandable ? 'details' : 'div');
 			const kindClass = ['add', 'delete', 'modify'].includes(chunk.kind) ? chunk.kind : 'modify';
 			details.className = 'review-chunk ' + kindClass
 				+ (findings.length > 0 ? ' has-findings' : ' no-findings')
 				+ (suggestions.length > 0 ? ' has-suggestion' : '');
-			if (findings.length > 0 || suggestions.length > 0) {
+			if (expandable) {
 				details.open = true;
 				details.setAttribute('open', '');
 			}
 
-			const summary = document.createElement('summary');
+			const summary = document.createElement(expandable ? 'summary' : 'div');
 			summary.className = 'review-chunk-summary';
 			summary.addEventListener('click', () => vscode.postMessage({ type: 'openChunk', uri: file.uri, hunkId: chunk.hunkId }));
+			if (!expandable) {
+				summary.setAttribute('role', 'button');
+				summary.tabIndex = 0;
+				summary.addEventListener('keydown', (event) => {
+					if (event.key !== 'Enter' && event.key !== ' ') {
+						return;
+					}
+					event.preventDefault();
+					vscode.postMessage({ type: 'openChunk', uri: file.uri, hunkId: chunk.hunkId });
+				});
+			}
 			const main = document.createElement('span');
 			main.className = 'wiki-run-main';
 			const title = document.createElement('span');
@@ -1958,6 +1971,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			side.append(actions);
 			summary.append(main, side);
 			details.appendChild(summary);
+			if (!expandable) {
+				return details;
+			}
 
 			const body = document.createElement('div');
 			body.className = 'review-chunk-body';
@@ -1966,15 +1982,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				body.appendChild(renderReviewChunkSuggestion(file, chunk, suggestion));
 			}
 
-			if (findings.length === 0) {
-				const empty = document.createElement('div');
-				empty.className = 'review-empty';
-				empty.textContent = 'No findings for this chunk.';
-				body.appendChild(empty);
-			} else {
-				for (const finding of findings) {
-					body.appendChild(renderReviewChunkFinding(file, finding));
-				}
+			for (const finding of findings) {
+				body.appendChild(renderReviewChunkFinding(file, finding));
 			}
 			details.appendChild(body);
 			return details;
@@ -2467,7 +2476,8 @@ export function buildReviewDashboardPayload(
 			.sort((left, right) => (left.projectName ?? '').localeCompare(right.projectName ?? '')
 				|| left.relativePath.localeCompare(right.relativePath))
 			.map((file) => {
-				const pendingCount = file.hunks.length;
+				const pendingHunks = dashboardPendingHunks(file);
+				const pendingCount = pendingHunks.length;
 				const reviewedCount = file.acceptedHunks.length + file.rejectedHunks.length;
 				const dirty = isDirty(file.uri);
 				const mutationDisabled = dirty || Boolean(file.skippedReason);
@@ -2488,7 +2498,7 @@ export function buildReviewDashboardPayload(
 					acceptDisabled: mutationDisabled || pendingCount === 0,
 					rejectDisabled: mutationDisabled || pendingCount === 0,
 					undoDisabled: mutationDisabled || reviewedCount === 0,
-					chunks: dashboardChunks(file, findingsByChunk, findingsByFile, suggestionsByChunk, suggestionsByFile, mutationDisabled),
+					chunks: dashboardChunks(file, pendingHunks, findingsByChunk, findingsByFile, suggestionsByChunk, suggestionsByFile, mutationDisabled),
 					aiReviewResult: fileResultsByUri.get(file.uri.toString()),
 				};
 			})
@@ -2554,6 +2564,7 @@ export function defaultLlmWikiDashboardState(): LlmWikiDashboardState {
 
 function dashboardChunks(
 	file: ReviewFileState,
+	pendingHunks: ReviewHunk[],
 	findingsByChunk: Map<string, AiReviewFinding[]>,
 	findingsByFile: Map<string, AiReviewFinding[]>,
 	suggestionsByChunk: Map<string, AiReviewChunkSuggestion[]>,
@@ -2565,7 +2576,7 @@ function dashboardChunks(
 		suggestionId: suggestion.suggestionId,
 		replacementText: suggestion.replacementText,
 	}]));
-	const chunks = file.hunks.map((hunk): ReviewDashboardChunk => ({
+	const chunks = pendingHunks.map((hunk): ReviewDashboardChunk => ({
 		hunkId: hunk.id,
 		kind: hunk.kind,
 		line: hunk.newStart,
@@ -2579,12 +2590,15 @@ function dashboardChunks(
 		canReject: !mutationDisabled,
 		canUndo: false,
 	}));
-	const seen = new Set(chunks.map((chunk) => chunk.hunkId));
+	const seenIdentities = new Set(pendingHunks.map(reviewHunkIdentity));
+	const seenHunkIds = new Set(pendingHunks.map((hunk) => hunk.id));
 	for (const hunk of [...file.acceptedHunks, ...file.rejectedHunks]) {
-		if (seen.has(hunk.id)) {
+		const identity = reviewHunkIdentity(hunk);
+		if (seenIdentities.has(identity)) {
 			continue;
 		}
-		seen.add(hunk.id);
+		seenIdentities.add(identity);
+		seenHunkIds.add(hunk.id);
 		chunks.push({
 			hunkId: hunk.id,
 			kind: hunk.kind,
@@ -2602,10 +2616,10 @@ function dashboardChunks(
 		});
 	}
 	for (const item of [...(findingsByFile.get(uri) ?? []), ...(suggestionsByFile.get(uri) ?? [])]) {
-		if (seen.has(item.hunkId)) {
+		if (seenHunkIds.has(item.hunkId)) {
 			continue;
 		}
-		seen.add(item.hunkId);
+		seenHunkIds.add(item.hunkId);
 		chunks.push({
 			hunkId: item.hunkId,
 			kind: 'reviewed',
@@ -2622,6 +2636,15 @@ function dashboardChunks(
 		});
 	}
 	return chunks.sort((left, right) => left.line - right.line || left.hunkId.localeCompare(right.hunkId));
+}
+
+function dashboardPendingHunks(file: ReviewFileState): ReviewHunk[] {
+	const reviewedIdentities = new Set([...file.acceptedHunks, ...file.rejectedHunks].map(reviewHunkIdentity));
+	if (reviewedIdentities.size === 0) {
+		return file.hunks;
+	}
+
+	return file.hunks.filter((hunk) => !reviewedIdentities.has(reviewHunkIdentity(hunk)));
 }
 
 function dashboardDescription(pendingCount: number, reviewedCount: number, dirty: boolean, skippedReason?: string): string {

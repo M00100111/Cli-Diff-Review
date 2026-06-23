@@ -275,6 +275,24 @@
           "default": true,
           "description": "Include generated LLM Code Wiki skill Markdown changes in Cli Diff Review."
         },
+        "cliDiff.reviewEditorMode": {
+          "type": "string",
+          "enum": [
+            "nativeEditor",
+            "reviewPage"
+          ],
+          "enumItemLabels": [
+            "Native inline diff editor",
+            "Review page"
+          ],
+          "default": "nativeEditor",
+          "description": "Controls whether review files open in the VS Code/Cursor native inline diff editor or the Cli Diff Review page."
+        },
+        "cliDiff.nativeDiffInline": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use inline single-page rendering for the native diff editor by setting diffEditor.renderSideBySide to false in the workspace."
+        },
         "cliDiff.aiReviewFindingOrder": {
           "type": "string",
           "enum": [

@@ -6,6 +6,7 @@ import { acceptHunkInBaseline, computeLineDiff } from './diffEngine';
 import { GitService } from './gitService';
 import { createLlmClient, LlmClient } from './llm/client';
 import { LlmConfigInput, LlmConfigStore, LlmSavedConfig, LlmRuntimeConfig } from './llm/config';
+import { NativeReviewEditorManager, NativeReviewRevealPosition } from './nativeReviewEditor';
 import { buildReviewDashboardPayload, defaultLlmWikiDashboardState, LlmWikiDashboardState, LlmWikiRunLogEntry, ReviewDashboardProvider } from './reviewDashboard';
 import { ReviewTreeProvider } from './reviewTree';
 import {
@@ -27,6 +28,7 @@ import {
 	mapLineAfterFileEdits,
 	mapLineAfterLineEdits,
 	manualGitBaselineFromReviewedFile,
+	reviewHunkIdentity,
 	SerialOperationQueue,
 	shouldDeleteRejectedCurrentFileOnRefresh,
 	shouldMergeReviewedFileOnRefresh,
@@ -65,6 +67,7 @@ interface ReviewNavigationTarget extends vscode.QuickPickItem {
 }
 
 type RunLogSource = 'wiki' | 'review';
+type ReviewEditorMode = 'nativeEditor' | 'reviewPage';
 
 type RunLogMetadata = Pick<LlmWikiRunLogEntry, 'source' | 'fileUri' | 'relativePath' | 'fileIndex' | 'fileCount'>;
 
@@ -87,6 +90,7 @@ export class ReviewController implements vscode.Disposable {
 	private readonly treeProvider: ReviewTreeProvider;
 	private readonly dashboardProvider: ReviewDashboardProvider;
 	private readonly reviewWebview: ReviewWebviewManager;
+	private readonly nativeReviewEditor: NativeReviewEditorManager;
 	private readonly refreshTimers = new Map<string, NodeJS.Timeout>();
 	private readonly humanEditBatches = new Map<string, EditedRange[]>();
 	private readonly humanSaveIntents = new Map<string, number>();
@@ -135,9 +139,14 @@ export class ReviewController implements vscode.Disposable {
 			(uri, line, column) => this.openNavigationTarget(uri, line, column),
 			(uri) => this.setCurrentReviewUri(uri),
 		);
+		this.nativeReviewEditor = new NativeReviewEditorManager(
+			() => this.activeSession,
+			() => this.reviewEditorMode() === 'nativeEditor',
+		);
 
 		this.disposables.push(
 			this.reviewWebview,
+			this.nativeReviewEditor,
 			this.dashboardProvider,
 			vscode.window.registerTreeDataProvider('cli-diff.review', this.treeProvider),
 			vscode.window.registerWebviewViewProvider(ReviewDashboardProvider.viewType, this.dashboardProvider),
@@ -160,6 +169,8 @@ export class ReviewController implements vscode.Disposable {
 			vscode.workspace.onDidChangeConfiguration((event) => {
 				if (event.affectsConfiguration('cliDiff.reviewWikiChanges')) {
 					void this.refreshAll();
+				} else if (event.affectsConfiguration('cliDiff.reviewEditorMode')) {
+					this.refreshReviewPresentation();
 				} else if (event.affectsConfiguration('cliDiff.aiReviewFindingOrder')
 					|| event.affectsConfiguration('cliDiff.aiReviewLanguage')
 					|| event.affectsConfiguration('cliDiff.aiReviewMaxRounds')) {
@@ -639,11 +650,13 @@ export class ReviewController implements vscode.Disposable {
 			}]);
 			this.recordDecisionHunk(target.file, target.hunk, 'accept', target.hunk.newStart, target.hunk.newLines, target.hunk.oldStart, target.hunk.newStart);
 			this.removePendingHunk(target.file, target.hunk);
+			this.normalizeReviewedDuplicateHunks(target.file);
 			this.syncBaselineExistsAfterAccept(target.file);
 			this.touchFileRevision(target.file);
 			if (this.activeSession?.mode === 'snapshot') {
 				await this.updateSnapshotBaselineFile(target.file);
 			}
+			this.nativeReviewEditor.clearActive(target.file.uri);
 			await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 		} catch (error) {
 			this.showError(error);
@@ -689,7 +702,9 @@ export class ReviewController implements vscode.Disposable {
 				}]);
 				this.recordDecisionHunk(target.file, target.hunk, 'reject', target.hunk.oldStart, target.hunk.oldLines, target.hunk.oldStart, target.hunk.oldStart);
 				this.removePendingHunk(target.file, target.hunk);
+				this.normalizeReviewedDuplicateHunks(target.file);
 				this.touchFileRevision(target.file);
+				this.nativeReviewEditor.clearActive(target.file.uri);
 				await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 				return;
 			}
@@ -723,7 +738,9 @@ export class ReviewController implements vscode.Disposable {
 			}]);
 			this.recordDecisionHunk(target.file, target.hunk, 'reject', target.hunk.newStart, target.hunk.oldLines, target.hunk.oldStart, target.hunk.newStart);
 			this.removePendingHunk(target.file, target.hunk);
+			this.normalizeReviewedDuplicateHunks(target.file);
 			this.touchFileRevision(target.file);
+			this.nativeReviewEditor.clearActive(target.file.uri);
 			await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 		} catch (error) {
 			this.showError(error);
@@ -792,6 +809,7 @@ export class ReviewController implements vscode.Disposable {
 			}
 
 			this.touchFileRevision(target.file);
+			this.nativeReviewEditor.clearActive(target.file.uri);
 			await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 		} catch (error) {
 			this.showError(error);
@@ -947,7 +965,7 @@ export class ReviewController implements vscode.Disposable {
 		const dirtyTargets = targets.filter((target) => this.isOpenDocumentDirty(target.file.uri));
 		if (dirtyTargets.length > 0) {
 			for (const target of dirtyTargets) {
-				this.reviewWebview.refresh(target.file.uri);
+				this.refreshReviewPresentation(target.file.uri);
 			}
 			vscode.window.showInformationMessage('Save or revert target files before accepting, rejecting, or undoing all Cli Diff Review changes.');
 			return;
@@ -1130,8 +1148,31 @@ export class ReviewController implements vscode.Disposable {
 		}
 
 		await this.ensureGitReviewForUri(uri);
-		await this.reviewWebview.open(uri);
+		await this.openReviewPresentation(uri);
+	}
+
+	private async openReviewPresentation(uri: vscode.Uri, reveal?: NativeReviewRevealPosition): Promise<void> {
+		const file = this.activeSession?.files.get(uriKey(uri));
+		if (this.reviewEditorMode() === 'nativeEditor' && file?.currentExists) {
+			const opened = reveal?.hunkId
+				? await this.nativeReviewEditor.revealChunk(uri, reveal.hunkId)
+				: await this.nativeReviewEditor.open(uri, reveal);
+			if (opened) {
+				this.setCurrentReviewUri(uri);
+				return;
+			}
+		}
+
+		await this.reviewWebview.open(uri, reveal?.line !== undefined ? {
+			line: reveal.line,
+			column: reveal.column ?? 0,
+		} : undefined);
 		this.setCurrentReviewUri(uri);
+	}
+
+	private reviewEditorMode(): ReviewEditorMode {
+		const configured = vscode.workspace.getConfiguration('cliDiff').get<string>('reviewEditorMode', 'nativeEditor');
+		return configured === 'reviewPage' ? 'reviewPage' : 'nativeEditor';
 	}
 
 	private async navigateFromReview(
@@ -1392,7 +1433,7 @@ export class ReviewController implements vscode.Disposable {
 
 		const file = this.activeSession?.files.get(uriKey(uri));
 		if (this.isReviewableFile(file)) {
-			await this.reviewWebview.open(uri, { line: range.start.line, column: range.start.character });
+			await this.openReviewPresentation(uri, { line: range.start.line, column: range.start.character });
 			return;
 		}
 
@@ -1414,15 +1455,17 @@ export class ReviewController implements vscode.Disposable {
 	private async openFileAtChange(uriString: string, hunkId: string): Promise<void> {
 		const file = this.resolveFile(uriString);
 		const hunk = file?.hunks.find((item) => item.id === hunkId);
-		if (!file || !hunk) {
+		const reviewed = hunk ? undefined : file ? [...file.acceptedHunks, ...file.rejectedHunks]
+			.find((item) => item.id === hunkId || item.id.endsWith(`-${hunkId}`)) : undefined;
+		if (!file || (!hunk && !reviewed)) {
 			return;
 		}
 
-		const document = await vscode.workspace.openTextDocument(file.uri);
-		const editor = await vscode.window.showTextDocument(document);
-		const range = lineRange(document, hunk.newStart, hunk.newLines);
-		editor.selection = new vscode.Selection(range.start, range.start);
-		editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+		await this.openReviewPresentation(file.uri, {
+			line: hunk?.newStart ?? reviewed?.displayStart ?? 0,
+			column: 0,
+			hunkId: hunk?.id ?? reviewed?.id ?? hunkId,
+		});
 	}
 
 	private async refreshAll(): Promise<void> {
@@ -1430,6 +1473,7 @@ export class ReviewController implements vscode.Disposable {
 		await this.ensureVisibleEditorsReviewed();
 
 		if (!this.activeSession) {
+			this.nativeReviewEditor.clear();
 			this.closeCompletedReviewEditorsAfterManualRefresh();
 			return;
 		}
@@ -1461,7 +1505,10 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private closeCompletedReviewEditorsAfterManualRefresh(): void {
-		const closedKeys = new Set(this.reviewWebview.closeCompleted().map(uriKey));
+		const closedKeys = new Set([
+			...this.reviewWebview.closeCompleted(),
+			...this.nativeReviewEditor.closeCompleted(),
+		].map(uriKey));
 		if (!this.currentReviewUri || !closedKeys.has(uriKey(this.currentReviewUri))) {
 			return;
 		}
@@ -1997,8 +2044,11 @@ export class ReviewController implements vscode.Disposable {
 		const hunk = file.hunks.find((candidate) => candidate.id === hunkId);
 		const reviewed = hunk ? undefined : [...file.acceptedHunks, ...file.rejectedHunks]
 			.find((candidate) => candidate.id === hunkId || candidate.id.endsWith(`-${hunkId}`));
-		await this.reviewWebview.open(file.uri, { line: hunk?.newStart ?? reviewed?.displayStart ?? 0, column: 0 });
-		this.setCurrentReviewUri(file.uri);
+		await this.openReviewPresentation(file.uri, {
+			line: hunk?.newStart ?? reviewed?.displayStart ?? 0,
+			column: 0,
+			hunkId: hunk?.id ?? reviewed?.id ?? hunkId,
+		});
 	}
 
 	private async applyAiSuggestion(uriString: string, hunkId: string, suggestionId: string): Promise<void> {
@@ -2048,7 +2098,7 @@ export class ReviewController implements vscode.Disposable {
 			});
 			this.touchFileRevision(file);
 			await this.saveAiReviewWithCurrentSignature(storedReview, reviewSession);
-			this.reviewWebview.refresh(file.uri);
+			this.refreshReviewPresentation(file.uri);
 			await this.refreshLlmWikiDashboardState();
 		} catch (error) {
 			this.showError(error);
@@ -2095,7 +2145,7 @@ export class ReviewController implements vscode.Disposable {
 			file.appliedAiSuggestions = file.appliedAiSuggestions.filter((item) => item.suggestionId !== suggestionId);
 			this.touchFileRevision(file);
 			await this.saveAiReviewWithCurrentSignature(storedReview, reviewSession);
-			this.reviewWebview.refresh(file.uri);
+			this.refreshReviewPresentation(file.uri);
 			await this.refreshLlmWikiDashboardState();
 		} catch (error) {
 			this.showError(error);
@@ -2395,6 +2445,7 @@ export class ReviewController implements vscode.Disposable {
 			this.manualGitBaselines.delete(key);
 		}
 		file.hunks = diff.hunks;
+		this.normalizeReviewedDuplicateHunks(file);
 		file.appliedAiSuggestions = file.appliedAiSuggestions.filter((suggestion) => file.hunks.some((hunk) => (
 			hunk.id === suggestion.hunkId
 			&& hunk.newText === suggestion.appliedHunk.newText
@@ -2442,9 +2493,14 @@ export class ReviewController implements vscode.Disposable {
 
 	private refreshUi(): void {
 		this.treeProvider.refresh();
-		this.reviewWebview.refresh();
+		this.refreshReviewPresentation();
 		this.dashboardProvider.refresh();
 		void this.refreshLlmWikiDashboardState();
+	}
+
+	private refreshReviewPresentation(uri?: vscode.Uri): void {
+		this.reviewWebview.refresh(uri);
+		this.nativeReviewEditor.refresh(uri);
 	}
 
 	private startWikiRunLog(event: AgentTraceEvent, source: RunLogSource = 'wiki'): void {
@@ -2869,7 +2925,7 @@ export class ReviewController implements vscode.Disposable {
 		}
 
 		vscode.window.showInformationMessage('Save or revert this file before accepting, rejecting, or undoing Cli Diff Review changes.');
-		this.reviewWebview.refresh(file.uri);
+		this.refreshReviewPresentation(file.uri);
 		return false;
 	}
 
@@ -3139,6 +3195,15 @@ export class ReviewController implements vscode.Disposable {
 	private removePendingHunk(file: ReviewFileState, hunk: ReviewHunk): void {
 		file.hunks = file.hunks.filter((item) => !this.isSameReviewHunk(item, hunk));
 		file.appliedAiSuggestions = file.appliedAiSuggestions.filter((item) => item.hunkId !== hunk.id);
+	}
+
+	private normalizeReviewedDuplicateHunks(file: ReviewFileState): void {
+		const reviewedIdentities = new Set(this.decisionHunks(file).map(reviewHunkIdentity));
+		if (reviewedIdentities.size === 0) {
+			return;
+		}
+
+		file.hunks = file.hunks.filter((hunk) => !reviewedIdentities.has(reviewHunkIdentity(hunk)));
 	}
 
 	private isSameReviewHunk(left: ReviewHunk, right: ReviewHunk): boolean {

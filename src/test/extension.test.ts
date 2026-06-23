@@ -24,6 +24,7 @@ import {
 	mapLineAfterFileEdits,
 	mapLineAfterLineEdits,
 	manualGitBaselineFromReviewedFile,
+	reviewHunkIdentity,
 	SerialOperationQueue,
 	shouldDeleteRejectedCurrentFileOnRefresh,
 	shouldMergeReviewedFileOnRefresh,
@@ -45,6 +46,16 @@ suite('Diff engine', () => {
 		assert.strictEqual(hunks[0].newStart, 1);
 		assert.strictEqual(hunks[0].newLines, 1);
 		assert.strictEqual(hunks[0].newText, 'const b = 2;\n');
+	});
+
+	test('identifies reviewed hunks by content instead of generated id', () => {
+		const hunk = computeLineDiff('file:///demo.ts', 'old\n', 'new\n')[0];
+		const reviewed = reviewedHunkFrom(hunk, 'accept');
+		const shifted = { ...hunk, newStart: hunk.newStart + 1 };
+
+		assert.notStrictEqual(reviewed.id, hunk.id);
+		assert.strictEqual(reviewHunkIdentity(reviewed), reviewHunkIdentity(hunk));
+		assert.notStrictEqual(reviewHunkIdentity(shifted), reviewHunkIdentity(hunk));
 	});
 
 	test('detects deleted lines', () => {
@@ -326,6 +337,32 @@ suite('Extension configuration', () => {
 		assert.strictEqual(Object.prototype.hasOwnProperty.call(setting, 'maximum'), false);
 		assert.match(String(setting.description), /0 means unlimited/);
 	});
+
+	test('declares review editor mode setting defaults', () => {
+		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+			contributes?: { configuration?: { properties?: Record<string, unknown> } };
+		};
+		const setting = manifest.contributes?.configuration?.properties?.['cliDiff.reviewEditorMode'] as {
+			default?: unknown;
+			enum?: unknown[];
+			enumItemLabels?: unknown[];
+		} | undefined;
+
+		assert.ok(setting);
+		assert.strictEqual(setting.default, 'nativeEditor');
+		assert.deepStrictEqual(setting.enum, ['nativeEditor', 'reviewPage']);
+		assert.deepStrictEqual(setting.enumItemLabels, ['Native inline diff editor', 'Review page']);
+
+		const inlineSetting = manifest.contributes?.configuration?.properties?.['cliDiff.nativeDiffInline'] as {
+			default?: unknown;
+			type?: unknown;
+			description?: unknown;
+		} | undefined;
+		assert.ok(inlineSetting);
+		assert.strictEqual(inlineSetting.type, 'boolean');
+		assert.strictEqual(inlineSetting.default, true);
+		assert.match(String(inlineSetting.description), /diffEditor\.renderSideBySide/);
+	});
 });
 
 suite('Review controller bulk actions', () => {
@@ -379,6 +416,43 @@ suite('Review controller bulk actions', () => {
 		assert.ok(source.includes('private async undoAiSuggestionCore'));
 		assert.ok(source.includes('await this.saveAiReviewWithCurrentSignature(storedReview, reviewSession);'));
 		assert.ok(source.includes('this.replacePendingHunkWithAppliedSuggestion'));
+	});
+
+	test('wires review editor mode through native editor and review page presenters', () => {
+		const controllerSource = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
+		const nativeSource = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'nativeReviewEditor.ts'), 'utf8');
+
+		assert.ok(controllerSource.includes("import { NativeReviewEditorManager"));
+		assert.ok(controllerSource.includes("get<string>('reviewEditorMode', 'nativeEditor')"));
+		assert.ok(controllerSource.includes("configured === 'reviewPage' ? 'reviewPage' : 'nativeEditor'"));
+		assert.ok(controllerSource.includes("await this.openReviewPresentation(uri);"));
+		assert.ok(controllerSource.includes("await this.nativeReviewEditor.revealChunk(uri, reveal.hunkId)"));
+		assert.ok(controllerSource.includes("await this.reviewWebview.open(uri, reveal?.line !== undefined"));
+		assert.ok(controllerSource.includes('this.nativeReviewEditor.refresh(uri);'));
+		assert.ok(controllerSource.includes('this.nativeReviewEditor.clearActive(target.file.uri);'));
+		assert.ok(controllerSource.includes('...this.nativeReviewEditor.closeCompleted(),'));
+		assert.ok(nativeSource.includes('registerTextDocumentContentProvider(NativeReviewEditorManager.beforeDocumentScheme'));
+		assert.ok(nativeSource.includes("provideTextDocumentContent: (uri) => this.provideBeforeDocumentContent(uri)"));
+		assert.ok(nativeSource.includes("'vscode.diff'"));
+		assert.ok(nativeSource.includes('return this.getSession()?.files.get(uriKey(fileUri))?.oldText ??'));
+		assert.ok(nativeSource.includes("get<boolean>('nativeDiffInline', true)"));
+		assert.ok(nativeSource.includes("diffConfig.update('renderSideBySide', false, vscode.ConfigurationTarget.Workspace)"));
+		assert.ok(nativeSource.includes("vscode.commands.executeCommand('revealLine'"));
+		assert.ok(nativeSource.includes('input instanceof vscode.TabInputTextDiff'));
+		assert.ok(nativeSource.includes('closeCompleted(): vscode.Uri[]'));
+		assert.strictEqual(nativeSource.includes('createTextEditorDecorationType'), false);
+		assert.strictEqual(nativeSource.includes('registerInlineCompletionItemProvider'), false);
+		assert.strictEqual(nativeSource.includes('provideInlineCompletionItems('), false);
+		assert.strictEqual(nativeSource.includes("editor.action.inlineSuggest.trigger"), false);
+		assert.strictEqual(nativeSource.includes('new vscode.InlineCompletionItem'), false);
+		assert.strictEqual(nativeSource.includes('gutterIconPath'), false);
+		assert.strictEqual(nativeSource.includes('oldCodeBlockDecoration'), false);
+		assert.strictEqual(nativeSource.includes('oldCodeBlockText'), false);
+		assert.strictEqual(nativeSource.includes('display: block'), false);
+		assert.strictEqual(nativeSource.includes('white-space: pre'), false);
+		assert.strictEqual(nativeSource.includes('editor.findMatchHighlightBackground'), false);
+		assert.strictEqual(nativeSource.includes("borderWidth: '0 0 0 2px'"), false);
+		assert.strictEqual(nativeSource.includes("borderWidth: '1px 0 1px 2px'"), false);
 	});
 });
 
@@ -814,6 +888,46 @@ suite('Review state', () => {
 		assert.strictEqual(reviewedFindingChunk?.findings[0].title, 'Reviewed finding');
 	});
 
+	test('deduplicates dashboard chunks when reviewed hunks reappear as pending', () => {
+		const uri = vscode.Uri.file('D:/repo/src/duplicate.ts');
+		const rejectedUri = vscode.Uri.file('D:/repo/src/rejected-duplicate.ts');
+		const duplicateHunk = computeLineDiff(uri.toString(), 'old\nsame\n', 'new\nsame\n')[0];
+		const pendingHunk = computeLineDiff(uri.toString(), 'new\nsame\n', 'new\nsame\nlater\n')[0];
+		const rejectedDuplicateHunk = computeLineDiff(rejectedUri.toString(), 'before\n', 'after\n')[0];
+		const session: ReviewSession = {
+			id: 'dashboard-duplicates',
+			mode: 'git',
+			rootUri: vscode.Uri.file('D:/repo'),
+			createdAt: 1,
+			files: new Map([
+				[uri.toString(), reviewFileState(uri, 'src/duplicate.ts', {
+					hunks: [duplicateHunk, pendingHunk],
+					acceptedHunks: [reviewedHunkFrom(duplicateHunk, 'accept')],
+				})],
+				[rejectedUri.toString(), reviewFileState(rejectedUri, 'src/rejected-duplicate.ts', {
+					hunks: [rejectedDuplicateHunk],
+					rejectedHunks: [reviewedHunkFrom(rejectedDuplicateHunk, 'reject')],
+				})],
+			]),
+		};
+
+		const payload = buildReviewDashboardPayload(session, uri, () => false);
+		const acceptedFile = payload.files.find((file) => file.relativePath === 'src/duplicate.ts');
+		const rejectedFile = payload.files.find((file) => file.relativePath === 'src/rejected-duplicate.ts');
+
+		assert.strictEqual(acceptedFile?.pendingCount, 1);
+		assert.strictEqual(acceptedFile?.reviewedCount, 1);
+		assert.strictEqual(acceptedFile?.description, '1 pending, 1 reviewed');
+		assert.deepStrictEqual(acceptedFile?.chunks.map((chunk) => chunk.reviewStatus), ['reviewed', 'pending']);
+		assert.strictEqual(acceptedFile?.chunks.some((chunk) => chunk.hunkId === duplicateHunk.id), false);
+		assert.strictEqual(acceptedFile?.chunks.some((chunk) => chunk.hunkId === pendingHunk.id), true);
+		assert.strictEqual(rejectedFile?.pendingCount, 0);
+		assert.strictEqual(rejectedFile?.reviewedCount, 1);
+		assert.strictEqual(rejectedFile?.chunks.length, 1);
+		assert.strictEqual(rejectedFile?.chunks[0].reviewStatus, 'reviewed');
+		assert.strictEqual(rejectedFile?.chunks[0].reviewDecision, 'rejected');
+	});
+
 	test('posts dashboard state after file-level commands', async () => {
 		const uri = vscode.Uri.file('D:/repo/src/pending.ts');
 		const posted: unknown[] = [];
@@ -904,6 +1018,7 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes("type: applied ? 'undoAiSuggestion' : 'applyAiSuggestion'"));
 		assert.ok(view.webview.html.includes('review-file-result'));
 		assert.ok(view.webview.html.includes("details.setAttribute('open', '')"));
+		assert.strictEqual(view.webview.html.includes('No findings for this chunk.'), false);
 		assert.ok(view.webview.html.includes("chunk.reviewStatus === 'reviewed'"));
 		assert.strictEqual(view.webview.html.includes('review-chunk-preview'), false);
 		const dashboardSource = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewDashboard.ts'), 'utf8');
