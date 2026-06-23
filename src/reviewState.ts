@@ -27,8 +27,30 @@ export interface GitManualBaseline {
 	baselineExists: boolean;
 }
 
+export interface ReviewRevealPosition {
+	line: number;
+	column: number;
+	hunkId: string;
+}
+
 export function skippedCurrentFile(skippedReason: string): CurrentTextState {
 	return { text: '', exists: true, skippedReason };
+}
+
+export function firstReviewRevealPosition(file: Pick<ReviewFileState, 'hunks' | 'acceptedHunks' | 'rejectedHunks'>): ReviewRevealPosition | undefined {
+	const firstPending = [...file.hunks]
+		.sort((left, right) => left.newStart - right.newStart || left.id.localeCompare(right.id))[0];
+	if (firstPending) {
+		return { line: firstPending.newStart, column: 0, hunkId: firstPending.id };
+	}
+
+	const firstReviewed = [...file.acceptedHunks, ...file.rejectedHunks]
+		.sort((left, right) => left.displayStart - right.displayStart || left.id.localeCompare(right.id))[0];
+	if (firstReviewed) {
+		return { line: firstReviewed.displayStart, column: 0, hunkId: firstReviewed.id };
+	}
+
+	return undefined;
 }
 
 export function reviewHunkIdentity(hunk: Pick<ReviewHunk, 'fileUri' | 'kind' | 'oldStart' | 'oldLines' | 'newStart' | 'newLines' | 'oldText' | 'newText'>): string {

@@ -851,6 +851,15 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			flex-direction: column;
 			gap: 5px;
 			overflow: auto;
+			scrollbar-color: var(--vscode-scrollbarSlider-background, rgba(128, 128, 128, 0.35)) transparent;
+		}
+		.review-file-detail::-webkit-scrollbar-track,
+		.review-file-detail::-webkit-scrollbar-corner {
+			background: transparent;
+		}
+		.review-file-detail::-webkit-scrollbar-thumb {
+			background-color: var(--vscode-scrollbarSlider-background, rgba(128, 128, 128, 0.35));
+			border-radius: 6px;
 		}
 		.review-file-heading {
 			flex: 0 0 auto;

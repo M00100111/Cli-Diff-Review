@@ -19,6 +19,7 @@ import { normalizeMonacoThemeColor, ReviewWebviewManager } from '../reviewWebvie
 import {
 	applyManualGitBaselineToPair,
 	captureLineBlockContext,
+	firstReviewRevealPosition,
 	isStaleRevision,
 	lineBlockWithContextMatchesUniquely,
 	mapLineAfterFileEdits,
@@ -423,11 +424,13 @@ suite('Review controller bulk actions', () => {
 		const nativeSource = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'nativeReviewEditor.ts'), 'utf8');
 
 		assert.ok(controllerSource.includes("import { NativeReviewEditorManager"));
+		assert.ok(controllerSource.includes('firstReviewRevealPosition'));
 		assert.ok(controllerSource.includes("get<string>('reviewEditorMode', 'nativeEditor')"));
 		assert.ok(controllerSource.includes("configured === 'reviewPage' ? 'reviewPage' : 'nativeEditor'"));
 		assert.ok(controllerSource.includes("await this.openReviewPresentation(uri);"));
-		assert.ok(controllerSource.includes("await this.nativeReviewEditor.revealChunk(uri, reveal.hunkId)"));
-		assert.ok(controllerSource.includes("await this.reviewWebview.open(uri, reveal?.line !== undefined"));
+		assert.ok(controllerSource.includes('const effectiveReveal = reveal ?? (file ? firstReviewRevealPosition(file) : undefined);'));
+		assert.ok(controllerSource.includes("await this.nativeReviewEditor.revealChunk(uri, effectiveReveal.hunkId)"));
+		assert.ok(controllerSource.includes("await this.reviewWebview.open(uri, effectiveReveal?.line !== undefined"));
 		assert.ok(controllerSource.includes('this.nativeReviewEditor.refresh(uri);'));
 		assert.ok(controllerSource.includes('this.nativeReviewEditor.clearActive(target.file.uri);'));
 		assert.ok(controllerSource.includes('...this.nativeReviewEditor.closeCompleted(),'));
@@ -639,6 +642,25 @@ suite('Review state', () => {
 
 		assert.strictEqual(mappedBaselineStart, 3);
 		assert.strictEqual(restored, 'a\nmanual\nb\nc\n');
+	});
+
+	test('selects the first review chunk as the default reveal position', () => {
+		const uri = vscode.Uri.file('D:/repo/src/reveal.ts');
+		const baseHunk = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
+		const laterPending = { ...baseHunk, id: 'later-pending', newStart: 9 };
+		const earlierPending = { ...baseHunk, id: 'earlier-pending', newStart: 2 };
+		const laterReviewed = reviewedHunk({ ...baseHunk, id: 'later-reviewed' }, 'accept', 8, baseHunk.newLines, baseHunk.oldStart, 8);
+		const earlierReviewed = reviewedHunk({ ...baseHunk, id: 'earlier-reviewed' }, 'reject', 3, baseHunk.oldLines, baseHunk.oldStart, 3);
+
+		assert.deepStrictEqual(firstReviewRevealPosition(reviewFileState(uri, 'src/reveal.ts', {
+			hunks: [laterPending, earlierPending],
+			acceptedHunks: [earlierReviewed],
+		})), { line: 2, column: 0, hunkId: 'earlier-pending' });
+		assert.deepStrictEqual(firstReviewRevealPosition(reviewFileState(uri, 'src/reveal.ts', {
+			acceptedHunks: [laterReviewed],
+			rejectedHunks: [earlierReviewed],
+		})), { line: 3, column: 0, hunkId: 'reject-earlier-reviewed' });
+		assert.strictEqual(firstReviewRevealPosition(reviewFileState(uri, 'src/reveal.ts')), undefined);
 	});
 
 	test('keeps skipped current snapshot files marked as existing', () => {
@@ -990,6 +1012,8 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('wiki-run-round'));
 		assert.ok(view.webview.html.includes('wiki-run-file'));
 		assert.ok(view.webview.html.includes('review-file-detail'));
+		assert.ok(view.webview.html.includes('.review-file-detail::-webkit-scrollbar-track'));
+		assert.ok(view.webview.html.includes('scrollbar-color: var(--vscode-scrollbarSlider-background, rgba(128, 128, 128, 0.35)) transparent'));
 		assert.ok(view.webview.html.includes('review-chunk'));
 		assert.ok(view.webview.html.includes('review-chunk-action'));
 		assert.ok(view.webview.html.includes('function chunkActionButton'));

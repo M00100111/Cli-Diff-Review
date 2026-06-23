@@ -22,6 +22,7 @@ import {
 	applyManualGitBaselineToPair,
 	captureLineBlockContext,
 	CurrentTextState,
+	firstReviewRevealPosition,
 	GitManualBaseline,
 	isStaleRevision,
 	lineBlockWithContextMatchesUniquely,
@@ -1153,19 +1154,20 @@ export class ReviewController implements vscode.Disposable {
 
 	private async openReviewPresentation(uri: vscode.Uri, reveal?: NativeReviewRevealPosition): Promise<void> {
 		const file = this.activeSession?.files.get(uriKey(uri));
+		const effectiveReveal = reveal ?? (file ? firstReviewRevealPosition(file) : undefined);
 		if (this.reviewEditorMode() === 'nativeEditor' && file?.currentExists) {
-			const opened = reveal?.hunkId
-				? await this.nativeReviewEditor.revealChunk(uri, reveal.hunkId)
-				: await this.nativeReviewEditor.open(uri, reveal);
+			const opened = effectiveReveal?.hunkId
+				? await this.nativeReviewEditor.revealChunk(uri, effectiveReveal.hunkId)
+				: await this.nativeReviewEditor.open(uri, effectiveReveal);
 			if (opened) {
 				this.setCurrentReviewUri(uri);
 				return;
 			}
 		}
 
-		await this.reviewWebview.open(uri, reveal?.line !== undefined ? {
-			line: reveal.line,
-			column: reveal.column ?? 0,
+		await this.reviewWebview.open(uri, effectiveReveal?.line !== undefined ? {
+			line: effectiveReveal.line,
+			column: effectiveReveal.column ?? 0,
 		} : undefined);
 		this.setCurrentReviewUri(uri);
 	}
