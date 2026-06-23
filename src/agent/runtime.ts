@@ -87,7 +87,7 @@ const protocolPrompt = [
 	'Use only the listed tools. Never invent tool results.',
 ].join('\n');
 
-const deepSeekProtocolPrompt = [
+const nativeToolProtocolPrompt = [
 	'You are operating inside a controlled local code agent runtime.',
 	'Use the provided native function tools when you need workspace or Wiki information. Never simulate a tool call in text JSON.',
 	'When complete, return only this JSON shape: {"type":"final","result":{}}.',
@@ -118,9 +118,9 @@ export class AgentRunner {
 		timeout.unref();
 		const signal = runAbortController.signal;
 		const tools = new Map(options.tools.map((tool) => [tool.name, tool]));
-		const nativeTools = options.config.provider === 'deepseek';
+		const nativeTools = providerUsesNativeTools(options.config.provider);
 		const messages: LlmMessage[] = [
-			{ role: 'system', content: `${nativeTools ? deepSeekProtocolPrompt : protocolPrompt}\n\n${options.systemPrompt}\n\nAvailable tools:\n${toolDescriptions(options.tools)}` },
+			{ role: 'system', content: `${nativeTools ? nativeToolProtocolPrompt : protocolPrompt}\n\n${options.systemPrompt}\n\nAvailable tools:\n${toolDescriptions(options.tools)}` },
 			{ role: 'user', content: options.userPrompt },
 		];
 		let toolCalls = 0;
@@ -307,7 +307,7 @@ async function requestAgentRound(
 			messages: [...messages, ...correction],
 			temperature: 0,
 			maxTokens: 12000,
-			jsonOutput: options.config.provider === 'deepseek' ? true : options.config.jsonOutputEnabled,
+			jsonOutput: providerForcesJsonOutput(options.config.provider) ? true : options.config.jsonOutputEnabled,
 			tools: nativeTools ? toolDefinitions(options.tools) : undefined,
 		};
 		emitTrace(options, {
@@ -330,7 +330,7 @@ async function requestAgentRound(
 		previousRawResponse = completion.content || JSON.stringify(completion.toolCalls);
 		preview = previousRawResponse.slice(0, 240);
 		try {
-			const response = nativeTools ? validateNativeRound(completion, options.tools) : validateTextRound(completion);
+			const response = nativeTools ? validateNativeRound(completion, options.tools, options.config.provider) : validateTextRound(completion);
 			emitTrace(options, {
 				kind: 'parse_success',
 				title: 'Parsed response',
@@ -390,14 +390,14 @@ function validateTextRound(completion: LlmCompletion): ValidAgentRound {
 		: { ...response, content: completion.content, reasoningContent: completion.reasoningContent };
 }
 
-function validateNativeRound(completion: LlmCompletion, tools: AgentTool[]): ValidAgentRound {
+function validateNativeRound(completion: LlmCompletion, tools: AgentTool[], provider: LlmRuntimeConfig['provider']): ValidAgentRound {
 	if (completion.toolCalls.length > 0) {
 		const available = new Map(tools.map((tool) => [tool.name, tool]));
 		const calls = completion.toolCalls.map((call): AgentToolCall => {
 			const argumentsValue = parseStrictJsonObject(call.arguments);
 			const tool = available.get(call.name);
 			if (!tool) {
-				throw new Error(`DeepSeek requested an unavailable native tool: ${call.name}`);
+				throw new Error(`${providerName(provider)} requested an unavailable native tool: ${call.name}`);
 			}
 			validateToolArguments(tool, argumentsValue);
 			return { id: call.id, name: call.name, arguments: argumentsValue };
@@ -415,7 +415,7 @@ function validateNativeRound(completion: LlmCompletion, tools: AgentTool[]): Val
 	}
 	const response = validateAgentResponse(parseStrictJsonObject(completion.content));
 	if (response.type !== 'final') {
-		throw new Error('DeepSeek must use native function tools instead of a textual tool_calls action.');
+		throw new Error(`${providerName(provider)} must use native function tools instead of a textual tool_calls action.`);
 	}
 	return { ...response, content: completion.content, reasoningContent: completion.reasoningContent };
 }
@@ -425,7 +425,21 @@ function toolDefinitions(tools: AgentTool[]): LlmToolDefinition[] {
 }
 
 function providerName(provider: LlmRuntimeConfig['provider']): string {
-	return provider === 'deepseek' ? 'DeepSeek' : provider === 'anthropic' ? 'Anthropic' : 'OpenAI-compatible';
+	if (provider === 'deepseek') {
+		return 'DeepSeek';
+	}
+	if (provider === 'glm') {
+		return 'GLM';
+	}
+	return provider === 'anthropic' ? 'Anthropic' : 'OpenAI-compatible';
+}
+
+function providerUsesNativeTools(provider: LlmRuntimeConfig['provider']): boolean {
+	return provider === 'deepseek' || provider === 'glm';
+}
+
+function providerForcesJsonOutput(provider: LlmRuntimeConfig['provider']): boolean {
+	return provider === 'deepseek' || provider === 'glm';
 }
 
 function emitTrace(options: AgentRunOptions, event: AgentTraceEvent): void {

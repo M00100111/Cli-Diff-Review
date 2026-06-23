@@ -47,6 +47,7 @@ const providerFactories: Record<LlmProvider, (config: LlmRuntimeConfig) => LlmCl
 	openai: (config) => new OpenAiCompatibleClient(config.baseUrl, config.apiKey, fetch, config.jsonOutputEnabled ?? true),
 	anthropic: (config) => new AnthropicClient(config.baseUrl, config.apiKey),
 	deepseek: (config) => new DeepSeekClient(config.baseUrl, config.apiKey, config.thinkingMode ?? 'high', config.strictTools ?? true),
+	glm: (config) => new GlmClient(config.baseUrl, config.apiKey, config.thinkingMode ?? 'high'),
 };
 
 export function createLlmClient(config: LlmRuntimeConfig): LlmClient {
@@ -144,6 +145,52 @@ export class DeepSeekClient implements LlmClient {
 			this.strictTools ? 'This endpoint may not support DeepSeek Strict Tools Beta; disable Strict Tools or use the official DeepSeek Base URL.' : undefined,
 		);
 		return parseOpenAiCompletion(await response.json() as unknown, 'DeepSeek');
+	}
+}
+
+export class GlmClient implements LlmClient {
+	public constructor(
+		private readonly baseUrl: string,
+		private readonly apiKey: string,
+		private readonly thinkingMode: LlmThinkingMode = 'high',
+		private readonly fetchImpl: typeof fetch = fetch,
+	) {}
+
+	public async completeJson(request: LlmJsonRequest, signal?: AbortSignal): Promise<string> {
+		const completion = await this.complete(request, signal);
+		if (!completion.content) {
+			throw new Error('GLM response did not include final JSON content.');
+		}
+		return completion.content;
+	}
+
+	public async complete(request: LlmJsonRequest, signal?: AbortSignal): Promise<LlmCompletion> {
+		const body: Record<string, unknown> = {
+			model: request.model,
+			messages: requestMessages(request).map(openAiMessage),
+			max_tokens: request.maxTokens ?? 8192,
+			response_format: { type: 'json_object' },
+			thinking: { type: this.thinkingMode === 'disabled' ? 'disabled' : 'enabled' },
+		};
+		if (this.thinkingMode === 'disabled') {
+			body.temperature = request.temperature ?? 0;
+		} else {
+			body.reasoning_effort = this.thinkingMode;
+		}
+		if (request.tools?.length) {
+			body.tools = request.tools.map((tool) => ({
+				type: 'function',
+				function: {
+					name: tool.name,
+					description: tool.description,
+					parameters: tool.parameters,
+				},
+			}));
+			body.tool_choice = 'auto';
+		}
+		const response = await this.fetchImpl(endpoint(this.baseUrl, 'chat/completions'), requestInit(this.apiKey, body, signal));
+		await ensureOk(response, 'GLM');
+		return parseOpenAiCompletion(await response.json() as unknown, 'GLM');
 	}
 }
 
@@ -296,5 +343,8 @@ export function providerLabel(provider: LlmProvider): string {
 	if (provider === 'anthropic') {
 		return 'Anthropic';
 	}
-	return provider === 'deepseek' ? 'DeepSeek' : 'OpenAI-compatible';
+	if (provider === 'deepseek') {
+		return 'DeepSeek';
+	}
+	return provider === 'glm' ? 'GLM' : 'OpenAI-compatible';
 }

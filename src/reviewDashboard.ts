@@ -1294,6 +1294,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 						<option value="openai">OpenAI-compatible</option>
 						<option value="anthropic">Anthropic</option>
 						<option value="deepseek">DeepSeek</option>
+						<option value="glm">GLM</option>
 					</select>
 				</div>
 				<div class="wiki-field">
@@ -1316,7 +1317,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					<label for="llmThinkingMode">Thinking</label>
 					<select id="llmThinkingMode">
 						<option value="disabled">Disabled</option>
+						<option value="minimal">Minimal</option>
+						<option value="low">Low</option>
+						<option value="medium">Medium</option>
 						<option value="high">High</option>
+						<option value="xhigh">XHigh</option>
 						<option value="max">Max</option>
 					</select>
 				</div>
@@ -1814,6 +1819,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			if (provider === 'deepseek') {
 				return 'DeepSeek';
 			}
+			if (provider === 'glm') {
+				return 'GLM';
+			}
 			return 'OpenAI-compatible';
 		}
 
@@ -2294,8 +2302,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		function applyProviderCapabilities(providerChanged) {
 			const provider = llmProvider.value;
 			const deepseek = provider === 'deepseek';
+			const glm = provider === 'glm';
+			const thinking = deepseek || glm;
+			updateThinkingModeOptions(provider, llmThinkingMode.value);
 			jsonOutputField.hidden = provider === 'anthropic';
-			thinkingModeField.hidden = !deepseek;
+			thinkingModeField.hidden = !thinking;
 			strictToolsField.hidden = !deepseek;
 			if (providerChanged) {
 				if (deepseek) {
@@ -2304,6 +2315,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					llmJsonOutput.checked = true;
 					llmThinkingMode.value = 'high';
 					llmStrictTools.checked = true;
+				} else if (glm) {
+					llmBaseUrl.value = 'https://open.bigmodel.cn/api/paas/v4';
+					llmModel.value = 'glm-5.2';
+					llmJsonOutput.checked = true;
+					llmThinkingMode.value = 'high';
+					llmStrictTools.checked = false;
 				} else if (provider === 'anthropic') {
 					llmJsonOutput.checked = false;
 					llmThinkingMode.value = 'disabled';
@@ -2314,7 +2331,37 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					llmStrictTools.checked = false;
 				}
 			}
-			llmJsonOutput.disabled = deepseek;
+			updateThinkingModeOptions(provider, llmThinkingMode.value);
+			llmJsonOutput.disabled = deepseek || glm;
+		}
+
+		function updateThinkingModeOptions(provider, currentValue) {
+			const optionSets = {
+				deepseek: [
+					['disabled', 'Disabled'],
+					['high', 'High'],
+					['max', 'Max'],
+				],
+				glm: [
+					['disabled', 'Disabled'],
+					['minimal', 'Minimal'],
+					['low', 'Low'],
+					['medium', 'Medium'],
+					['high', 'High'],
+					['xhigh', 'XHigh'],
+					['max', 'Max'],
+				],
+				default: [['disabled', 'Disabled']],
+			};
+			const options = optionSets[provider] || optionSets.default;
+			llmThinkingMode.replaceChildren(...options.map(([value, label]) => {
+				const option = document.createElement('option');
+				option.value = value;
+				option.textContent = label;
+				return option;
+			}));
+			const fallback = provider === 'deepseek' || provider === 'glm' ? 'high' : 'disabled';
+			llmThinkingMode.value = options.some(([value]) => value === currentValue) ? currentValue : fallback;
 		}
 
 		function emptyWikiState() {

@@ -9,7 +9,7 @@ import { AgentRunner, type AgentTraceEvent, validateAgentResponse } from '../age
 import { createReadOnlyAgentTools, createWikiAgentTools } from '../agent/tools';
 import { acceptHunkInBaseline, computeLineDiff } from '../diffEngine';
 import { GitService } from '../gitService';
-import { AnthropicClient, DeepSeekClient, OpenAiCompatibleClient } from '../llm/client';
+import { AnthropicClient, DeepSeekClient, GlmClient, OpenAiCompatibleClient } from '../llm/client';
 import { LlmConfigStore } from '../llm/config';
 import { parseStrictJsonObject } from '../llm/json';
 import { buildReviewDashboardPayload, defaultLlmWikiDashboardState, ReviewDashboardProvider } from '../reviewDashboard';
@@ -983,6 +983,7 @@ suite('Review state', () => {
 		assert.ok(messageHandler);
 		assert.strictEqual(view.title, 'pending.ts');
 		assert.ok(view.webview.html.includes('<option value="deepseek">DeepSeek</option>'));
+		assert.ok(view.webview.html.includes('<option value="glm">GLM</option>'));
 		assert.ok(view.webview.html.includes('Strict Tools (Beta)'));
 		assert.ok(view.webview.html.includes('id="closeConfig"'));
 		assert.ok(view.webview.html.includes('id="homeButton"'));
@@ -1038,6 +1039,9 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('.review-chunk.has-findings'));
 		assert.ok(view.webview.html.includes('.review-chunk.has-suggestion'));
 		assert.ok(view.webview.html.includes('function renderReviewChunkSuggestion'));
+		assert.ok(view.webview.html.includes('https://open.bigmodel.cn/api/paas/v4'));
+		assert.ok(view.webview.html.includes('glm-5.2'));
+		assert.ok(view.webview.html.includes("['xhigh', 'XHigh']"));
 		assert.ok(view.webview.html.includes('review-suggestion-action'));
 		assert.ok(view.webview.html.includes("type: applied ? 'undoAiSuggestion' : 'applyAiSuggestion'"));
 		assert.ok(view.webview.html.includes('review-file-result'));
@@ -1392,6 +1396,56 @@ suite('LLM Code Wiki', () => {
 		assert.strictEqual(body.reasoning_effort, undefined);
 	});
 
+	test('sends GLM JSON Output, thinking, and native tools', async () => {
+		const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+		const client = new GlmClient('https://open.bigmodel.cn/api/paas/v4', 'secret', 'xhigh', async (input, init) => {
+			calls.push({ url: String(input), body: JSON.parse(String(init?.body)) });
+			return new Response(JSON.stringify({
+				choices: [{
+					message: {
+						content: '',
+						reasoning_content: 'Need the source file.',
+						tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"src/app.ts"}' } }],
+					},
+				}],
+			}), { status: 200 });
+		});
+		const completion = await client.complete({
+			model: 'glm-5.2',
+			messages: [{ role: 'user', content: 'Use json and inspect the file.' }],
+			tools: [{
+				name: 'read_file',
+				description: 'Read a file.',
+				parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'], additionalProperties: false },
+			}],
+		});
+
+		assert.strictEqual(calls[0].url, 'https://open.bigmodel.cn/api/paas/v4/chat/completions');
+		assert.deepStrictEqual(calls[0].body.response_format, { type: 'json_object' });
+		assert.deepStrictEqual(calls[0].body.thinking, { type: 'enabled' });
+		assert.strictEqual(calls[0].body.reasoning_effort, 'xhigh');
+		assert.strictEqual(calls[0].body.temperature, undefined);
+		assert.strictEqual(calls[0].body.tool_choice, 'auto');
+		const tools = calls[0].body.tools as Array<{ function: { strict?: boolean } }>;
+		assert.strictEqual(tools[0].function.strict, undefined);
+		assert.strictEqual(completion.reasoningContent, 'Need the source file.');
+		assert.strictEqual(completion.toolCalls[0].name, 'read_file');
+	});
+
+	test('supports GLM disabled thinking', async () => {
+		let body: Record<string, unknown> = {};
+		const client = new GlmClient('https://open.bigmodel.cn/api/paas/v4', 'secret', 'disabled', async (_input, init) => {
+			body = JSON.parse(String(init?.body));
+			return new Response(JSON.stringify({ choices: [{ message: { content: '{"type":"final","result":{}}' } }] }), { status: 200 });
+		});
+
+		await client.completeJson({ model: 'glm-5.2', systemPrompt: 'json system', userPrompt: 'user', temperature: 0.3 });
+
+		assert.deepStrictEqual(body.thinking, { type: 'disabled' });
+		assert.strictEqual(body.temperature, 0.3);
+		assert.strictEqual(body.reasoning_effort, undefined);
+	});
+
 	test('extracts Anthropic JSON content from messages responses', async () => {
 		const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
 		const fetchImpl: typeof fetch = async (input, init) => {
@@ -1470,6 +1524,32 @@ suite('LLM Code Wiki', () => {
 		assert.strictEqual(saved.strictTools, false);
 	});
 
+	test('stores GLM capabilities and applies provider defaults', async () => {
+		const globalState = new TestMemento();
+		const secrets = new TestSecretStorage();
+		const store = new LlmConfigStore({ globalState, secrets } as unknown as vscode.ExtensionContext);
+
+		const saved = await store.save({
+			provider: 'glm',
+			baseUrl: '',
+			model: '',
+			apiKey: 'secret-key',
+			jsonOutputEnabled: false,
+			thinkingMode: 'xhigh',
+			strictTools: true,
+		});
+		const runtime = await store.runtimeConfig();
+
+		assert.strictEqual(saved.provider, 'glm');
+		assert.strictEqual(saved.baseUrl, 'https://open.bigmodel.cn/api/paas/v4');
+		assert.strictEqual(saved.model, 'glm-5.2');
+		assert.strictEqual(saved.jsonOutputEnabled, true);
+		assert.strictEqual(saved.thinkingMode, 'xhigh');
+		assert.strictEqual(saved.strictTools, false);
+		assert.strictEqual(runtime?.provider, 'glm');
+		assert.strictEqual(runtime?.apiKey, 'secret-key');
+	});
+
 	test('migrates legacy provider config to capability defaults', async () => {
 		const openAiState = new TestMemento();
 		openAiState.values.set('cliDiff.llm.provider', 'openai');
@@ -1511,6 +1591,24 @@ suite('LLM Code Wiki', () => {
 		assert.strictEqual(saved.thinkingMode, 'high');
 		assert.strictEqual(saved.strictTools, true);
 		assert.strictEqual(globalState.values.get('cliDiff.llm.provider'), 'deepseek');
+	});
+
+	test('migrates legacy OpenAI-compatible official GLM config', async () => {
+		const globalState = new TestMemento();
+		globalState.values.set('cliDiff.llm.provider', 'openai');
+		globalState.values.set('cliDiff.llm.baseUrl', 'https://open.bigmodel.cn/api/paas/v4');
+		globalState.values.set('cliDiff.llm.model', 'glm-5.2');
+		const secrets = new TestSecretStorage();
+
+		const saved = await new LlmConfigStore({ globalState, secrets } as unknown as vscode.ExtensionContext).savedConfig();
+
+		assert.strictEqual(saved.provider, 'glm');
+		assert.strictEqual(saved.baseUrl, 'https://open.bigmodel.cn/api/paas/v4');
+		assert.strictEqual(saved.model, 'glm-5.2');
+		assert.strictEqual(saved.jsonOutputEnabled, true);
+		assert.strictEqual(saved.thinkingMode, 'high');
+		assert.strictEqual(saved.strictTools, false);
+		assert.strictEqual(globalState.values.get('cliDiff.llm.provider'), 'glm');
 	});
 
 	test('includes wiki state in dashboard payload', () => {
@@ -1742,6 +1840,56 @@ suite('Agent runtime', () => {
 		assert.ok(trace.some((event) => event.kind === 'tool_results_context'));
 		assert.ok(JSON.stringify(trace).includes('I need to echo.'));
 		assert.ok(JSON.stringify(trace).includes('toolCallId'));
+	});
+
+	test('uses GLM native tools and returns reasoning content on the next round', async () => {
+		const requests: Array<{ jsonOutput?: boolean; tools?: unknown[]; messages?: Array<{ role: string; reasoningContent?: string; toolCallId?: string }> }> = [];
+		const trace: AgentTraceEvent[] = [];
+		const completions = [
+			{
+				content: '',
+				reasoningContent: 'I need to echo.',
+				toolCalls: [{ id: 'call-1', name: 'echo', arguments: '{"value":"hello"}' }],
+			},
+			{ content: '{"type":"final","result":{"summary":"done"}}', toolCalls: [] },
+		];
+		const runner = new AgentRunner();
+		const result = await runner.run({
+			config: {
+				provider: 'glm',
+				baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+				model: 'glm-5.2',
+				apiKey: 'secret',
+				jsonOutputEnabled: true,
+				thinkingMode: 'high',
+				strictTools: false,
+			},
+			client: {
+				completeJson: async () => '',
+				complete: async (request) => {
+					requests.push(request);
+					return completions.shift() ?? { content: '', toolCalls: [] };
+				},
+			},
+			systemPrompt: 'test json',
+			userPrompt: 'test',
+			tools: [{
+				name: 'echo',
+				description: 'Echo.',
+				parameters: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false },
+				execute: async (args) => args,
+			}],
+			onTrace: (event) => trace.push(event),
+		});
+
+		assert.strictEqual(result.result.summary, 'done');
+		assert.strictEqual(requests.length, 2);
+		assert.strictEqual(requests[0].jsonOutput, true);
+		assert.ok(requests[0].tools?.length);
+		assert.ok(requests[1].messages?.some((message) => message.role === 'assistant' && message.reasoningContent === 'I need to echo.'));
+		assert.ok(requests[1].messages?.some((message) => message.role === 'tool' && message.toolCallId === 'call-1'));
+		assert.ok(trace.some((event) => event.kind === 'run_start' && event.summary.includes('GLM model glm-5.2')));
+		assert.ok(trace.some((event) => event.kind === 'llm_response' && event.summary.includes('native tool call')));
 	});
 
 	test('corrects empty or invalid DeepSeek native tool output once', async () => {

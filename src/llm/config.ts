@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 
-export type LlmProvider = 'openai' | 'anthropic' | 'deepseek';
-export type LlmThinkingMode = 'disabled' | 'high' | 'max';
+export type LlmProvider = 'openai' | 'anthropic' | 'deepseek' | 'glm';
+export type LlmThinkingMode = 'disabled' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 export interface LlmConfigInput {
 	profileId?: string;
@@ -50,6 +50,9 @@ const strictToolsKey = 'cliDiff.llm.strictTools';
 const apiKeySecretKey = 'cliDiff.llm.apiKey';
 const profilesKey = 'cliDiff.llm.profiles';
 const activeProfileKey = 'cliDiff.llm.activeProfileId';
+const deepSeekBaseUrl = 'https://api.deepseek.com';
+const glmBaseUrl = 'https://open.bigmodel.cn/api/paas/v4';
+const glmDefaultModel = 'glm-5.2';
 
 interface LlmPersistedProfile {
 	id: string;
@@ -96,13 +99,11 @@ export class LlmConfigStore {
 		if (!provider) {
 			throw new Error('Select a supported LLM provider.');
 		}
-		const baseUrl = input.baseUrl.trim() || (provider === 'deepseek' ? 'https://api.deepseek.com' : '');
-		const model = input.model.trim();
+		const baseUrl = input.baseUrl.trim() || defaultBaseUrl(provider);
+		const model = input.model.trim() || defaultModel(provider);
 		const apiKey = input.apiKey?.trim() ?? '';
-		const jsonOutputEnabled = provider === 'deepseek' ? true : input.jsonOutputEnabled ?? provider === 'openai';
-		const thinkingMode = provider === 'deepseek'
-			? this.thinkingModeFromValue(input.thinkingMode) ?? 'high'
-			: 'disabled';
+		const jsonOutputEnabled = providerForcesJsonOutput(provider) ? true : input.jsonOutputEnabled ?? provider === 'openai';
+		const thinkingMode = normalizeThinkingMode(provider, this.thinkingModeFromValue(input.thinkingMode));
 		const strictTools = provider === 'deepseek' ? input.strictTools ?? true : false;
 		if (!baseUrl || !model) {
 			throw new Error('Base URL and model are required.');
@@ -162,14 +163,14 @@ export class LlmConfigStore {
 	}
 
 	private providerFromValue(value: string | undefined): LlmProvider | undefined {
-		if (value === 'openai' || value === 'anthropic' || value === 'deepseek') {
+		if (value === 'openai' || value === 'anthropic' || value === 'deepseek' || value === 'glm') {
 			return value;
 		}
 		return undefined;
 	}
 
 	private thinkingModeFromValue(value: string | undefined): LlmThinkingMode | undefined {
-		if (value === 'disabled' || value === 'high' || value === 'max') {
+		if (value === 'disabled' || value === 'minimal' || value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh' || value === 'max') {
 			return value;
 		}
 		return undefined;
@@ -221,8 +222,8 @@ export class LlmConfigStore {
 		if (!baseUrl && !model && !legacyApiKey) {
 			return undefined;
 		}
-		if (provider === 'openai' && isOfficialDeepSeekBaseUrl(baseUrl)) {
-			provider = 'deepseek';
+		if (provider === 'openai' && officialProviderForBaseUrl(baseUrl)) {
+			provider = officialProviderForBaseUrl(baseUrl) ?? provider;
 			await this.context.globalState.update(providerKey, provider);
 		}
 		const storedThinkingMode = this.thinkingModeFromValue(this.context.globalState.get<string>(thinkingModeKey));
@@ -231,8 +232,8 @@ export class LlmConfigStore {
 			provider,
 			baseUrl,
 			model,
-			jsonOutputEnabled: provider === 'deepseek' ? true : this.context.globalState.get<boolean>(jsonOutputKey, provider === 'openai'),
-			thinkingMode: provider === 'deepseek' ? storedThinkingMode ?? 'high' : 'disabled',
+			jsonOutputEnabled: providerForcesJsonOutput(provider) ? true : this.context.globalState.get<boolean>(jsonOutputKey, provider === 'openai'),
+			thinkingMode: normalizeThinkingMode(provider, storedThinkingMode),
 			strictTools: provider === 'deepseek' ? this.context.globalState.get<boolean>(strictToolsKey, true) : false,
 		});
 	}
@@ -287,10 +288,10 @@ export class LlmConfigStore {
 		return {
 			id: profile.id.trim(),
 			provider,
-			baseUrl: profile.baseUrl.trim() || (provider === 'deepseek' ? 'https://api.deepseek.com' : ''),
-			model: profile.model.trim(),
-			jsonOutputEnabled: provider === 'deepseek' ? true : profile.jsonOutputEnabled,
-			thinkingMode: provider === 'deepseek' ? this.thinkingModeFromValue(profile.thinkingMode) ?? 'high' : 'disabled',
+			baseUrl: profile.baseUrl.trim() || defaultBaseUrl(provider),
+			model: profile.model.trim() || defaultModel(provider),
+			jsonOutputEnabled: providerForcesJsonOutput(provider) ? true : profile.jsonOutputEnabled,
+			thinkingMode: normalizeThinkingMode(provider, this.thinkingModeFromValue(profile.thinkingMode)),
 			strictTools: provider === 'deepseek' ? profile.strictTools : false,
 		};
 	}
@@ -315,12 +316,47 @@ function profileSecretKey(profileId: string): string {
 	return `cliDiff.llm.profile.${profileId}.apiKey`;
 }
 
-function isOfficialDeepSeekBaseUrl(value: string): boolean {
-	try {
-		return new URL(value).hostname === 'api.deepseek.com';
-	} catch {
-		return false;
+function providerForcesJsonOutput(provider: LlmProvider): boolean {
+	return provider === 'deepseek' || provider === 'glm';
+}
+
+function normalizeThinkingMode(provider: LlmProvider, value: LlmThinkingMode | undefined): LlmThinkingMode {
+	if (provider === 'deepseek') {
+		return value === 'disabled' || value === 'max' ? value : 'high';
 	}
+	if (provider === 'glm') {
+		return value ?? 'high';
+	}
+	return 'disabled';
+}
+
+function defaultBaseUrl(provider: LlmProvider): string {
+	if (provider === 'deepseek') {
+		return deepSeekBaseUrl;
+	}
+	if (provider === 'glm') {
+		return glmBaseUrl;
+	}
+	return '';
+}
+
+function defaultModel(provider: LlmProvider): string {
+	return provider === 'glm' ? glmDefaultModel : '';
+}
+
+function officialProviderForBaseUrl(value: string): LlmProvider | undefined {
+	try {
+		const hostname = new URL(value).hostname;
+		if (hostname === 'api.deepseek.com') {
+			return 'deepseek';
+		}
+		if (hostname === 'open.bigmodel.cn') {
+			return 'glm';
+		}
+	} catch {
+		return undefined;
+	}
+	return undefined;
 }
 
 function slug(value: string): string {
