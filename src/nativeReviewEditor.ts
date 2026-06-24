@@ -93,7 +93,7 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 
 		const tabs = this.nativeDiffTabs(uri);
 		const key = uriKey(uri);
-		if (tabs.length === 0 && !this.openFileKeys.has(key)) {
+		if (tabs.length === 0 && !this.openFileKeys.has(key) && !this.isActiveReviewDocumentForFile(uri)) {
 			return false;
 		}
 
@@ -102,16 +102,10 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 			return false;
 		}
 
-		const viewColumn = tabs[0]?.group.viewColumn;
-		if (tabs.length > 0) {
-			const closed = await vscode.window.tabGroups.close(tabs, true);
-			if (!closed) {
-				return false;
-			}
-		} else if (this.isActiveReviewDocumentForFile(uri)) {
-			await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
-		}
-		return this.open(uri, reveal ?? firstReviewRevealPosition(file), viewColumn);
+		this.refresh(uri);
+		await this.reveal(file, reveal ?? firstReviewRevealPosition(file));
+		this.openFileKeys.add(key);
+		return true;
 	}
 
 	public async revealChunk(uri: vscode.Uri, hunkId: string): Promise<boolean> {

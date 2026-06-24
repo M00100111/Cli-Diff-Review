@@ -813,6 +813,7 @@ export class ReviewController implements vscode.Disposable {
 				}]);
 			}
 
+			this.refreshPendingHunksFromReviewState(target.file);
 			this.touchFileRevision(target.file);
 			this.syncManualGitBaseline(target.file);
 			await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
@@ -3254,6 +3255,17 @@ export class ReviewController implements vscode.Disposable {
 		file.hunks = file.hunks.filter((hunk) => !reviewedIdentities.has(reviewHunkIdentity(hunk)));
 	}
 
+	private refreshPendingHunksFromReviewState(file: ReviewFileState): void {
+		const diff = this.computeReviewHunks(file.uri, file.oldText, file.newText);
+		file.hunks = diff.hunks;
+		this.normalizeReviewedDuplicateHunks(file);
+		file.appliedAiSuggestions = file.appliedAiSuggestions.filter((suggestion) => file.hunks.some((hunk) => (
+			hunk.id === suggestion.hunkId
+			&& hunk.newText === suggestion.appliedHunk.newText
+		)));
+		file.skippedReason = diff.skippedReason;
+	}
+
 	private isSameReviewHunk(left: ReviewHunk, right: ReviewHunk): boolean {
 		return left.fileUri === right.fileUri
 			&& left.kind === right.kind
@@ -3546,6 +3558,18 @@ export class ReviewController implements vscode.Disposable {
 		return this.lineBlock(text, startLine, lineCount) === expectedText;
 	}
 
+	private lineBlockAtCoordinateMatches(text: string, startLine: number, lineCount: number, expectedText: string): boolean {
+		const lines = splitLines(text);
+		const expectedLines = splitLines(expectedText);
+		const start = Math.max(0, startLine);
+		const count = Math.max(0, lineCount);
+		return start === startLine
+			&& expectedLines.length === count
+			&& start <= lines.length
+			&& start + count <= lines.length
+			&& lines.slice(start, start + count).join('') === expectedText;
+	}
+
 	private originalHunkSideMatches(text: string, hunk: ReviewHunk, side: 'old' | 'new', startLine: number): boolean {
 		const context = side === 'old'
 			? { before: hunk.oldContextBefore, after: hunk.oldContextAfter }
@@ -3565,7 +3589,7 @@ export class ReviewController implements vscode.Disposable {
 		return lineBlockWithContextMatches(text, startLine, lineCount, expectedText, {
 			before: hunk.baselineContextBefore,
 			after: hunk.baselineContextAfter,
-		});
+		}) || this.lineBlockAtCoordinateMatches(text, startLine, lineCount, expectedText);
 	}
 
 	private reviewedCurrentSideMatches(
@@ -3578,7 +3602,7 @@ export class ReviewController implements vscode.Disposable {
 		return lineBlockWithContextMatches(text, startLine, lineCount, expectedText, {
 			before: hunk.currentContextBefore,
 			after: hunk.currentContextAfter,
-		});
+		}) || this.lineBlockAtCoordinateMatches(text, startLine, lineCount, expectedText);
 	}
 
 	private manualHunkTouchesPending(manualHunk: ReviewHunk, pendingHunks: ReviewHunk[], editedRanges: EditedRange[]): boolean {

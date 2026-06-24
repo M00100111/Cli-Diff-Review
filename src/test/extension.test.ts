@@ -396,6 +396,10 @@ suite('Review controller bulk actions', () => {
 		assert.ok(source.includes('this.syncManualGitBaseline(refreshedFile);'));
 		assert.ok(source.includes('this.manualGitBaselines.set(key, baseline);'));
 		assert.ok(source.includes('this.manualGitBaselines.delete(key);'));
+		assert.ok(source.includes('this.refreshPendingHunksFromReviewState(target.file);'));
+		assert.ok(source.includes('private refreshPendingHunksFromReviewState(file: ReviewFileState): void'));
+		assert.ok(source.includes('private lineBlockAtCoordinateMatches'));
+		assert.ok(source.includes('}) || this.lineBlockAtCoordinateMatches(text, startLine, lineCount, expectedText);'));
 		assert.ok(source.includes('this.removePendingHunk(target.file, target.hunk)'));
 		assert.ok(source.includes('file.hunks = [];'));
 		assert.ok(source.includes('refreshedFile.hunks = [];'));
@@ -455,11 +459,13 @@ suite('Review controller bulk actions', () => {
 		assert.ok(nativeSource.includes('public async syncOpen(uri: vscode.Uri, reveal?: NativeReviewRevealPosition): Promise<boolean>'));
 		assert.ok(nativeSource.includes('private readonly openFileKeys = new Set<string>();'));
 		assert.ok(nativeSource.includes('vscode.window.tabGroups.onDidChangeTabs'));
-		assert.ok(nativeSource.includes('if (tabs.length === 0 && !this.openFileKeys.has(key))'));
+		assert.ok(nativeSource.includes('if (tabs.length === 0 && !this.openFileKeys.has(key) && !this.isActiveReviewDocumentForFile(uri))'));
 		assert.ok(nativeSource.includes('vscode.window.tabGroups.close(tabs, true)'));
-		assert.ok(nativeSource.includes("vscode.commands.executeCommand('workbench.action.closeActiveEditor')"));
 		assert.ok(nativeSource.includes('private isActiveReviewDocumentForFile(fileUri: vscode.Uri): boolean'));
-		assert.ok(nativeSource.includes('return this.open(uri, reveal ?? firstReviewRevealPosition(file), viewColumn);'));
+		assert.ok(nativeSource.includes('this.refresh(uri);'));
+		assert.ok(nativeSource.includes('await this.reveal(file, reveal ?? firstReviewRevealPosition(file));'));
+		assert.ok(nativeSource.includes('this.openFileKeys.add(key);'));
+		assert.ok(nativeSource.includes('return true;'));
 		assert.ok(nativeSource.includes('query: encodeURIComponent(JSON.stringify({ uri: uri.toString(), side, revision }))'));
 		assert.ok(nativeSource.includes('private fileUriFromDiffInput(input: vscode.TabInputTextDiff): vscode.Uri | undefined'));
 		assert.ok(nativeSource.includes('private textDiffInput(tab: vscode.Tab): vscode.TabInputTextDiff | undefined'));
