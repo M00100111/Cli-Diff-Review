@@ -10,12 +10,12 @@ type DashboardMessage =
 	| { type: 'ready' }
 	| { type: 'refresh' }
 	| { type: 'open'; uri: string }
-	| { type: 'acceptFile'; uri: string }
-	| { type: 'rejectFile'; uri: string }
-	| { type: 'undoFile'; uri: string }
-	| { type: 'acceptChunk'; uri: string; hunkId: string }
-	| { type: 'rejectChunk'; uri: string; hunkId: string }
-	| { type: 'undoChunk'; uri: string; hunkId: string }
+	| { type: 'acceptFile'; uri: string; revision: number }
+	| { type: 'rejectFile'; uri: string; revision: number }
+	| { type: 'undoFile'; uri: string; revision: number }
+	| { type: 'acceptChunk'; uri: string; hunkId: string; revision: number }
+	| { type: 'rejectChunk'; uri: string; hunkId: string; revision: number }
+	| { type: 'undoChunk'; uri: string; hunkId: string; revision: number }
 	| { type: 'acceptAll' }
 	| { type: 'rejectAll' }
 	| { type: 'undoAll' }
@@ -65,6 +65,7 @@ export interface ReviewDashboardChunk {
 
 export interface ReviewDashboardFile {
 	uri: string;
+	revision: number;
 	relativePath: string;
 	fileExtension: string;
 	description: string;
@@ -208,32 +209,32 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			return;
 		}
 		if (message.type === 'acceptFile') {
-			await this.executeCommand('cli-diff.acceptFile', message.uri);
+			await this.executeCommand('cli-diff.acceptFile', message.uri, message.revision);
 			this.postState();
 			return;
 		}
 		if (message.type === 'rejectFile') {
-			await this.executeCommand('cli-diff.rejectFile', message.uri);
+			await this.executeCommand('cli-diff.rejectFile', message.uri, message.revision);
 			this.postState();
 			return;
 		}
 		if (message.type === 'undoFile') {
-			await this.executeCommand('cli-diff.undoFile', message.uri);
+			await this.executeCommand('cli-diff.undoFile', message.uri, message.revision);
 			this.postState();
 			return;
 		}
 		if (message.type === 'acceptChunk') {
-			await this.executeCommand('cli-diff.acceptChange', message.uri, message.hunkId);
+			await this.executeCommand('cli-diff.acceptChange', message.uri, message.hunkId, message.revision);
 			this.postState();
 			return;
 		}
 		if (message.type === 'rejectChunk') {
-			await this.executeCommand('cli-diff.rejectChange', message.uri, message.hunkId);
+			await this.executeCommand('cli-diff.rejectChange', message.uri, message.hunkId, message.revision);
 			this.postState();
 			return;
 		}
 		if (message.type === 'undoChunk') {
-			await this.executeCommand('cli-diff.restoreChange', message.uri, message.hunkId);
+			await this.executeCommand('cli-diff.restoreChange', message.uri, message.hunkId, message.revision);
 			this.postState();
 			return;
 		}
@@ -1980,10 +1981,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const actions = document.createElement('span');
 			actions.className = 'review-chunk-actions';
 			if (chunk.reviewStatus === 'reviewed') {
-				actions.appendChild(chunkActionButton('undoChunk', file.uri, chunk.hunkId, !chunk.canUndo, 'Undo chunk', 'undo'));
+				actions.appendChild(chunkActionButton('undoChunk', file.uri, chunk.hunkId, file.revision, !chunk.canUndo, 'Undo chunk', 'undo'));
 			} else {
-				actions.appendChild(chunkActionButton('rejectChunk', file.uri, chunk.hunkId, !chunk.canReject, 'Reject chunk', 'reject'));
-				actions.appendChild(chunkActionButton('acceptChunk', file.uri, chunk.hunkId, !chunk.canAccept, 'Accept chunk', 'accept'));
+				actions.appendChild(chunkActionButton('rejectChunk', file.uri, chunk.hunkId, file.revision, !chunk.canReject, 'Reject chunk', 'reject'));
+				actions.appendChild(chunkActionButton('acceptChunk', file.uri, chunk.hunkId, file.revision, !chunk.canAccept, 'Accept chunk', 'accept'));
 			}
 			side.append(actions);
 			summary.append(main, side);
@@ -2437,9 +2438,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const actions = document.createElement('div');
 			actions.className = 'actions';
 			row.appendChild(actions);
-			actions.appendChild(actionButton('acceptFile', file.uri, file.acceptDisabled, 'Accept file'));
-			actions.appendChild(actionButton('rejectFile', file.uri, file.rejectDisabled, 'Reject file'));
-			actions.appendChild(actionButton('undoFile', file.uri, file.undoDisabled, 'Undo file'));
+			actions.appendChild(actionButton('acceptFile', file.uri, file.revision, file.acceptDisabled, 'Accept file'));
+			actions.appendChild(actionButton('rejectFile', file.uri, file.revision, file.rejectDisabled, 'Reject file'));
+			actions.appendChild(actionButton('undoFile', file.uri, file.revision, file.undoDisabled, 'Undo file'));
 			return row;
 		}
 
@@ -2449,7 +2450,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			vscode.postMessage({ type: 'open', uri: file.uri });
 		}
 
-		function actionButton(type, uri, disabled, title) {
+		function actionButton(type, uri, revision, disabled, title) {
 			const button = document.createElement('button');
 			button.className = 'icon-button';
 			button.title = title;
@@ -2458,12 +2459,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			button.disabled = Boolean(disabled);
 			button.addEventListener('click', (event) => {
 				event.stopPropagation();
-				vscode.postMessage({ type, uri });
+				vscode.postMessage({ type, uri, revision });
 			});
 			return button;
 		}
 
-		function chunkActionButton(type, uri, hunkId, disabled, title, tone) {
+		function chunkActionButton(type, uri, hunkId, revision, disabled, title, tone) {
 			const button = document.createElement('button');
 			button.type = 'button';
 			button.className = 'icon-button review-chunk-action ' + tone;
@@ -2477,7 +2478,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				if (button.disabled) {
 					return;
 				}
-				vscode.postMessage({ type, uri, hunkId });
+				vscode.postMessage({ type, uri, hunkId, revision });
 			});
 			return button;
 		}
@@ -2541,6 +2542,7 @@ export function buildReviewDashboardPayload(
 				const displayPath = aggregate && file.projectName ? `${file.projectName}/${file.relativePath}` : file.relativePath;
 				return {
 					uri: file.uri.toString(),
+					revision: file.revision,
 					relativePath: displayPath,
 					fileExtension: dashboardExtension(displayPath),
 					description: dashboardDescription(pendingCount, reviewedCount, dirty, file.skippedReason),

@@ -21,6 +21,7 @@ import {
 	captureLineBlockContext,
 	firstReviewRevealPosition,
 	isStaleRevision,
+	lineBlockWithContextMatches,
 	lineBlockWithContextMatchesUniquely,
 	mapLineAfterFileEdits,
 	mapLineAfterLineEdits,
@@ -389,6 +390,12 @@ suite('Review controller bulk actions', () => {
 		assert.ok(source.includes('await this.acceptFileCore(target.file)'));
 		assert.ok(source.includes('await this.rejectFileCore(target.file)'));
 		assert.ok(source.includes('await this.undoFileCore(target.file)'));
+		assert.ok(source.includes('private syncManualGitBaseline(file: ReviewFileState): void'));
+		assert.ok(source.includes('this.syncManualGitBaseline(target.file);'));
+		assert.ok(source.includes('this.syncManualGitBaseline(file);'));
+		assert.ok(source.includes('this.syncManualGitBaseline(refreshedFile);'));
+		assert.ok(source.includes('this.manualGitBaselines.set(key, baseline);'));
+		assert.ok(source.includes('this.manualGitBaselines.delete(key);'));
 		assert.ok(source.includes('this.removePendingHunk(target.file, target.hunk)'));
 		assert.ok(source.includes('file.hunks = [];'));
 		assert.ok(source.includes('refreshedFile.hunks = [];'));
@@ -432,12 +439,33 @@ suite('Review controller bulk actions', () => {
 		assert.ok(controllerSource.includes("await this.nativeReviewEditor.revealChunk(uri, effectiveReveal.hunkId)"));
 		assert.ok(controllerSource.includes("await this.reviewWebview.open(uri, effectiveReveal?.line !== undefined"));
 		assert.ok(controllerSource.includes('this.nativeReviewEditor.refresh(uri);'));
-		assert.ok(controllerSource.includes('this.nativeReviewEditor.clearActive(target.file.uri);'));
+		assert.ok(controllerSource.includes('private async syncNativeReviewAfterMutation(uri: vscode.Uri, reveal?: NativeReviewRevealPosition): Promise<void>'));
+		assert.ok(controllerSource.includes('await this.nativeReviewEditor.syncOpen(uri, reveal);'));
+		assert.ok(controllerSource.includes('await this.syncNativeReviewAfterMutation(target.file.uri, { line: target.hunk.newStart, column: 0 });'));
+		assert.ok(controllerSource.includes('await this.syncNativeReviewAfterMutation(file.uri);'));
+		assert.ok(controllerSource.includes('await this.syncNativeReviewAfterMutation(refreshedFile.uri);'));
 		assert.ok(controllerSource.includes('...this.nativeReviewEditor.closeCompleted(),'));
 		assert.ok(nativeSource.includes('registerTextDocumentContentProvider(NativeReviewEditorManager.beforeDocumentScheme'));
-		assert.ok(nativeSource.includes("provideTextDocumentContent: (uri) => this.provideBeforeDocumentContent(uri)"));
+		assert.ok(nativeSource.includes('registerTextDocumentContentProvider(NativeReviewEditorManager.afterDocumentScheme'));
+		assert.ok(nativeSource.includes("provideTextDocumentContent: (uri) => this.provideReviewDocumentContent(uri)"));
 		assert.ok(nativeSource.includes("'vscode.diff'"));
-		assert.ok(nativeSource.includes('return this.getSession()?.files.get(uriKey(fileUri))?.oldText ??'));
+		assert.ok(nativeSource.includes("this.reviewDocumentUri(file, 'before')"));
+		assert.ok(nativeSource.includes("this.reviewDocumentUri(file, 'after')"));
+		assert.ok(nativeSource.includes("return payload.side === 'after' ? file.newText : file.oldText;"));
+		assert.ok(nativeSource.includes('public async syncOpen(uri: vscode.Uri, reveal?: NativeReviewRevealPosition): Promise<boolean>'));
+		assert.ok(nativeSource.includes('private readonly openFileKeys = new Set<string>();'));
+		assert.ok(nativeSource.includes('vscode.window.tabGroups.onDidChangeTabs'));
+		assert.ok(nativeSource.includes('if (tabs.length === 0 && !this.openFileKeys.has(key))'));
+		assert.ok(nativeSource.includes('vscode.window.tabGroups.close(tabs, true)'));
+		assert.ok(nativeSource.includes("vscode.commands.executeCommand('workbench.action.closeActiveEditor')"));
+		assert.ok(nativeSource.includes('private isActiveReviewDocumentForFile(fileUri: vscode.Uri): boolean'));
+		assert.ok(nativeSource.includes('return this.open(uri, reveal ?? firstReviewRevealPosition(file), viewColumn);'));
+		assert.ok(nativeSource.includes('query: encodeURIComponent(JSON.stringify({ uri: uri.toString(), side, revision }))'));
+		assert.ok(nativeSource.includes('private fileUriFromDiffInput(input: vscode.TabInputTextDiff): vscode.Uri | undefined'));
+		assert.ok(nativeSource.includes('private textDiffInput(tab: vscode.Tab): vscode.TabInputTextDiff | undefined'));
+		assert.ok(nativeSource.includes("'original' in input"));
+		assert.ok(nativeSource.includes("'modified' in input"));
+		assert.ok(nativeSource.includes('private isUriLike(value: unknown): value is vscode.Uri'));
 		assert.ok(nativeSource.includes("get<boolean>('nativeDiffInline', true)"));
 		assert.ok(nativeSource.includes("diffConfig.update('renderSideBySide', false, vscode.ConfigurationTarget.Workspace)"));
 		assert.ok(nativeSource.includes("vscode.commands.executeCommand('revealLine'"));
@@ -1032,7 +1060,7 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes("chunkActionButton('acceptChunk'"));
 		assert.ok(view.webview.html.includes("chunkActionButton('rejectChunk'"));
 		assert.ok(view.webview.html.includes("chunkActionButton('undoChunk'"));
-		assert.ok(view.webview.html.includes('vscode.postMessage({ type, uri, hunkId })'));
+		assert.ok(view.webview.html.includes('vscode.postMessage({ type, uri, hunkId, revision })'));
 		assert.ok(view.webview.html.includes('.review-chunk.add'));
 		assert.ok(view.webview.html.includes('.review-chunk.delete'));
 		assert.ok(view.webview.html.includes('.review-chunk.modify'));
@@ -1087,7 +1115,7 @@ suite('Review state', () => {
 		assert.ok(modelIndex < wikiPanelIndex);
 		assert.ok(modelIndex < reviewTreeIndex);
 		const before = posted.length;
-		messageHandler({ type: 'acceptFile', uri: uri.toString() });
+		messageHandler({ type: 'acceptFile', uri: uri.toString(), revision: 0 });
 		await new Promise((resolve) => setTimeout(resolve, 0));
 
 		assert.ok(posted.length > before);
@@ -1132,19 +1160,22 @@ suite('Review state', () => {
 		assert.ok(commands.some((call) => call.command === 'cli-diff.openAiReviewFinding'
 			&& call.args[0] === uri.toString()
 			&& call.args[1] === 'hunk-1'));
-		messageHandler({ type: 'acceptChunk', uri: uri.toString(), hunkId: 'hunk-1' });
-		messageHandler({ type: 'rejectChunk', uri: uri.toString(), hunkId: 'hunk-1' });
-		messageHandler({ type: 'undoChunk', uri: uri.toString(), hunkId: 'hunk-1' });
+		messageHandler({ type: 'acceptChunk', uri: uri.toString(), hunkId: 'hunk-1', revision: 0 });
+		messageHandler({ type: 'rejectChunk', uri: uri.toString(), hunkId: 'hunk-1', revision: 0 });
+		messageHandler({ type: 'undoChunk', uri: uri.toString(), hunkId: 'hunk-1', revision: 0 });
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.acceptChange'
 			&& call.args[0] === uri.toString()
-			&& call.args[1] === 'hunk-1'));
+			&& call.args[1] === 'hunk-1'
+			&& call.args[2] === 0));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.rejectChange'
 			&& call.args[0] === uri.toString()
-			&& call.args[1] === 'hunk-1'));
+			&& call.args[1] === 'hunk-1'
+			&& call.args[2] === 0));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.restoreChange'
 			&& call.args[0] === uri.toString()
-			&& call.args[1] === 'hunk-1'));
+			&& call.args[1] === 'hunk-1'
+			&& call.args[2] === 0));
 		messageHandler({ type: 'applyAiSuggestion', uri: uri.toString(), hunkId: 'hunk-1', suggestionId: 'suggestion-1' });
 		messageHandler({ type: 'undoAiSuggestion', uri: uri.toString(), hunkId: 'hunk-1', suggestionId: 'suggestion-1' });
 		await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1188,6 +1219,15 @@ suite('Review state', () => {
 		assert.strictEqual(lineBlockWithContextMatchesUniquely(text, 1, 0, '', context), false);
 		assert.strictEqual(lineBlockWithContextMatchesUniquely('a\n}\n', 1, 0, '', context), true);
 		assert.strictEqual(lineBlockWithContextMatchesUniquely('a\n}\n', 2, 0, '', context), false);
+	});
+
+	test('allows reviewed undo to use exact coordinates when context is duplicated', () => {
+		const block = 'before1\nbefore2\nbefore3\nx\nafter1\nafter2\nafter3\n';
+		const text = block + block;
+		const context = captureLineBlockContext(text, 3, 1);
+
+		assert.strictEqual(lineBlockWithContextMatches(text, 3, 1, 'x\n', context), true);
+		assert.strictEqual(lineBlockWithContextMatchesUniquely(text, 3, 1, 'x\n', context), false);
 	});
 
 	test('keeps file-level accept undo coordinates in final baseline space', () => {

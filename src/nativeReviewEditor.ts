@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { firstReviewRevealPosition } from './reviewState';
 import { splitLines } from './text';
 import { ReviewFileState, ReviewSession, uriKey } from './types';
 
@@ -8,11 +9,15 @@ export interface NativeReviewRevealPosition {
 	hunkId?: string;
 }
 
+type NativeReviewSide = 'before' | 'after';
+
 export class NativeReviewEditorManager implements vscode.Disposable {
 	private static readonly beforeDocumentScheme = 'cli-diff-review-before';
+	private static readonly afterDocumentScheme = 'cli-diff-review-after';
 
 	private readonly disposables: vscode.Disposable[] = [];
 	private readonly beforeDocumentEmitter = new vscode.EventEmitter<vscode.Uri>();
+	private readonly openFileKeys = new Set<string>();
 
 	public constructor(
 		private readonly getSession: () => ReviewSession | undefined,
@@ -22,7 +27,27 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 			this.beforeDocumentEmitter,
 			vscode.workspace.registerTextDocumentContentProvider(NativeReviewEditorManager.beforeDocumentScheme, {
 				onDidChange: this.beforeDocumentEmitter.event,
-				provideTextDocumentContent: (uri) => this.provideBeforeDocumentContent(uri),
+				provideTextDocumentContent: (uri) => this.provideReviewDocumentContent(uri),
+			}),
+			vscode.workspace.registerTextDocumentContentProvider(NativeReviewEditorManager.afterDocumentScheme, {
+				onDidChange: this.beforeDocumentEmitter.event,
+				provideTextDocumentContent: (uri) => this.provideReviewDocumentContent(uri),
+			}),
+			vscode.window.tabGroups.onDidChangeTabs((event) => {
+				for (const tab of event.opened) {
+					const input = this.textDiffInput(tab);
+					const fileUri = input ? this.fileUriFromDiffInput(input) : undefined;
+					if (fileUri) {
+						this.openFileKeys.add(uriKey(fileUri));
+					}
+				}
+				for (const tab of event.closed) {
+					const input = this.textDiffInput(tab);
+					const fileUri = input ? this.fileUriFromDiffInput(input) : undefined;
+					if (fileUri) {
+						this.openFileKeys.delete(uriKey(fileUri));
+					}
+				}
 			}),
 		);
 	}
@@ -34,13 +59,13 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 		}
 	}
 
-	public async open(uri: vscode.Uri, reveal?: NativeReviewRevealPosition): Promise<boolean> {
+	public async open(uri: vscode.Uri, reveal?: NativeReviewRevealPosition, viewColumn?: vscode.ViewColumn): Promise<boolean> {
 		if (!this.isEnabled()) {
 			return false;
 		}
 
 		const file = this.getSession()?.files.get(uriKey(uri));
-		if (!file?.currentExists) {
+		if (!file || file.skippedReason) {
 			return false;
 		}
 
@@ -48,16 +73,45 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 			await this.ensureInlineDiffMode();
 			await vscode.commands.executeCommand(
 				'vscode.diff',
-				this.beforeDocumentUri(file),
-				file.uri,
+				this.reviewDocumentUri(file, 'before'),
+				this.reviewDocumentUri(file, 'after'),
 				`${file.relativePath} - Cli Diff Review`,
-				{ preview: false },
+				{ preview: false, viewColumn },
 			);
 			await this.reveal(file, reveal);
+			this.openFileKeys.add(uriKey(file.uri));
 			return true;
 		} catch {
 			return false;
 		}
+	}
+
+	public async syncOpen(uri: vscode.Uri, reveal?: NativeReviewRevealPosition): Promise<boolean> {
+		if (!this.isEnabled()) {
+			return false;
+		}
+
+		const tabs = this.nativeDiffTabs(uri);
+		const key = uriKey(uri);
+		if (tabs.length === 0 && !this.openFileKeys.has(key)) {
+			return false;
+		}
+
+		const file = this.getSession()?.files.get(uriKey(uri));
+		if (!file || file.skippedReason) {
+			return false;
+		}
+
+		const viewColumn = tabs[0]?.group.viewColumn;
+		if (tabs.length > 0) {
+			const closed = await vscode.window.tabGroups.close(tabs, true);
+			if (!closed) {
+				return false;
+			}
+		} else if (this.isActiveReviewDocumentForFile(uri)) {
+			await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
+		}
+		return this.open(uri, reveal ?? firstReviewRevealPosition(file), viewColumn);
 	}
 
 	public async revealChunk(uri: vscode.Uri, hunkId: string): Promise<boolean> {
@@ -87,13 +141,27 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 			return;
 		}
 
+		const openTabs = this.nativeDiffTabs(uri);
+		for (const tab of openTabs) {
+			const input = this.textDiffInput(tab);
+			if (input) {
+				this.beforeDocumentEmitter.fire(input.original);
+				this.beforeDocumentEmitter.fire(input.modified);
+			}
+		}
+
 		if (uri) {
-			this.beforeDocumentEmitter.fire(this.beforeDocumentUriForFileUri(uri));
+			const file = session.files.get(uriKey(uri));
+			if (file) {
+				this.beforeDocumentEmitter.fire(this.reviewDocumentUri(file, 'before'));
+				this.beforeDocumentEmitter.fire(this.reviewDocumentUri(file, 'after'));
+			}
 			return;
 		}
 
 		for (const file of session.files.values()) {
-			this.beforeDocumentEmitter.fire(this.beforeDocumentUri(file));
+			this.beforeDocumentEmitter.fire(this.reviewDocumentUri(file, 'before'));
+			this.beforeDocumentEmitter.fire(this.reviewDocumentUri(file, 'after'));
 		}
 	}
 
@@ -102,10 +170,19 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 		if (tabs.length > 0) {
 			void vscode.window.tabGroups.close(tabs, true);
 		}
+		if (uri) {
+			this.openFileKeys.delete(uriKey(uri));
+		} else {
+			this.openFileKeys.clear();
+		}
 	}
 
-	public clearActive(_uri?: vscode.Uri): void {
-		this.refresh(_uri);
+	public clearActive(uri?: vscode.Uri): void {
+		if (uri) {
+			void this.syncOpen(uri);
+			return;
+		}
+		this.refresh(uri);
 	}
 
 	public closeCompleted(): vscode.Uri[] {
@@ -113,8 +190,14 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 		const closed: vscode.Uri[] = [];
 		const tabs = this.nativeDiffTabs();
 		for (const tab of tabs) {
-			const input = tab.input as vscode.TabInputTextDiff;
-			const fileUri = input.modified;
+			const input = this.textDiffInput(tab);
+			if (!input) {
+				continue;
+			}
+			const fileUri = this.fileUriFromDiffInput(input);
+			if (!fileUri) {
+				continue;
+			}
 			if ((files?.get(uriKey(fileUri))?.hunks.length ?? 0) > 0) {
 				continue;
 			}
@@ -124,39 +207,57 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 		if (closed.length > 0) {
 			const closedKeys = new Set(closed.map(uriKey));
 			void vscode.window.tabGroups.close(tabs.filter((tab) => {
-				const input = tab.input as vscode.TabInputTextDiff;
-				return closedKeys.has(uriKey(input.modified));
+				const input = this.textDiffInput(tab);
+				const fileUri = input ? this.fileUriFromDiffInput(input) : undefined;
+				return Boolean(fileUri && closedKeys.has(uriKey(fileUri)));
 			}), true);
 		}
 
 		return closed;
 	}
 
-	private provideBeforeDocumentContent(uri: vscode.Uri): string {
-		const fileUri = this.fileUriFromBeforeDocumentUri(uri);
-		if (!fileUri) {
+	private provideReviewDocumentContent(uri: vscode.Uri): string {
+		const payload = this.reviewDocumentPayload(uri);
+		if (!payload) {
 			return '';
 		}
-		return this.getSession()?.files.get(uriKey(fileUri))?.oldText ?? '';
+		const file = this.getSession()?.files.get(uriKey(payload.fileUri));
+		if (!file) {
+			return '';
+		}
+		return payload.side === 'after' ? file.newText : file.oldText;
 	}
 
-	private beforeDocumentUri(file: ReviewFileState): vscode.Uri {
-		return this.beforeDocumentUriForFileUri(file.uri);
+	private reviewDocumentUri(file: ReviewFileState, side: NativeReviewSide): vscode.Uri {
+		return this.reviewDocumentUriForFileUri(file.uri, side, file.revision);
 	}
 
-	private beforeDocumentUriForFileUri(uri: vscode.Uri): vscode.Uri {
+	private reviewDocumentUriForFileUri(uri: vscode.Uri, side: NativeReviewSide, revision = 0): vscode.Uri {
 		return vscode.Uri.from({
-			scheme: NativeReviewEditorManager.beforeDocumentScheme,
+			scheme: side === 'after' ? NativeReviewEditorManager.afterDocumentScheme : NativeReviewEditorManager.beforeDocumentScheme,
 			path: uri.path,
-			query: encodeURIComponent(uri.toString()),
+			query: encodeURIComponent(JSON.stringify({ uri: uri.toString(), side, revision })),
 		});
 	}
 
-	private fileUriFromBeforeDocumentUri(uri: vscode.Uri): vscode.Uri | undefined {
-		try {
-			return vscode.Uri.parse(decodeURIComponent(uri.query));
-		} catch {
+	private reviewDocumentPayload(uri: vscode.Uri): { fileUri: vscode.Uri; side: NativeReviewSide } | undefined {
+		if (uri.scheme !== NativeReviewEditorManager.beforeDocumentScheme && uri.scheme !== NativeReviewEditorManager.afterDocumentScheme) {
 			return undefined;
+		}
+		try {
+			const decoded = decodeURIComponent(uri.query);
+			const parsed = JSON.parse(decoded) as { uri?: unknown; side?: unknown };
+			if (typeof parsed.uri === 'string') {
+				const side = parsed.side === 'after' || uri.scheme === NativeReviewEditorManager.afterDocumentScheme ? 'after' : 'before';
+				return { fileUri: vscode.Uri.parse(parsed.uri), side };
+			}
+			return undefined;
+		} catch {
+			try {
+				return { fileUri: vscode.Uri.parse(decodeURIComponent(uri.query)), side: uri.scheme === NativeReviewEditorManager.afterDocumentScheme ? 'after' : 'before' };
+			} catch {
+				return undefined;
+			}
 		}
 	}
 
@@ -178,7 +279,7 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 		await vscode.commands.executeCommand('revealLine', { lineNumber: line, at: 'center' });
 
 		const editor = vscode.window.activeTextEditor;
-		if (!editor || uriKey(editor.document.uri) !== uriKey(file.uri)) {
+		if (!editor || !this.isReviewDocumentForFile(editor.document.uri, file.uri)) {
 			return;
 		}
 
@@ -192,10 +293,51 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 	private nativeDiffTabs(uri?: vscode.Uri): vscode.Tab[] {
 		const targetKey = uri ? uriKey(uri) : undefined;
 		return vscode.window.tabGroups.all.flatMap((group) => group.tabs).filter((tab) => {
-			const input = tab.input;
-			return input instanceof vscode.TabInputTextDiff
-				&& input.original.scheme === NativeReviewEditorManager.beforeDocumentScheme
-				&& (!targetKey || uriKey(input.modified) === targetKey);
+			const input = this.textDiffInput(tab);
+			const fileUri = input ? this.fileUriFromDiffInput(input) : undefined;
+			return Boolean(fileUri && (!targetKey || uriKey(fileUri) === targetKey));
 		});
+	}
+
+	private fileUriFromDiffInput(input: vscode.TabInputTextDiff): vscode.Uri | undefined {
+		const original = this.reviewDocumentPayload(input.original);
+		const modified = this.reviewDocumentPayload(input.modified);
+		if (!original || !modified || original.side !== 'before' || modified.side !== 'after') {
+			return undefined;
+		}
+		return uriKey(original.fileUri) === uriKey(modified.fileUri) ? original.fileUri : undefined;
+	}
+
+	private isReviewDocumentForFile(uri: vscode.Uri, fileUri: vscode.Uri): boolean {
+		const payload = this.reviewDocumentPayload(uri);
+		return Boolean(payload && uriKey(payload.fileUri) === uriKey(fileUri));
+	}
+
+	private isActiveReviewDocumentForFile(fileUri: vscode.Uri): boolean {
+		const activeUri = vscode.window.activeTextEditor?.document.uri;
+		return Boolean(activeUri && this.isReviewDocumentForFile(activeUri, fileUri));
+	}
+
+	private textDiffInput(tab: vscode.Tab): vscode.TabInputTextDiff | undefined {
+		const input = tab.input;
+		if (input instanceof vscode.TabInputTextDiff) {
+			return input;
+		}
+		if (!input || typeof input !== 'object' || !('original' in input) || !('modified' in input)) {
+			return undefined;
+		}
+		const candidate = input as { original?: unknown; modified?: unknown };
+		if (this.isUriLike(candidate.original) && this.isUriLike(candidate.modified)) {
+			return candidate as vscode.TabInputTextDiff;
+		}
+		return undefined;
+	}
+
+	private isUriLike(value: unknown): value is vscode.Uri {
+		return Boolean(value
+			&& typeof value === 'object'
+			&& 'scheme' in value
+			&& typeof (value as { scheme?: unknown }).scheme === 'string'
+			&& typeof (value as { toString?: unknown }).toString === 'function');
 	}
 }
