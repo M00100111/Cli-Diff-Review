@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import { gitIgnoredReviewPaths, normalizeReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
 import { decodeUtf8, isProbablyBinary, relativePath } from '../text';
 import { throwIfAborted } from './cancellation';
+import { isGeneratedAgentsGuidancePath } from './paths';
 
 interface DigestFile {
 	uri: vscode.Uri;
@@ -22,7 +23,7 @@ export async function buildWorkspaceDigest(root: vscode.WorkspaceFolder, signal?
 	throwIfAborted(signal);
 	const uris = await vscode.workspace.findFiles(
 		new vscode.RelativePattern(root, '**/*'),
-		'**/{.git,.skills,node_modules,dist,out,.vscode-test}/**',
+		'**/{.git,.agents,.skills,node_modules,dist,out,.vscode-test}/**',
 		digestMaxFiles,
 	);
 	throwIfAborted(signal);
@@ -64,7 +65,7 @@ export async function buildWorkspaceDigest(root: vscode.WorkspaceFolder, signal?
 }
 
 function shouldSkipDigestPath(relativePath: string): boolean {
-	if (!relativePath || shouldSkipReviewPath(relativePath)) {
+	if (!relativePath || isGeneratedAgentsGuidancePath(relativePath) || shouldSkipReviewPath(relativePath)) {
 		return true;
 	}
 	const segments = relativePath.split('/');
@@ -73,6 +74,7 @@ function shouldSkipDigestPath(relativePath: string): boolean {
 		'dist',
 		'out',
 		'.git',
+		'.agents',
 		'.skills',
 		'.vscode-test',
 	].includes(segment));

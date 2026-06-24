@@ -3,6 +3,16 @@ import * as vscode from 'vscode';
 import { gitIgnoredReviewPaths, normalizeReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
 import { decodeUtf8, encodeUtf8, isProbablyBinary, relativePath } from '../text';
 import { throwIfAborted } from './cancellation';
+import {
+	agentsDirectoryName,
+	isGeneratedAgentsGuidancePath,
+	referencesDirectoryName,
+	skillsDirectoryName,
+	wikiSchemaFileName,
+	wikiSkillDirectoryName,
+	wikiSkillFileName,
+	wikiStateFileName,
+} from './paths';
 
 export type WikiAgentState = 'initializing' | 'ready' | 'paused' | 'updating' | 'failed';
 
@@ -24,12 +34,6 @@ export interface SourceFingerprintDiff {
 	current: Record<string, string>;
 }
 
-const stateFileName = '.state.json';
-const skillsDirectoryName = '.skills';
-const skillDirectoryName = 'llm-code-wiki';
-const referencesDirectoryName = 'references';
-const skillFileName = 'SKILL.md';
-const schemaFileName = 'schema.md';
 const sourceMaxFiles = 5000;
 const sourceMaxFileBytes = 2 * 1024 * 1024;
 
@@ -37,7 +41,7 @@ export class WikiStateService {
 	public constructor(private readonly extensionUri: vscode.Uri) {}
 
 	public wikiUri(rootUri: vscode.Uri): vscode.Uri {
-		return vscode.Uri.joinPath(rootUri, skillsDirectoryName, skillDirectoryName);
+		return vscode.Uri.joinPath(rootUri, agentsDirectoryName, skillsDirectoryName, wikiSkillDirectoryName);
 	}
 
 	public referencesUri(rootUri: vscode.Uri): vscode.Uri {
@@ -45,15 +49,15 @@ export class WikiStateService {
 	}
 
 	public stateUri(rootUri: vscode.Uri): vscode.Uri {
-		return vscode.Uri.joinPath(this.wikiUri(rootUri), stateFileName);
+		return vscode.Uri.joinPath(this.wikiUri(rootUri), wikiStateFileName);
 	}
 
 	public skillUri(rootUri: vscode.Uri): vscode.Uri {
-		return vscode.Uri.joinPath(this.wikiUri(rootUri), skillFileName);
+		return vscode.Uri.joinPath(this.wikiUri(rootUri), wikiSkillFileName);
 	}
 
 	public schemaUri(rootUri: vscode.Uri): vscode.Uri {
-		return vscode.Uri.joinPath(this.referencesUri(rootUri), schemaFileName);
+		return vscode.Uri.joinPath(this.referencesUri(rootUri), wikiSchemaFileName);
 	}
 
 	public async wikiExists(rootUri: vscode.Uri): Promise<boolean> {
@@ -150,7 +154,7 @@ export class WikiStateService {
 		throwIfAborted(signal);
 		const uris = await vscode.workspace.findFiles(
 			new vscode.RelativePattern(root, '**/*'),
-			'**/{.git,.skills,node_modules,dist,out,.vscode-test}/**',
+			'**/{.git,.agents,.skills,node_modules,dist,out,.vscode-test}/**',
 			sourceMaxFiles,
 		);
 		const paths = new Map(uris.map((uri) => [uri.toString(), normalizeReviewPath(relativePath(root.uri, uri))]));
@@ -159,7 +163,7 @@ export class WikiStateService {
 		for (const uri of uris) {
 			throwIfAborted(signal);
 			const currentPath = paths.get(uri.toString()) ?? normalizeReviewPath(relativePath(root.uri, uri));
-			if (shouldSkipReviewPath(currentPath, false) || ignored.has(currentPath)) {
+			if (isGeneratedAgentsGuidancePath(currentPath) || shouldSkipReviewPath(currentPath, false) || ignored.has(currentPath)) {
 				continue;
 			}
 			try {
@@ -176,11 +180,11 @@ export class WikiStateService {
 	}
 
 	public async readBundledSkill(): Promise<string> {
-		return decodeUtf8(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(this.extensionUri, 'llm-code-wiki', skillFileName)));
+		return decodeUtf8(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(this.extensionUri, 'llm-code-wiki', wikiSkillFileName)));
 	}
 
 	public async readBundledSchema(): Promise<string> {
-		return decodeUtf8(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(this.extensionUri, 'llm-code-wiki', schemaFileName)));
+		return decodeUtf8(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(this.extensionUri, 'llm-code-wiki', wikiSchemaFileName)));
 	}
 }
 

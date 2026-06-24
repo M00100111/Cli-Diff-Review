@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import * as vscode from 'vscode';
+import { isWikiPath, isWikiStatePath } from './wiki/paths';
 
 export function normalizeReviewPath(relativePath: string): string {
 	return relativePath.replace(/\\/g, '/');
@@ -12,7 +13,7 @@ export function isDotReviewPath(relativePath: string): boolean {
 }
 
 export function isWikiReviewPath(relativePath: string): boolean {
-	return normalizeReviewPath(relativePath).startsWith('.skills/llm-code-wiki/');
+	return isWikiPath(relativePath);
 }
 
 export function shouldSkipReviewPath(
@@ -20,10 +21,10 @@ export function shouldSkipReviewPath(
 	reviewWikiChanges = vscode.workspace.getConfiguration('cliDiff').get<boolean>('reviewWikiChanges', true),
 ): boolean {
 	const normalized = normalizeReviewPath(relativePath);
-	if (normalized === '.skills/llm-code-wiki/.state.json') {
+	if (isWikiStatePath(normalized)) {
 		return true;
 	}
-	if (normalized.startsWith('.skills/llm-code-wiki/')) {
+	if (isWikiPath(normalized)) {
 		return !reviewWikiChanges || !normalized.endsWith('.md');
 	}
 	return isDotReviewPath(normalized);

@@ -2,7 +2,7 @@
 
 This file defines the operating rules for an LLM-maintained, repository-local code knowledge base stored as a project skill.
 
-The source tree is always the source of truth. `.skills/llm-code-wiki` is a compact navigation and explanation layer for humans and coding agents. It must describe the repository that contains it, not the tool that generated it.
+The source tree is always the source of truth. `.agents/skills/llm-code-wiki` is a compact navigation and explanation layer for humans and coding agents. It must describe the repository that contains it, not the tool that generated it.
 
 ## Structure
 
@@ -52,9 +52,11 @@ There are three agent roles:
 - `Normal coding agent`: an external coding agent such as Codex or Claude Code that may use and improve business wiki pages while coding.
 - `AI Review Agent`: the Cli Diff Review review Agent that may read wiki context for code review but must not modify wiki files.
 
-The Host Wiki Agent may read source files and wiki pages through the tools provided by the host plugin. It may write generated Markdown files inside `.skills/llm-code-wiki/references`.
+The Host Wiki Agent may read source files and wiki pages through the tools provided by the host plugin. It may write generated Markdown files inside `.agents/skills/llm-code-wiki/references`.
 
-Normal coding agents may edit business knowledge pages under `.skills/llm-code-wiki/references` when the edits are grounded in source evidence. They should update `references/index.md` when adding a new business knowledge page.
+Normal coding agents are encouraged to edit business knowledge pages under `.agents/skills/llm-code-wiki/references` when the edits are grounded in source evidence. When making code changes, keeping the wiki aligned is part of the expected work when the change affects durable project knowledge. Wiki updates are expected when changes affect behavior, architecture, workflows, public interfaces, commands, configuration, data flow, module responsibilities, file structure, or important design decisions.
+
+Normal coding agents should update the wiki while coding when they learn durable project knowledge, keep repository-relative source paths, and update `references/index.md` when adding a new business knowledge page. Small formatting-only edits, comment-only changes, or mechanical cleanups with no durable knowledge change usually do not require wiki updates; agents should say why in the final response. Wiki updates must be based on source evidence to avoid low-value documentation churn.
 
 The AI Review Agent treats source and wiki files as read-only.
 
@@ -63,9 +65,9 @@ The AI Review Agent treats source and wiki files as read-only.
 When maintaining the wiki, agents must never:
 
 - Modify repository source files as part of wiki maintenance.
-- Modify `.skills/llm-code-wiki/SKILL.md`.
-- Modify `.skills/llm-code-wiki/references/schema.md`.
-- Modify `.skills/llm-code-wiki/.state.json`.
+- Modify `.agents/skills/llm-code-wiki/SKILL.md`.
+- Modify `.agents/skills/llm-code-wiki/references/schema.md`.
+- Modify `.agents/skills/llm-code-wiki/.state.json`.
 - Invent repository facts that are not supported by source evidence.
 
 For initialization, inspect the repository before creating all required pages.

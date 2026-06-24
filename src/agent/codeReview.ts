@@ -5,6 +5,7 @@ import { LlmRuntimeConfig } from '../llm/config';
 import { isJsonObject } from '../llm/json';
 import { ReviewFileState, ReviewHunk, ReviewSession } from '../types';
 import { isAbortError } from '../wiki/cancellation';
+import { isWikiPath } from '../wiki/paths';
 import { createReadOnlyAgentTools } from './tools';
 import { AgentRunner, AgentTraceDetail, AgentTraceEvent } from './runtime';
 
@@ -320,7 +321,7 @@ function aiReviewRunLimits(maxRounds: number | 'unlimited' | undefined): {
 export function sourcePendingFiles(session: ReviewSession | undefined): ReviewFileState[] {
 	return session
 		? [...session.files.values()]
-			.filter((file) => file.hunks.length > 0 && !file.relativePath.replace(/\\/g, '/').startsWith('.skills/llm-code-wiki/'))
+			.filter((file) => file.hunks.length > 0 && !isWikiPath(file.relativePath))
 			.sort((left, right) => left.relativePath.localeCompare(right.relativePath))
 		: [];
 }

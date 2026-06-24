@@ -6,7 +6,9 @@ import { LlmClient } from '../llm/client';
 import { LlmRuntimeConfig } from '../llm/config';
 import { isJsonObject } from '../llm/json';
 import { decodeUtf8, encodeUtf8 } from '../text';
+import { agentsGuidanceStartMarker, removeManagedAgentsGuidance } from './agentsGuidance';
 import { isAbortError, OperationCancelledError, throwIfAborted } from './cancellation';
+import { agentsGuidanceFileName, wikiDirectoryPath } from './paths';
 import { SourceFingerprintDiff, WikiState, WikiStateService } from './state';
 
 export interface WikiInitializationProgress {
@@ -96,7 +98,8 @@ export class WikiInitializationService {
 			throw new Error('Initialize LLM Code Wiki before updating it.');
 		}
 		const diff = await this.stateService.sourceDiff(options.root, existing, options.signal);
-		if (!hasSourceChanges(diff)) {
+		const agentsGuidanceMissing = !await this.hasAgentsGuidance(options.root.uri);
+		if (!hasSourceChanges(diff) && !agentsGuidanceMissing) {
 			return { summary: 'Wiki is already synchronized.', fileCount: 0, warnings: [] };
 		}
 		const state: WikiState = { ...existing, status: 'updating' };
@@ -133,7 +136,8 @@ export class WikiInitializationService {
 		if (!state || state.status !== 'ready') {
 			return false;
 		}
-		return hasSourceChanges(await this.stateService.sourceDiff(root, state, signal));
+		return hasSourceChanges(await this.stateService.sourceDiff(root, state, signal))
+			|| !await this.hasAgentsGuidance(root.uri);
 	}
 
 	public async state(rootUri: vscode.Uri): Promise<WikiState | undefined> {
@@ -146,7 +150,7 @@ export class WikiInitializationService {
 
 	public async deleteWiki(rootUri: vscode.Uri): Promise<void> {
 		const target = this.stateService.wikiUri(rootUri);
-		if (path.resolve(target.fsPath) !== path.resolve(rootUri.fsPath, '.skills', 'llm-code-wiki')) {
+		if (path.resolve(target.fsPath) !== path.resolve(rootUri.fsPath, wikiDirectoryPath)) {
 			throw new Error('Refusing to delete a path outside the workspace LLM Code Wiki skill directory.');
 		}
 		try {
@@ -154,6 +158,7 @@ export class WikiInitializationService {
 		} catch {
 			// Reverting is complete if the skill directory is already absent.
 		}
+		await removeManagedAgentsGuidance(rootUri);
 	}
 
 	private async runWikiAgent(
@@ -164,16 +169,27 @@ export class WikiInitializationService {
 		userPrompt: string,
 	): Promise<{ summary: string; warnings: string[] }> {
 		const repositorySpecification = decodeUtf8(await vscode.workspace.fs.readFile(this.stateService.schemaUri(options.root.uri)));
+		let agentsGuidanceWritten = false;
 		const result = await this.runner.run({
 			config: options.config,
 			client: options.client,
 			systemPrompt: `${systemPrompt}\n\nRepository Wiki skill schema:\n${repositorySpecification}`,
 			userPrompt,
-			tools: createWikiAgentTools({ root: options.root, generatedFiles }),
+			tools: createWikiAgentTools({
+				root: options.root,
+				generatedFiles,
+				onAgentsGuidanceWritten: () => {
+					agentsGuidanceWritten = true;
+				},
+			}),
 			signal: options.signal,
 			onProgress: (progress) => options.onProgress?.({ message: progress.message }),
 			onTrace: options.onTrace,
 		});
+		if (!agentsGuidanceWritten) {
+			throw new Error(`Wiki Agent did not create or refresh ${agentsGuidanceFileName} guidance.`);
+		}
+		await this.ensureAgentsGuidance(options.root.uri);
 		const summary = typeof result.result.summary === 'string' && result.result.summary.trim()
 			? result.result.summary
 			: `Wiki Agent completed in ${result.rounds} rounds.`;
@@ -191,6 +207,22 @@ export class WikiInitializationService {
 			} catch {
 				throw new Error(`Wiki Agent did not create required file: ${required}`);
 			}
+		}
+	}
+
+	private async ensureAgentsGuidance(rootUri: vscode.Uri): Promise<void> {
+		if (await this.hasAgentsGuidance(rootUri)) {
+			return;
+		}
+		throw new Error(`Wiki Agent did not create ${agentsGuidanceFileName} guidance.`);
+	}
+
+	private async hasAgentsGuidance(rootUri: vscode.Uri): Promise<boolean> {
+		try {
+			const content = decodeUtf8(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(rootUri, agentsGuidanceFileName)));
+			return content.includes(agentsGuidanceStartMarker);
+		} catch {
+			return false;
 		}
 	}
 
@@ -276,6 +308,7 @@ function initializationSystemPrompt(): string {
 		'Source code is read-only. You may create only generated Markdown through wiki write tools.',
 		'First read references/schema.md with read_wiki_file using path "schema.md", then inspect the repository incrementally.',
 		'Create every required initial page described by the specification.',
+		'Create or refresh the root AGENTS.md managed guidance with write_agents_guidance. Include a concise project introduction. Explicitly invite Claude Code, Codex, and other coding agents to use and improve the repository-local wiki at .agents/skills/llm-code-wiki. Point them to .agents/skills/llm-code-wiki/SKILL.md and .agents/skills/llm-code-wiki/references/index.md. State that when making code changes, keeping the wiki aligned is part of the expected work when the change affects durable project knowledge. State that wiki updates are expected when changes affect behavior, architecture, workflows, public interfaces, commands, configuration, data flow, module responsibilities, file structure, or important design decisions. State that small formatting-only edits, comment-only changes, or mechanical cleanups with no durable knowledge change usually do not require wiki updates, but the agent should say why in the final response. State that agents may update source-grounded business knowledge pages under .agents/skills/llm-code-wiki/references, should update references/index.md when adding pages, and should record uncertainty in references/open-questions.md. State that before completing code changes, agents should check whether wiki pages need to be synchronized and state in the final response whether wiki pages were updated, or why no wiki update was needed. State that they must not modify .agents/skills/llm-code-wiki/SKILL.md, .agents/skills/llm-code-wiki/references/schema.md, or .agents/skills/llm-code-wiki/.state.json. Remind them that source files are authoritative.',
 		'Generate index.md as a normal coding-agent navigation page for business wiki content; do not list schema.md in the main index catalog.',
 		'Use source paths as evidence and record uncertainty in open-questions.md.',
 	].join('\n');
@@ -294,6 +327,7 @@ function updateSystemPrompt(): string {
 		'You are the Wiki Update Agent for an arbitrary software repository.',
 		'Source code is read-only. Update only generated Markdown through wiki write tools.',
 		'Read references/schema.md with read_wiki_file using path "schema.md" and relevant existing Wiki pages before editing.',
+		'Refresh the root AGENTS.md managed guidance with write_agents_guidance so the project introduction, .agents/skills/llm-code-wiki pointers, and coding-agent collaboration rules stay current.',
 		'Keep accurate existing content and revise only what source evidence supports.',
 		'Preserve and integrate source-grounded Wiki updates already made by normal coding agents; do not overwrite them without evidence.',
 		'Do not add schema.md to the normal index.md catalog of business wiki pages.',

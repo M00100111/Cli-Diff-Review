@@ -34,6 +34,7 @@ import {
 } from '../reviewState';
 import { replaceLineBlock, splitLines } from '../text';
 import { FilePair, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewProject, ReviewSession, visibleReviewFiles } from '../types';
+import { agentsGuidanceEndMarker, agentsGuidanceStartMarker, mergeManagedAgentsGuidance, removeManagedAgentsGuidanceBlock } from '../wiki/agentsGuidance';
 import { normalizeWikiFilePath, validateWikiInitializationResponse, WikiInitializationService } from '../wiki/wikiInitializer';
 import { WikiStateService } from '../wiki/state';
 
@@ -500,11 +501,13 @@ suite('Review state', () => {
 		assert.strictEqual(isDotReviewPath('src/.cache/output.txt'), true);
 		assert.strictEqual(shouldSkipReviewPath('src/app.ts'), false);
 		assert.strictEqual(shouldSkipReviewPath('src/file.name.ts'), false);
-		assert.strictEqual(shouldSkipReviewPath('.skills/llm-code-wiki/SKILL.md', true), false);
-		assert.strictEqual(shouldSkipReviewPath('.skills/llm-code-wiki/references/overview.md', true), false);
-		assert.strictEqual(shouldSkipReviewPath('.skills/llm-code-wiki/references/overview.md', false), true);
-		assert.strictEqual(shouldSkipReviewPath('.skills/llm-code-wiki/.state.json', true), true);
-		assert.strictEqual(shouldSkipReviewPath('.skills/llm-code-wiki/private.json', true), true);
+		assert.strictEqual(shouldSkipReviewPath('.agents/skills/llm-code-wiki/SKILL.md', true), false);
+		assert.strictEqual(shouldSkipReviewPath('.agents/skills/llm-code-wiki/references/overview.md', true), false);
+		assert.strictEqual(shouldSkipReviewPath('.agents/skills/llm-code-wiki/references/overview.md', false), true);
+		assert.strictEqual(shouldSkipReviewPath('.agents/skills/llm-code-wiki/.state.json', true), true);
+		assert.strictEqual(shouldSkipReviewPath('.agents/skills/llm-code-wiki/private.json', true), true);
+		assert.strictEqual(shouldSkipReviewPath('.skills/llm-code-wiki/SKILL.md', true), true);
+		assert.strictEqual(shouldSkipReviewPath('.agents/skills/other-skill/SKILL.md', true), true);
 		assert.strictEqual(shouldSkipReviewPath('.skills/other-skill/SKILL.md', true), true);
 		assert.strictEqual(shouldSkipReviewPath('.wiki/overview.md', true), true);
 	});
@@ -1292,6 +1295,25 @@ suite('LLM Code Wiki', () => {
 		}));
 	});
 
+	test('merges root AGENTS.md managed guidance without overwriting user content', () => {
+		const created = mergeManagedAgentsGuidance(undefined, '# Project Agents\n\nUse `.agents/skills/llm-code-wiki`.');
+		assert.ok(created.includes(agentsGuidanceStartMarker));
+		assert.ok(created.includes(agentsGuidanceEndMarker));
+		assert.ok(created.includes('.agents/skills/llm-code-wiki'));
+
+		const appended = mergeManagedAgentsGuidance('# Existing\n\nKeep this.\n', '## Cli Diff Review\n\nRead the wiki.');
+		assert.ok(appended.startsWith('# Existing\n\nKeep this.'));
+		assert.ok(appended.includes('## Cli Diff Review'));
+
+		const replaced = mergeManagedAgentsGuidance(appended, '## Cli Diff Review\n\nUpdated guidance.');
+		assert.ok(replaced.includes('# Existing'));
+		assert.ok(replaced.includes('Updated guidance.'));
+		assert.ok(!replaced.includes('Read the wiki.'));
+
+		assert.strictEqual(removeManagedAgentsGuidanceBlock(replaced), '# Existing\n\nKeep this.\n');
+		assert.strictEqual(removeManagedAgentsGuidanceBlock(created), undefined);
+	});
+
 	test('documents normal coding agent collaboration boundaries', () => {
 		const root = path.join(__dirname, '..', '..');
 		const skill = fs.readFileSync(path.join(root, 'llm-code-wiki', 'SKILL.md'), 'utf8');
@@ -1300,18 +1322,40 @@ suite('LLM Code Wiki', () => {
 
 		assert.ok(skill.includes('✨💬 我已阅读llm-code-wiki.SKILL.md'));
 		assert.ok(skill.includes('✨🎯 我已阅读llm-code-wiki/references：{references名称}'));
+		assert.ok(skill.includes('`.agents/skills/llm-code-wiki`'));
 		assert.ok(skill.includes('Do not read every reference page at once unless the task truly requires broad repository context.'));
-		assert.ok(skill.includes('Normal coding agents may help maintain business knowledge pages under `references/`'));
+		assert.ok(skill.includes('Normal coding agents are encouraged to help maintain business knowledge pages under `references/`'));
+		assert.ok(skill.includes('keeping the wiki aligned is part of the expected work when the change affects durable project knowledge'));
+		assert.ok(skill.includes('Wiki updates are expected when changes affect behavior, architecture, workflows, public interfaces, commands, configuration, data flow, module responsibilities, file structure, or important design decisions.'));
+		assert.ok(skill.includes('Small formatting-only edits, comment-only changes, or mechanical cleanups with no durable knowledge change usually do not require wiki updates; say why in the final response.'));
+		assert.ok(skill.includes('Before substantial code changes, read `references/index.md` and only the relevant reference pages.'));
+		assert.ok(skill.includes('In the final response, state whether wiki pages were updated, and if not, why no wiki update was needed.'));
 		assert.ok(skill.includes('Do not modify `SKILL.md`, `references/schema.md`, or `.state.json`.'));
-		assert.ok(skill.includes('✨⚠️ 检测到较多知识库内容可能已过期，建议在 Cli Diff Review 中执行 Update LLM Code Wiki。'));
+		assert.ok(skill.includes('When adding a new business knowledge page, update `references/index.md`.'));
+		assert.ok(skill.includes('treat source as authoritative and update the affected `references/` pages'));
+		assert.ok(skill.includes('✨⚠️ 发现知识库与源码存在较多不一致。我会优先基于源码协助更新可确认的内容；建议随后在 Cli Diff Review 中执行 Update LLM Code Wiki 做一次整体同步。'));
 
 		assert.ok(schema.includes('`Host Wiki Agent`: the Cli Diff Review plugin Agent'));
 		assert.ok(schema.includes('`Normal coding agent`: an external coding agent'));
 		assert.ok(schema.includes('`AI Review Agent`: the Cli Diff Review review Agent'));
-		assert.ok(schema.includes('Normal coding agents may edit business knowledge pages'));
+		assert.ok(schema.includes('Normal coding agents are encouraged to edit business knowledge pages'));
+		assert.ok(schema.includes('keeping the wiki aligned is part of the expected work when the change affects durable project knowledge'));
+		assert.ok(schema.includes('Wiki updates are expected when changes affect behavior, architecture, workflows, public interfaces, commands, configuration, data flow, module responsibilities, file structure, or important design decisions.'));
+		assert.ok(schema.includes('Small formatting-only edits, comment-only changes, or mechanical cleanups with no durable knowledge change usually do not require wiki updates'));
+		assert.ok(schema.includes('avoid low-value documentation churn'));
+		assert.ok(schema.includes('`.agents/skills/llm-code-wiki/references`'));
 		assert.ok(schema.includes('Do not list `references/schema.md` as a normal knowledge page.'));
 		assert.ok(schema.includes('`.state.json`'));
 
+		assert.ok(initializer.includes('write_agents_guidance'));
+		assert.ok(initializer.includes('.agents/skills/llm-code-wiki/SKILL.md'));
+		assert.ok(initializer.includes('Explicitly invite Claude Code, Codex, and other coding agents'));
+		assert.ok(initializer.includes('keeping the wiki aligned is part of the expected work when the change affects durable project knowledge'));
+		assert.ok(initializer.includes('changes affect behavior, architecture, workflows, public interfaces, commands, configuration, data flow, module responsibilities, file structure, or important design decisions'));
+		assert.ok(initializer.includes('formatting-only edits, comment-only changes, or mechanical cleanups'));
+		assert.ok(initializer.includes('should record uncertainty in references/open-questions.md'));
+		assert.ok(initializer.includes('state in the final response whether wiki pages were updated, or why no wiki update was needed'));
+		assert.ok(initializer.includes('must not modify .agents/skills/llm-code-wiki/SKILL.md'));
 		assert.ok(initializer.includes('do not list schema.md in the main index catalog'));
 		assert.ok(initializer.includes('Preserve and integrate source-grounded Wiki updates already made by normal coding agents'));
 		assert.ok(initializer.includes('Do not add schema.md to the normal index.md catalog of business wiki pages.'));
@@ -1328,11 +1372,20 @@ suite('LLM Code Wiki', () => {
 			const responses = [
 				JSON.stringify({
 					type: 'tool_calls',
-					calls: wiki.files.map((file, index) => ({
-						id: `write-${index}`,
-						name: 'write_wiki_file',
-						arguments: file,
-					})),
+					calls: [
+						...wiki.files.map((file, index) => ({
+							id: `write-${index}`,
+							name: 'write_wiki_file',
+							arguments: file,
+						})),
+						{
+							id: 'write-agents',
+							name: 'write_agents_guidance',
+							arguments: {
+								content: '# Project Agents\n\nThis project uses `.agents/skills/llm-code-wiki` for repository knowledge.',
+							},
+						},
+					],
 				}),
 				'{"type":"final","result":{"summary":"Generated wiki.","warnings":[]}}',
 			];
@@ -1346,12 +1399,31 @@ suite('LLM Code Wiki', () => {
 			});
 
 			assert.strictEqual(result.summary, 'Generated wiki.');
+			const agents = fs.readFileSync(path.join(repositoryRoot, 'AGENTS.md'), 'utf8');
+			assert.ok(agents.includes(agentsGuidanceStartMarker));
+			assert.ok(agents.includes('.agents/skills/llm-code-wiki'));
 			assert.ok(trace.some((event) => event.kind === 'llm_request'));
 			assert.ok(trace.some((event) => event.kind === 'tool_result' && event.summary.includes('write_wiki_file')));
 			assert.ok(trace.some((event) => event.kind === 'run_complete'));
 		} finally {
 			fs.rmSync(extensionRoot, { recursive: true, force: true });
 			fs.rmSync(repositoryRoot, { recursive: true, force: true });
+		}
+	});
+
+	test('deleteWiki removes the wiki directory and root AGENTS.md managed block', async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-wiki-delete-'));
+		try {
+			writeRepoFile(root, '.agents/skills/llm-code-wiki/SKILL.md', '# Skill\n');
+			writeRepoFile(root, 'AGENTS.md', mergeManagedAgentsGuidance('# Human guidance\n', '## Cli Diff Review\n\nRead the wiki.'));
+			const service = new WikiInitializationService(vscode.Uri.file(root));
+
+			await service.deleteWiki(vscode.Uri.file(root));
+
+			assert.strictEqual(fs.existsSync(path.join(root, '.agents', 'skills', 'llm-code-wiki')), false);
+			assert.strictEqual(fs.readFileSync(path.join(root, 'AGENTS.md'), 'utf8'), '# Human guidance\n');
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 
@@ -2095,17 +2167,30 @@ suite('Agent runtime', () => {
 	test('protects Wiki template and state files from Agent writes', async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-agent-'));
 		try {
-			writeRepoFile(root, '.skills/llm-code-wiki/references/schema.md', '# Schema\n');
+			writeRepoFile(root, '.agents/skills/llm-code-wiki/references/schema.md', '# Schema\n');
+			writeRepoFile(root, 'AGENTS.md', '# Human notes\n\nKeep me.\n');
+			let agentsGuidanceWritten = false;
 			const tools = createWikiAgentTools({ root: workspaceFolder(root), generatedFiles: new Set() });
 			const list = tools.find((tool) => tool.name === 'list_wiki_files');
 			const read = tools.find((tool) => tool.name === 'read_wiki_file');
 			const write = tools.find((tool) => tool.name === 'write_wiki_file');
+			const writeAgents = createWikiAgentTools({
+				root: workspaceFolder(root),
+				generatedFiles: new Set(),
+				onAgentsGuidanceWritten: () => {
+					agentsGuidanceWritten = true;
+				},
+			}).find((tool) => tool.name === 'write_agents_guidance');
 			assert.ok(list);
 			assert.ok(read);
 			assert.ok(write);
+			assert.ok(writeAgents);
+			assert.ok(JSON.stringify(writeAgents.parameters).includes('durable project knowledge'));
+			assert.ok(JSON.stringify(writeAgents.parameters).includes('formatting-only/comment-only/mechanical cleanups'));
+			assert.ok(JSON.stringify(writeAgents.parameters).includes('SKILL.md, references/schema.md, and .state.json are protected'));
 			assert.deepStrictEqual(await list.execute({}, undefined), { files: ['schema.md'] });
 			assert.deepStrictEqual(await read.execute({ path: 'schema.md' }, undefined), {
-				path: '.skills/llm-code-wiki/references/schema.md',
+				path: '.agents/skills/llm-code-wiki/references/schema.md',
 				content: '# Schema\n',
 				truncated: false,
 			});
@@ -2113,7 +2198,14 @@ suite('Agent runtime', () => {
 			await assert.rejects(() => write.execute({ path: 'SKILL.md', content: 'changed' }), /protected/);
 			await assert.rejects(() => write.execute({ path: '../outside.md', content: 'changed' }), /Invalid relative path/);
 			await write.execute({ path: 'overview.md', content: '# Overview\n' });
-			assert.strictEqual(fs.readFileSync(path.join(root, '.skills', 'llm-code-wiki', 'references', 'overview.md'), 'utf8'), '# Overview\n');
+			assert.strictEqual(fs.readFileSync(path.join(root, '.agents', 'skills', 'llm-code-wiki', 'references', 'overview.md'), 'utf8'), '# Overview\n');
+			await assert.rejects(() => writeAgents.execute({ content: `${agentsGuidanceStartMarker}\nnope` }), /managed block markers/);
+			await writeAgents.execute({ content: '## Cli Diff Review\n\nRead `.agents/skills/llm-code-wiki/SKILL.md`.' });
+			const agents = fs.readFileSync(path.join(root, 'AGENTS.md'), 'utf8');
+			assert.strictEqual(agentsGuidanceWritten, true);
+			assert.ok(agents.includes('# Human notes'));
+			assert.ok(agents.includes(agentsGuidanceStartMarker));
+			assert.ok(agents.includes('.agents/skills/llm-code-wiki/SKILL.md'));
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -2129,21 +2221,29 @@ suite('Wiki state', () => {
 			writeRepoFile(extensionRoot, 'llm-code-wiki/schema.md', '# Schema\n');
 			writeRepoFile(repositoryRoot, 'src/app.ts', 'export const value = 1;\n');
 			writeRepoFile(repositoryRoot, '.env', 'secret\n');
+			writeRepoFile(repositoryRoot, 'AGENTS.md', '# Agent guidance\n');
 			const folder = workspaceFolder(repositoryRoot);
 			const service = new WikiStateService(vscode.Uri.file(extensionRoot));
 			const state = await service.ensureScaffold(folder, 'initializing');
 
 			assert.strictEqual(fs.existsSync(path.join(repositoryRoot, '.wiki')), false);
-			assert.strictEqual(fs.readFileSync(path.join(repositoryRoot, '.skills', 'llm-code-wiki', 'SKILL.md'), 'utf8'), '# Skill\n');
-			assert.strictEqual(fs.readFileSync(path.join(repositoryRoot, '.skills', 'llm-code-wiki', 'references', 'schema.md'), 'utf8'), '# Schema\n');
+			assert.strictEqual(fs.existsSync(path.join(repositoryRoot, '.skills', 'llm-code-wiki')), false);
+			assert.strictEqual(fs.readFileSync(path.join(repositoryRoot, '.agents', 'skills', 'llm-code-wiki', 'SKILL.md'), 'utf8'), '# Skill\n');
+			assert.strictEqual(fs.readFileSync(path.join(repositoryRoot, '.agents', 'skills', 'llm-code-wiki', 'references', 'schema.md'), 'utf8'), '# Schema\n');
 			assert.strictEqual(state.version, 2);
 			assert.ok(state.skillHash);
 			assert.ok(state.schemaHash);
+			assert.strictEqual(fs.existsSync(path.join(repositoryRoot, '.agents', 'skills', 'llm-code-wiki', '.state.json')), true);
 			const ready = await service.completeRun(folder, state, 'done', ['overview.md']);
 			assert.strictEqual(ready.status, 'ready');
 			assert.ok(ready.sourceFingerprints['src/app.ts']);
 			assert.strictEqual(ready.sourceFingerprints['.env'], undefined);
-			assert.strictEqual(ready.sourceFingerprints['.skills/llm-code-wiki/references/schema.md'], undefined);
+			assert.strictEqual(ready.sourceFingerprints['AGENTS.md'], undefined);
+			assert.strictEqual(ready.sourceFingerprints['.agents/skills/llm-code-wiki/references/schema.md'], undefined);
+			const initialization = new WikiInitializationService(vscode.Uri.file(extensionRoot));
+			assert.strictEqual(await initialization.needsUpdate(folder), true);
+			writeRepoFile(repositoryRoot, 'AGENTS.md', mergeManagedAgentsGuidance(undefined, '# Project Agents\n\nRead the wiki.'));
+			assert.strictEqual(await initialization.needsUpdate(folder), false);
 
 			writeRepoFile(repositoryRoot, 'src/app.ts', 'export const value = 2;\n');
 			writeRepoFile(repositoryRoot, 'src/new.ts', 'export const next = true;\n');
@@ -2419,9 +2519,9 @@ suite('AI review findings', () => {
 
 	test('changes review signature when pending chunks change and skips Wiki files', () => {
 		const sourceUri = vscode.Uri.file('/repo/src/app.ts');
-		const wikiUri = vscode.Uri.file('/repo/.skills/llm-code-wiki/references/overview.md');
+		const wikiUri = vscode.Uri.file('/repo/.agents/skills/llm-code-wiki/references/overview.md');
 		const source = reviewFileState(sourceUri, 'src/app.ts', { hunks: computeLineDiff(sourceUri.toString(), 'a\n', 'b\n') });
-		const wiki = reviewFileState(wikiUri, '.skills/llm-code-wiki/references/overview.md', { hunks: computeLineDiff(wikiUri.toString(), 'a\n', 'b\n') });
+		const wiki = reviewFileState(wikiUri, '.agents/skills/llm-code-wiki/references/overview.md', { hunks: computeLineDiff(wikiUri.toString(), 'a\n', 'b\n') });
 		const session: ReviewSession = { id: 'x', mode: 'git', rootUri: vscode.Uri.file('/repo'), createdAt: 1, files: new Map([[sourceUri.toString(), source], [wikiUri.toString(), wiki]]) };
 		const first = reviewChangeSignature(session);
 		source.revision += 1;
@@ -2516,20 +2616,22 @@ suite('Git service', () => {
 			writeRepoFile(root, '.cache/output.txt', 'cache\n');
 			writeRepoFile(root, '.gitignore', 'ignored.txt\n');
 			writeRepoFile(root, 'ignored.txt', 'ignored\n');
-			writeRepoFile(root, '.skills/llm-code-wiki/SKILL.md', '# Skill\n');
-			writeRepoFile(root, '.skills/llm-code-wiki/references/overview.md', '# Overview\n');
-			writeRepoFile(root, '.skills/llm-code-wiki/.state.json', '{}\n');
-			writeRepoFile(root, '.skills/other-skill/SKILL.md', '# Other\n');
+			writeRepoFile(root, '.agents/skills/llm-code-wiki/SKILL.md', '# Skill\n');
+			writeRepoFile(root, '.agents/skills/llm-code-wiki/references/overview.md', '# Overview\n');
+			writeRepoFile(root, '.agents/skills/llm-code-wiki/.state.json', '{}\n');
+			writeRepoFile(root, '.agents/skills/other-skill/SKILL.md', '# Other\n');
+			writeRepoFile(root, '.skills/llm-code-wiki/SKILL.md', '# Old Skill\n');
 			pairs = await service.createFilePairs(folder);
 			byPath = filePairsByPath(pairs);
 			assert.strictEqual(byPath.has('.env'), false);
 			assert.strictEqual(byPath.has('.cache/output.txt'), false);
 			assert.strictEqual(byPath.has('.gitignore'), false);
 			assert.strictEqual(byPath.has('ignored.txt'), false);
-			assert.strictEqual(byPath.has('.skills/llm-code-wiki/SKILL.md'), true);
-			assert.strictEqual(byPath.has('.skills/llm-code-wiki/references/overview.md'), true);
-			assert.strictEqual(byPath.has('.skills/llm-code-wiki/.state.json'), false);
-			assert.strictEqual(byPath.has('.skills/other-skill/SKILL.md'), false);
+			assert.strictEqual(byPath.has('.agents/skills/llm-code-wiki/SKILL.md'), true);
+			assert.strictEqual(byPath.has('.agents/skills/llm-code-wiki/references/overview.md'), true);
+			assert.strictEqual(byPath.has('.agents/skills/llm-code-wiki/.state.json'), false);
+			assert.strictEqual(byPath.has('.agents/skills/other-skill/SKILL.md'), false);
+			assert.strictEqual(byPath.has('.skills/llm-code-wiki/SKILL.md'), false);
 		} finally {
 			removeTempRepo(root);
 		}

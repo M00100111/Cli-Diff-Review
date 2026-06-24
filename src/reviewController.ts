@@ -55,6 +55,7 @@ import {
 	visibleReviewFiles,
 } from './types';
 import { isAbortError } from './wiki/cancellation';
+import { wikiReferencesPath } from './wiki/paths';
 import { WikiInitializationService } from './wiki/wikiInitializer';
 
 type InternalWriteSource = 'plugin' | 'human';
@@ -2193,7 +2194,7 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 
-		const indexUri = vscode.Uri.joinPath(root.uri, '.skills', 'llm-code-wiki', 'references', 'index.md');
+		const indexUri = vscode.Uri.joinPath(root.uri, ...wikiReferencesPath.split('/'), 'index.md');
 		try {
 			await vscode.workspace.fs.stat(indexUri);
 		} catch {
