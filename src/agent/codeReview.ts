@@ -327,18 +327,35 @@ export function sourcePendingFiles(session: ReviewSession | undefined): ReviewFi
 }
 
 export function reviewChangeSignature(session: ReviewSession): string {
-	const payload = sourcePendingFiles(session).map((file) => ({
+	const payload = sourceReviewFiles(session).map((file) => ({
 		path: file.relativePath,
-		revision: file.revision,
-		hunks: file.hunks.map((hunk) => ({
-			id: hunk.id,
-			oldStart: hunk.oldStart,
-			newStart: hunk.newStart,
-			oldText: hunk.oldText,
-			newText: hunk.newText,
-		})),
+		hunks: [...file.hunks, ...file.acceptedHunks, ...file.rejectedHunks]
+			.map(stableReviewHunkSignature)
+			.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
 	}));
 	return createHash('sha256').update(JSON.stringify({ sessionId: session.id, files: payload })).digest('hex');
+}
+
+function sourceReviewFiles(session: ReviewSession): ReviewFileState[] {
+	return [...session.files.values()]
+		.filter((file) => (
+			file.hunks.length > 0
+			|| file.acceptedHunks.length > 0
+			|| file.rejectedHunks.length > 0
+		) && !isWikiPath(file.relativePath))
+		.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+}
+
+function stableReviewHunkSignature(hunk: ReviewHunk): Record<string, unknown> {
+	return {
+		kind: hunk.kind,
+		oldStart: hunk.oldStart,
+		oldLines: hunk.oldLines,
+		newStart: hunk.newStart,
+		newLines: hunk.newLines,
+		oldText: hunk.oldText,
+		newText: hunk.newText,
+	};
 }
 
 export function validateReviewFindings(result: Record<string, unknown>, file: ReviewFileState, startOrder = 0): AiReviewFinding[] {
@@ -470,7 +487,7 @@ export function validateReviewSuggestionsWithDiagnostics(result: Record<string, 
 			relativePath: file.relativePath,
 			hunkId: hunk.id,
 			line: hunk.newStart,
-			replacementText: candidate.replacementText,
+			replacementText: normalizeAiSuggestionReplacementText(candidate.replacementText, hunk),
 			rationale: typeof candidate.rationale === 'string' ? candidate.rationale : '',
 			generationOrder,
 		});
@@ -483,6 +500,14 @@ export function validateReviewSuggestionsWithDiagnostics(result: Record<string, 
 			dropped,
 		},
 	};
+}
+
+export function normalizeAiSuggestionReplacementText(replacementText: string, hunk: Pick<ReviewHunk, 'newText'>): string {
+	if (replacementText.length === 0 || replacementText.endsWith('\n') || replacementText.endsWith('\r')) {
+		return replacementText;
+	}
+	const lineTerminator = hunk.newText.match(/(\r\n|\n|\r)$/)?.[1];
+	return lineTerminator ? `${replacementText}${lineTerminator}` : replacementText;
 }
 
 export function sortFindings(
@@ -513,7 +538,7 @@ function reviewSystemPrompt(language: AiReviewLanguage, includeWikiTools: boolea
 			: 'Use tools when needed to inspect callers, tests, and configuration.',
 		'Report concrete correctness, reliability, security, or maintainability risks; avoid generic praise.',
 		'Every finding must bind to one supplied hunkId.',
-		'When a concise code change would help, include at most one suggestion per non-delete hunk. A suggestion replacementText replaces the entire current newText for that hunk. Do not create suggestions for delete hunks.',
+		'When a concise code change would help, include at most one suggestion per non-delete hunk. A suggestion replacementText replaces the entire current newText for that hunk; preserve the hunk line terminator when the original newText ends with one. Do not create suggestions for delete hunks.',
 		languageInstruction(language),
 		'Keep finding title, explanation, and recommendation concise. When mentioning code symbols or operators, avoid decorative markdown and make sure any required quotes, backslashes, or newlines are valid JSON string content.',
 		'Finish with {"type":"final","result":{"findings":[{"hunkId":"...","severity":"warning","title":"...","explanation":"...","recommendation":"...","evidence":["path:line"]}],"suggestions":[{"hunkId":"...","replacementText":"complete replacement text for the hunk newText","rationale":"why this replacement helps"}]}}.',

@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { AiReviewPartialError, CodeReviewAgentService, reviewChangeSignature, sortFindings, StoredAiReview, validateReviewFindings, validateReviewFindingsWithDiagnostics, validateReviewSuggestionsWithDiagnostics } from '../agent/codeReview';
+import { AiReviewPartialError, AiReviewStore, CodeReviewAgentService, reviewChangeSignature, sortFindings, StoredAiReview, validateReviewFindings, validateReviewFindingsWithDiagnostics, validateReviewSuggestionsWithDiagnostics } from '../agent/codeReview';
 import { AgentRunner, type AgentTraceEvent, validateAgentResponse } from '../agent/runtime';
 import { createReadOnlyAgentTools, createWikiAgentTools } from '../agent/tools';
 import { acceptHunkInBaseline, computeLineDiff } from '../diffEngine';
@@ -190,6 +190,7 @@ suite('Review webview compatibility', () => {
 		assert.ok(source.includes("require(['vs/editor/editor.main']"));
 		assert.ok(source.includes('showInitializationError'));
 		assert.ok(source.includes('Review editor failed to initialize: '));
+		assert.strictEqual(source.includes("actions.appendChild(createButton(labels.undo, 'undoSuggestion', entry));"), false);
 		assert.ok(source.includes("private static readonly deletedDocumentScheme = 'cli-diff-review-deleted';"));
 		assert.ok(source.includes('vscode.workspace.registerTextDocumentContentProvider(ReviewWebviewManager.deletedDocumentScheme'));
 		assert.ok(source.includes('provideDeletedDocumentContent'));
@@ -427,6 +428,11 @@ suite('Review controller bulk actions', () => {
 		assert.ok(source.includes("this.registerCommand('cli-diff.undoAiSuggestion'"));
 		assert.ok(source.includes('private async applyAiSuggestionCore'));
 		assert.ok(source.includes('private async undoAiSuggestionCore'));
+		assert.ok(source.includes('normalizeAiSuggestionReplacementText(suggestion.replacementText, hunk)'));
+		assert.ok(source.includes('appliedSuggestion.originalHunk.newText'));
+		assert.ok(source.includes('appliedAiSuggestion'));
+		assert.ok(source.includes('aiReviewToResign = appliedSuggestion ? this.aiReviewStore.load(aiReviewSession) : undefined;'));
+		assert.ok(source.includes('await this.saveAiReviewWithCurrentSignature(aiReviewToResign, aiReviewSession);'));
 		assert.ok(source.includes('await this.saveAiReviewWithCurrentSignature(storedReview, reviewSession);'));
 		assert.ok(source.includes('this.replacePendingHunkWithAppliedSuggestion'));
 	});
@@ -924,27 +930,73 @@ suite('Review state', () => {
 		assert.strictEqual(suggestionFile?.chunks[0].appliedSuggestion?.suggestionId, 'suggestion-1');
 		assert.strictEqual(suggestionFile?.aiReviewResult?.summary, 'Model returned 0 findings. Accepted 1 of 1 suggestions.');
 		session.files.set(pendingUri.toString(), reviewFileState(pendingUri, 'src/pending.ts', { hunks: [pendingHunk] }));
+		session.files.set(reviewedUri.toString(), reviewFileState(reviewedUri, 'src/reviewed.ts', {
+			acceptedHunks: [{
+				...reviewedHunkFrom({ ...reviewedHunk, newText: 'better reviewed\n' }, 'accept'),
+				id: `accept-1-${reviewedHunk.id}`,
+				appliedAiSuggestion: {
+					suggestionId: 'suggestion-reviewed',
+					hunkId: reviewedHunk.id,
+					originalHunk: reviewedHunk,
+					replacementText: 'better reviewed\n',
+					appliedHunk: { ...reviewedHunk, newText: 'better reviewed\n' },
+					appliedAt: 1,
+				},
+			}],
+		}));
 		const reviewedFindingPayload = buildReviewDashboardPayload(session, reviewedUri, () => false, {
 			...defaultLlmWikiDashboardState(),
-			reviewFindings: [{
-				id: 'finding-reviewed',
+			reviewFindings: [
+				{
+					id: 'finding-reviewed',
+					uri: reviewedUri.toString(),
+					relativePath: 'src/reviewed.ts',
+					hunkId: reviewedHunk.id,
+					line: reviewedHunk.newStart,
+					severity: 'warning',
+					title: 'Reviewed finding',
+					explanation: 'Risk',
+					recommendation: 'Fix',
+					evidence: [],
+					generationOrder: 0,
+				},
+				{
+					id: 'finding-pending',
+					uri: pendingUri.toString(),
+					relativePath: 'src/pending.ts',
+					hunkId: pendingHunk.id,
+					line: pendingHunk.newStart,
+					severity: 'info',
+					title: 'Other file finding',
+					explanation: 'Risk',
+					recommendation: 'Fix',
+					evidence: [],
+					generationOrder: 1,
+				},
+			],
+			reviewSuggestions: [{
+				id: 'suggestion-reviewed',
 				uri: reviewedUri.toString(),
 				relativePath: 'src/reviewed.ts',
 				hunkId: reviewedHunk.id,
 				line: reviewedHunk.newStart,
-				severity: 'warning',
-				title: 'Reviewed finding',
-				explanation: 'Risk',
-				recommendation: 'Fix',
-				evidence: [],
+				replacementText: 'better reviewed\n',
+				rationale: 'Prefer this reviewed code.',
 				generationOrder: 0,
 			}],
 		});
-		const reviewedFindingChunk = reviewedFindingPayload.files
-			.find((file) => file.relativePath === 'src/reviewed.ts')
-			?.chunks.find((chunk) => chunk.hunkId === reviewedHunk.id);
+		const reviewedFindingFile = reviewedFindingPayload.files.find((file) => file.relativePath === 'src/reviewed.ts');
+		const reviewedFindingChunk = reviewedFindingFile?.chunks[0];
+		const otherFileChunk = reviewedFindingPayload.files
+			.find((file) => file.relativePath === 'src/pending.ts')
+			?.chunks.find((chunk) => chunk.hunkId === pendingHunk.id);
+		assert.strictEqual(reviewedFindingFile?.chunks.length, 1);
+		assert.notStrictEqual(reviewedFindingChunk?.hunkId, reviewedHunk.id);
 		assert.strictEqual(reviewedFindingChunk?.reviewStatus, 'reviewed');
 		assert.strictEqual(reviewedFindingChunk?.findings[0].title, 'Reviewed finding');
+		assert.strictEqual(reviewedFindingChunk?.suggestions[0].replacementText, 'better reviewed\n');
+		assert.strictEqual(reviewedFindingChunk?.appliedSuggestion?.suggestionId, 'suggestion-reviewed');
+		assert.strictEqual(otherFileChunk?.findings[0].title, 'Other file finding');
 	});
 
 	test('deduplicates dashboard chunks when reviewed hunks reappear as pending', () => {
@@ -1080,7 +1132,17 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('glm-5.2'));
 		assert.ok(view.webview.html.includes("['xhigh', 'XHigh']"));
 		assert.ok(view.webview.html.includes('review-suggestion-action'));
-		assert.ok(view.webview.html.includes("type: applied ? 'undoAiSuggestion' : 'applyAiSuggestion'"));
+		assert.ok(view.webview.html.includes("const canApply = chunk.reviewStatus === 'pending' && !applied"));
+		assert.ok(view.webview.html.includes('if (canApply)'));
+		assert.ok(view.webview.html.includes('min-width: 64px;'));
+		assert.ok(view.webview.html.includes('line-height: 18px;'));
+		assert.ok(view.webview.html.includes('cursor: pointer;'));
+		assert.ok(view.webview.html.includes('user-select: none;'));
+		assert.ok(view.webview.html.includes('.review-suggestion-action::before'));
+		assert.ok(view.webview.html.includes('inset: -6px -4px;'));
+		assert.ok(view.webview.html.includes('.review-suggestion-action:hover:not(:disabled)'));
+		assert.ok(view.webview.html.includes("type: 'applyAiSuggestion'"));
+		assert.strictEqual(view.webview.html.includes("type: applied ? 'undoAiSuggestion' : 'applyAiSuggestion'"), false);
 		assert.ok(view.webview.html.includes('review-file-result'));
 		assert.ok(view.webview.html.includes("details.setAttribute('open', '')"));
 		assert.strictEqual(view.webview.html.includes('No findings for this chunk.'), false);
@@ -2418,6 +2480,7 @@ suite('AI review findings', () => {
 		assert.ok(zhPrompt.includes('Keep finding title, explanation, and recommendation concise'));
 		assert.ok(enPrompt.includes('valid JSON string content'));
 		assert.ok(enPrompt.includes('replacementText replaces the entire current newText'));
+		assert.ok(enPrompt.includes('preserve the hunk line terminator'));
 		assert.ok(enPrompt.includes('Do not create suggestions for delete hunks'));
 	});
 
@@ -2437,7 +2500,7 @@ suite('AI review findings', () => {
 			root: workspaceFolder('/repo'),
 			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
 			client: {
-				completeJson: async () => `{"type":"final","result":{"findings":[],"suggestions":[{"hunkId":"${hunk.id}","replacementText":"better\\n","rationale":"Tighter implementation."}]}}`,
+				completeJson: async () => `{"type":"final","result":{"findings":[],"suggestions":[{"hunkId":"${hunk.id}","replacementText":"better","rationale":"Tighter implementation."}]}}`,
 			},
 			language: 'en',
 		});
@@ -2517,18 +2580,112 @@ suite('AI review findings', () => {
 		assert.deepStrictEqual(sortFindings(findings, [file], 'severity').map((item) => item.title), ['Later', 'Earlier']);
 	});
 
-	test('changes review signature when pending chunks change and skips Wiki files', () => {
+	test('keeps review signature stable across review-only transitions and skips Wiki files', async () => {
 		const sourceUri = vscode.Uri.file('/repo/src/app.ts');
 		const wikiUri = vscode.Uri.file('/repo/.agents/skills/llm-code-wiki/references/overview.md');
-		const source = reviewFileState(sourceUri, 'src/app.ts', { hunks: computeLineDiff(sourceUri.toString(), 'a\n', 'b\n') });
+		const hunk = computeLineDiff(sourceUri.toString(), 'a\n', 'b\n')[0];
+		const source = reviewFileState(sourceUri, 'src/app.ts', { hunks: [hunk] });
 		const wiki = reviewFileState(wikiUri, '.agents/skills/llm-code-wiki/references/overview.md', { hunks: computeLineDiff(wikiUri.toString(), 'a\n', 'b\n') });
 		const session: ReviewSession = { id: 'x', mode: 'git', rootUri: vscode.Uri.file('/repo'), createdAt: 1, files: new Map([[sourceUri.toString(), source], [wikiUri.toString(), wiki]]) };
 		const first = reviewChangeSignature(session);
+		const store = new AiReviewStore(new TestMemento() as unknown as vscode.Memento);
+		const review: StoredAiReview = {
+			signature: first,
+			findings: [{
+				id: 'finding-1',
+				uri: sourceUri.toString(),
+				relativePath: 'src/app.ts',
+				hunkId: hunk.id,
+				line: hunk.newStart,
+				severity: 'warning',
+				title: 'Bound',
+				explanation: 'Risk',
+				recommendation: 'Fix',
+				evidence: [],
+				generationOrder: 0,
+			}],
+			suggestions: [],
+			fileResults: [],
+			generatedAt: '2026-06-25T00:00:00.000Z',
+			status: 'complete',
+			completedFiles: [sourceUri.toString()],
+		};
+		await store.save(session, review);
+
 		source.revision += 1;
-		const afterSource = reviewChangeSignature(session);
-		assert.notStrictEqual(afterSource, first);
+		assert.strictEqual(reviewChangeSignature(session), first);
+		assert.strictEqual(store.load(session)?.findings[0].title, 'Bound');
+
+		source.hunks = [];
+		source.acceptedHunks = [reviewedHunkFrom(hunk, 'accept')];
+		source.revision += 1;
+		assert.strictEqual(reviewChangeSignature(session), first);
+		assert.strictEqual(store.load(session)?.findings[0].title, 'Bound');
+
+		source.hunks = [hunk];
+		source.acceptedHunks = [];
+		source.revision += 1;
+		assert.strictEqual(reviewChangeSignature(session), first);
+		assert.strictEqual(store.load(session)?.findings[0].title, 'Bound');
+
 		wiki.revision += 1;
-		assert.strictEqual(reviewChangeSignature(session), afterSource);
+		assert.strictEqual(reviewChangeSignature(session), first);
+
+		source.hunks = [{ ...hunk, newText: 'changed\n' }];
+		assert.notStrictEqual(reviewChangeSignature(session), first);
+		assert.strictEqual(store.load(session), undefined);
+	});
+
+	test('keeps AI suggestions loadable after undoing an accepted AI suggestion chunk', async () => {
+		const sourceUri = vscode.Uri.file('/repo/src/app.ts');
+		const originalHunk = computeLineDiff(sourceUri.toString(), 'old\n', 'new\n')[0];
+		const appliedHunk = { ...originalHunk, newText: 'suggested\n' };
+		const appliedSuggestion = {
+			suggestionId: 'suggestion-1',
+			hunkId: originalHunk.id,
+			originalHunk,
+			replacementText: 'suggested\n',
+			appliedHunk,
+			appliedAt: 1,
+		};
+		const acceptedAppliedHunk: ReviewedHunk = {
+			...reviewedHunkFrom(appliedHunk, 'accept'),
+			id: `accept-1-${originalHunk.id}`,
+			appliedAiSuggestion: appliedSuggestion,
+		};
+		const source = reviewFileState(sourceUri, 'src/app.ts', { hunks: [], acceptedHunks: [acceptedAppliedHunk] });
+		const session: ReviewSession = { id: 'accepted-ai-suggestion-undo', mode: 'git', rootUri: vscode.Uri.file('/repo'), createdAt: 1, files: new Map([[sourceUri.toString(), source]]) };
+		const store = new AiReviewStore(new TestMemento() as unknown as vscode.Memento);
+		const appliedSignature = reviewChangeSignature(session);
+		const review: StoredAiReview = {
+			signature: appliedSignature,
+			findings: [],
+			suggestions: [{
+				id: 'suggestion-1',
+				uri: sourceUri.toString(),
+				relativePath: 'src/app.ts',
+				hunkId: originalHunk.id,
+				line: originalHunk.newStart,
+				replacementText: 'suggested\n',
+				rationale: 'Prefer suggested code.',
+				generationOrder: 0,
+			}],
+			fileResults: [],
+			generatedAt: '2026-06-25T00:00:00.000Z',
+			status: 'complete',
+			completedFiles: [sourceUri.toString()],
+		};
+		await store.save(session, review);
+		assert.strictEqual(store.load(session)?.suggestions[0].id, 'suggestion-1');
+
+		source.acceptedHunks = [];
+		source.hunks = [originalHunk];
+		const restoredSignature = reviewChangeSignature(session);
+		assert.notStrictEqual(restoredSignature, appliedSignature);
+		assert.strictEqual(store.load(session), undefined);
+
+		await store.save(session, { ...review, signature: restoredSignature });
+		assert.strictEqual(store.load(session)?.suggestions[0].id, 'suggestion-1');
 	});
 });
 

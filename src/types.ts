@@ -37,6 +37,7 @@ export interface ReviewedHunk extends ReviewHunk {
 	currentContextBefore: string[];
 	currentContextAfter: string[];
 	reviewedAt: number;
+	appliedAiSuggestion?: AppliedAiSuggestion;
 }
 
 export interface AppliedAiSuggestion {

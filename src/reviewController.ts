@@ -1,6 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { AiReviewLanguage, AiReviewPartialError, AiReviewStore, CodeReviewAgentService, CodeReviewTraceContext, reviewChangeSignature, StoredAiReview, sortFindings, sourcePendingFiles } from './agent/codeReview';
+import { AiReviewLanguage, AiReviewPartialError, AiReviewStore, CodeReviewAgentService, CodeReviewTraceContext, normalizeAiSuggestionReplacementText, reviewChangeSignature, StoredAiReview, sortFindings, sourcePendingFiles } from './agent/codeReview';
 import type { AgentTraceEvent } from './agent/runtime';
 import { acceptHunkInBaseline, computeLineDiff } from './diffEngine';
 import { GitService } from './gitService';
@@ -778,11 +778,26 @@ export class ReviewController implements vscode.Disposable {
 				return;
 			}
 
+			let aiReviewSession: ReviewSession | undefined;
+			let aiReviewToResign: StoredAiReview | undefined;
 			if (target.list === 'accepted') {
 				const baselineStart = target.hunk.baselineStart;
 				if (!this.reviewedBaselineSideMatches(target.file.oldText, target.hunk, baselineStart, target.hunk.newLines, target.hunk.newText)) {
 					await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 					return;
+				}
+				const appliedSuggestion = target.hunk.appliedAiSuggestion;
+				aiReviewSession = appliedSuggestion ? this.sessionForFile(target.file) : undefined;
+				aiReviewToResign = appliedSuggestion ? this.aiReviewStore.load(aiReviewSession) : undefined;
+				const currentStart = target.hunk.currentStart;
+				let restoredCurrentText: string | undefined;
+				if (appliedSuggestion) {
+					const current = await this.readCurrentText(target.file.uri);
+					if (!current.exists || !this.reviewedCurrentSideMatches(current.text, target.hunk, currentStart, target.hunk.displayLines, target.hunk.newText)) {
+						await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
+						return;
+					}
+					restoredCurrentText = replaceLineBlock(current.text, currentStart, target.hunk.displayLines, appliedSuggestion.originalHunk.newText);
 				}
 				target.file.oldText = replaceLineBlock(target.file.oldText, baselineStart, target.hunk.newLines, target.hunk.oldText);
 				target.file.acceptedHunks = target.file.acceptedHunks.filter((item) => item.id !== target.hunk.id);
@@ -791,6 +806,16 @@ export class ReviewController implements vscode.Disposable {
 					oldLines: target.hunk.newLines,
 					newLines: target.hunk.oldLines,
 				}]);
+				if (appliedSuggestion && restoredCurrentText !== undefined) {
+					await this.writeCurrentFileText(target.file.uri, restoredCurrentText);
+					target.file.newText = restoredCurrentText;
+					target.file.currentExists = true;
+					this.mapDecisionCurrentStarts(target.file, [{
+						oldStart: currentStart,
+						oldLines: target.hunk.displayLines,
+						newLines: appliedSuggestion.originalHunk.newLines,
+					}]);
+				}
 				this.syncBaselineExistsForPending(target.file);
 				if (this.activeSession?.mode === 'snapshot') {
 					await this.updateSnapshotBaselineFile(target.file);
@@ -817,6 +842,7 @@ export class ReviewController implements vscode.Disposable {
 			this.refreshPendingHunksFromReviewState(target.file);
 			this.touchFileRevision(target.file);
 			this.syncManualGitBaseline(target.file);
+			await this.saveAiReviewWithCurrentSignature(aiReviewToResign, aiReviewSession);
 			await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 			await this.syncNativeReviewAfterMutation(target.file.uri, { line: target.hunk.displayStart, column: 0 });
 		} catch (error) {
@@ -2111,7 +2137,7 @@ export class ReviewController implements vscode.Disposable {
 				return;
 			}
 
-			const replacementText = suggestion.replacementText;
+			const replacementText = normalizeAiSuggestionReplacementText(suggestion.replacementText, hunk);
 			const currentText = replaceLineBlock(current.text, hunk.newStart, hunk.newLines, replacementText);
 			const updatedHunk = this.aiSuggestionHunk(hunk, currentText, replacementText);
 			await this.writeCurrentFileText(file.uri, currentText);
@@ -3295,6 +3321,9 @@ export class ReviewController implements vscode.Disposable {
 		const currentLines = reviewSource === 'reject' ? displayLines : hunk.newLines;
 		const baselineContext = captureLineBlockContext(file.oldText, baselineStart, baselineLines);
 		const currentContext = captureLineBlockContext(file.newText, currentStart, currentLines);
+		const appliedAiSuggestion = reviewSource === 'accept'
+			? file.appliedAiSuggestions.find((item) => item.hunkId === hunk.id && item.appliedHunk.newText === hunk.newText)
+			: undefined;
 		return {
 			...hunk,
 			id: `${reviewSource}-${Date.now()}-${hunk.id}`,
@@ -3310,6 +3339,7 @@ export class ReviewController implements vscode.Disposable {
 			currentContextAfter: currentContext.after,
 			zoneAfterLineNumber: displayStart,
 			reviewedAt: Date.now(),
+			...(appliedAiSuggestion ? { appliedAiSuggestion } : {}),
 		};
 	}
 

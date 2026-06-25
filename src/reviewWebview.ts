@@ -1381,9 +1381,6 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 			header.appendChild(actions);
 
 			if (!entry.decided) {
-				if (entry.appliedSuggestion) {
-					actions.appendChild(createButton(labels.undo, 'undoSuggestion', entry));
-				}
 				actions.appendChild(createButton(labels.reject, 'reject', entry));
 				actions.appendChild(createButton(labels.accept, 'accept', entry));
 			} else if (entry.source === 'accept' || entry.source === 'reject') {

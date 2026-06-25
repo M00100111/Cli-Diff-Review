@@ -1019,6 +1019,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			gap: 6px;
 			padding: 5px 6px;
 			border-bottom: 1px solid color-mix(in srgb, var(--vscode-editorInfo-foreground) 26%, transparent);
+			position: relative;
+			z-index: 1;
+			cursor: default;
+			user-select: none;
 		}
 		.review-suggestion-title {
 			flex: 1 1 auto;
@@ -1027,15 +1031,38 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			font-weight: 700;
 			color: var(--vscode-editorInfo-foreground);
 			overflow-wrap: anywhere;
+			cursor: default;
+			user-select: none;
 		}
 		.review-suggestion-action {
 			flex: 0 0 auto;
-			padding: 1px 7px;
+			position: relative;
+			z-index: 6;
+			min-width: 64px;
+			min-height: 22px;
+			box-sizing: border-box;
+			padding: 1px 8px;
 			border: 1px solid color-mix(in srgb, var(--vscode-editorInfo-foreground) 48%, transparent);
 			border-radius: 4px;
 			color: var(--vscode-editorInfo-foreground);
 			background: color-mix(in srgb, var(--vscode-sideBar-background) 76%, var(--vscode-editorInfo-foreground) 24%);
-			font-size: 11px;
+			font-family: var(--vscode-font-family);
+			font-size: 12px;
+			line-height: 18px;
+			white-space: nowrap;
+			cursor: pointer;
+			user-select: none;
+			text-align: center;
+			overflow: visible;
+		}
+		.review-suggestion-action::before {
+			content: '';
+			position: absolute;
+			inset: -6px -4px;
+			border-radius: 6px;
+		}
+		.review-suggestion-action:hover:not(:disabled) {
+			background: color-mix(in srgb, var(--vscode-sideBar-background) 66%, var(--vscode-editorInfo-foreground) 34%);
 		}
 		.review-suggestion-pre {
 			max-height: 160px;
@@ -2009,6 +2036,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 
 		function renderReviewChunkSuggestion(file, chunk, suggestion) {
 			const applied = chunk.appliedSuggestion && chunk.appliedSuggestion.suggestionId === suggestion.id;
+			const canApply = chunk.reviewStatus === 'pending' && !applied;
 			const wrapper = document.createElement('div');
 			wrapper.className = 'review-suggestion' + (applied ? ' applied' : '');
 			const header = document.createElement('div');
@@ -2016,21 +2044,26 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const title = document.createElement('div');
 			title.className = 'review-suggestion-title';
 			title.textContent = applied ? 'AI suggestion applied' : 'AI suggestion';
-			const action = document.createElement('button');
-			action.type = 'button';
-			action.className = 'review-suggestion-action';
-			action.textContent = applied ? 'Undo' : 'Accept';
-			action.addEventListener('click', (event) => {
-				event.preventDefault();
-				event.stopPropagation();
-				vscode.postMessage({
-					type: applied ? 'undoAiSuggestion' : 'applyAiSuggestion',
-					uri: file.uri,
-					hunkId: chunk.hunkId,
-					suggestionId: suggestion.id,
+			header.appendChild(title);
+			if (canApply) {
+				const action = document.createElement('button');
+				action.type = 'button';
+				action.className = 'review-suggestion-action';
+				action.textContent = 'Accept';
+				action.title = 'Accept AI suggestion';
+				action.setAttribute('aria-label', 'Accept AI suggestion');
+				action.addEventListener('click', (event) => {
+					event.preventDefault();
+					event.stopPropagation();
+					vscode.postMessage({
+						type: 'applyAiSuggestion',
+						uri: file.uri,
+						hunkId: chunk.hunkId,
+						suggestionId: suggestion.id,
+					});
 				});
-			});
-			header.append(title, action);
+				header.appendChild(action);
+			}
 			wrapper.appendChild(header);
 			const pre = document.createElement('pre');
 			pre.className = 'review-suggestion-pre';
@@ -2656,16 +2689,19 @@ function dashboardChunks(
 			continue;
 		}
 		seenIdentities.add(identity);
+		const originalHunkId = originalReviewedHunkId(hunk.id);
+		const reviewItemHunkIds = originalHunkId === hunk.id ? [hunk.id] : [hunk.id, originalHunkId];
 		seenHunkIds.add(hunk.id);
+		seenHunkIds.add(originalHunkId);
 		chunks.push({
 			hunkId: hunk.id,
 			kind: hunk.kind,
 			line: hunk.displayStart,
 			oldLines: hunk.oldLines,
 			newLines: hunk.newLines,
-			findings: findingsByChunk.get(`${uri}#${hunk.id}`) ?? [],
-			suggestions: suggestionsByChunk.get(`${uri}#${hunk.id}`) ?? [],
-			appliedSuggestion: appliedByHunk.get(hunk.id),
+			findings: reviewItemsByHunkIds(findingsByChunk, uri, reviewItemHunkIds),
+			suggestions: reviewItemsByHunkIds(suggestionsByChunk, uri, reviewItemHunkIds),
+			appliedSuggestion: dashboardAppliedSuggestion(hunk.appliedAiSuggestion) ?? appliedByHunk.get(hunk.id) ?? appliedByHunk.get(originalHunkId),
 			reviewStatus: 'reviewed',
 			reviewDecision: hunk.status,
 			canAccept: false,
@@ -2694,6 +2730,35 @@ function dashboardChunks(
 		});
 	}
 	return chunks.sort((left, right) => left.line - right.line || left.hunkId.localeCompare(right.hunkId));
+}
+
+function reviewItemsByHunkIds<T>(itemsByChunk: Map<string, T[]>, uri: string, hunkIds: string[]): T[] {
+	return hunkIds.flatMap((hunkId) => itemsByChunk.get(`${uri}#${hunkId}`) ?? []);
+}
+
+function dashboardAppliedSuggestion(suggestion: { suggestionId: string; replacementText: string } | undefined): ReviewDashboardChunk['appliedSuggestion'] {
+	return suggestion ? {
+		suggestionId: suggestion.suggestionId,
+		replacementText: suggestion.replacementText,
+	} : undefined;
+}
+
+function originalReviewedHunkId(hunkId: string): string {
+	const acceptPrefix = 'accept-';
+	const rejectPrefix = 'reject-';
+	const prefix = hunkId.startsWith(acceptPrefix)
+		? acceptPrefix
+		: hunkId.startsWith(rejectPrefix) ? rejectPrefix : undefined;
+	if (!prefix) {
+		return hunkId;
+	}
+	const suffix = hunkId.slice(prefix.length);
+	const firstSeparator = suffix.indexOf('-');
+	if (firstSeparator < 0) {
+		return suffix;
+	}
+	const firstSegment = suffix.slice(0, firstSeparator);
+	return /^\d+$/.test(firstSegment) ? suffix.slice(firstSeparator + 1) : suffix;
 }
 
 function dashboardPendingHunks(file: ReviewFileState): ReviewHunk[] {
