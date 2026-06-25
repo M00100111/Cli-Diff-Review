@@ -9,7 +9,7 @@ import { isWikiPath } from '../wiki/paths';
 import { createReadOnlyAgentTools } from './tools';
 import { AgentRunner, AgentTraceDetail, AgentTraceEvent } from './runtime';
 
-export type AiReviewSeverity = 'critical' | 'warning' | 'suggestion' | 'info';
+export type AiReviewSeverity = 'error' | 'warning' | 'suggestion' | 'info';
 
 export type AiReviewLanguage = 'zh-CN' | 'en';
 
@@ -125,8 +125,8 @@ export interface CodeReviewAgentOptions {
 	onFileComplete?: (review: StoredAiReview) => void | Promise<void>;
 }
 
-const severities = new Set<AiReviewSeverity>(['critical', 'warning', 'suggestion', 'info']);
-const severityOrder: Record<AiReviewSeverity, number> = { critical: 0, warning: 1, suggestion: 2, info: 3 };
+const severities = new Set<AiReviewSeverity>(['error', 'warning', 'suggestion', 'info']);
+const severityOrder: Record<AiReviewSeverity, number> = { error: 0, warning: 1, suggestion: 2, info: 3 };
 
 export class AiReviewPartialError extends Error {
 	public constructor(message: string, public readonly review: StoredAiReview, public readonly cause?: unknown) {
@@ -538,6 +538,7 @@ function reviewSystemPrompt(language: AiReviewLanguage, includeWikiTools: boolea
 			: 'Use tools when needed to inspect callers, tests, and configuration.',
 		'Report concrete correctness, reliability, security, or maintainability risks; avoid generic praise.',
 		'Every finding must bind to one supplied hunkId.',
+		'Allowed finding severities are error, warning, suggestion, and info. Use error for correctness bugs that can break expected behavior.',
 		'When a concise code change would help, include at most one suggestion per non-delete hunk. A suggestion replacementText replaces the entire current newText for that hunk; preserve the hunk line terminator when the original newText ends with one. Do not create suggestions for delete hunks.',
 		languageInstruction(language),
 		'Keep finding title, explanation, and recommendation concise. When mentioning code symbols or operators, avoid decorative markdown and make sure any required quotes, backslashes, or newlines are valid JSON string content.',

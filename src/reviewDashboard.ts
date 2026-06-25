@@ -842,7 +842,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			text-align: left;
 		}
 		.finding-marker { width: 7px; height: 7px; margin-top: 4px; border-radius: 50%; background: var(--muted); }
-		.finding.critical .finding-marker { background: var(--vscode-errorForeground); }
+		.finding.error .finding-marker { background: var(--vscode-errorForeground); }
 		.finding.warning .finding-marker { background: var(--vscode-editorWarning-foreground); }
 		.finding.suggestion .finding-marker { background: var(--vscode-editorInfo-foreground); }
 		.finding-title { display: block; font-weight: 600; overflow-wrap: anywhere; }
@@ -990,7 +990,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			border-radius: 50%;
 			background: var(--muted);
 		}
-		.review-finding.critical .review-finding-marker { background: var(--vscode-errorForeground); }
+		.review-finding.error .review-finding-marker { background: var(--vscode-errorForeground); }
 		.review-finding.warning .review-finding-marker { background: var(--vscode-editorWarning-foreground); }
 		.review-finding.suggestion .review-finding-marker { background: var(--vscode-editorInfo-foreground); }
 		.review-finding-title {

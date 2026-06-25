@@ -2477,6 +2477,7 @@ suite('AI review findings', () => {
 		assert.strictEqual(enPrompt.includes('optional Wiki context'), false);
 		assert.ok(wikiPrompt.includes('Source and Wiki files are read-only.'));
 		assert.ok(wikiPrompt.includes('optional Wiki context'));
+		assert.ok(enPrompt.includes('Allowed finding severities are error, warning, suggestion, and info'));
 		assert.ok(zhPrompt.includes('Keep finding title, explanation, and recommendation concise'));
 		assert.ok(enPrompt.includes('valid JSON string content'));
 		assert.ok(enPrompt.includes('replacementText replaces the entire current newText'));
@@ -2571,7 +2572,7 @@ suite('AI review findings', () => {
 		const file = reviewFileState(uri, 'src/app.ts', { hunks });
 		const findings = validateReviewFindings({
 			findings: [
-				{ hunkId: hunks[1].id, severity: 'critical', title: 'Later', explanation: 'x', recommendation: 'x' },
+				{ hunkId: hunks[1].id, severity: 'error', title: 'Later', explanation: 'x', recommendation: 'x' },
 				{ hunkId: hunks[0].id, severity: 'info', title: 'Earlier', explanation: 'x', recommendation: 'x' },
 			],
 		}, file);
