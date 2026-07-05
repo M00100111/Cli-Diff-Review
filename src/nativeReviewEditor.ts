@@ -223,14 +223,14 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 	}
 
 	private reviewDocumentUri(file: ReviewFileState, side: NativeReviewSide): vscode.Uri {
-		return this.reviewDocumentUriForFileUri(file.uri, side, file.revision);
+		return this.reviewDocumentUriForFileUri(file.uri, side);
 	}
 
-	private reviewDocumentUriForFileUri(uri: vscode.Uri, side: NativeReviewSide, revision = 0): vscode.Uri {
+	private reviewDocumentUriForFileUri(uri: vscode.Uri, side: NativeReviewSide): vscode.Uri {
 		return vscode.Uri.from({
 			scheme: side === 'after' ? NativeReviewEditorManager.afterDocumentScheme : NativeReviewEditorManager.beforeDocumentScheme,
 			path: uri.path,
-			query: encodeURIComponent(JSON.stringify({ uri: uri.toString(), side, revision })),
+			query: encodeURIComponent(JSON.stringify({ uri: uri.toString(), side })),
 		});
 	}
 

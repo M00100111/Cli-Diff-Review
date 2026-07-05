@@ -12,7 +12,9 @@ import { GitService } from '../gitService';
 import { AnthropicClient, DeepSeekClient, GlmClient, OpenAiCompatibleClient } from '../llm/client';
 import { LlmConfigStore } from '../llm/config';
 import { parseStrictJsonObject } from '../llm/json';
+import { NativeReviewEditorManager } from '../nativeReviewEditor';
 import { buildReviewDashboardPayload, defaultLlmWikiDashboardState, ReviewDashboardProvider } from '../reviewDashboard';
+import { ReviewController } from '../reviewController';
 import { isDotReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
 import { ReviewTreeProvider } from '../reviewTree';
 import { normalizeMonacoThemeColor, ReviewWebviewManager } from '../reviewWebview';
@@ -473,7 +475,8 @@ suite('Review controller bulk actions', () => {
 		assert.ok(nativeSource.includes('await this.reveal(file, reveal ?? firstReviewRevealPosition(file));'));
 		assert.ok(nativeSource.includes('this.openFileKeys.add(key);'));
 		assert.ok(nativeSource.includes('return true;'));
-		assert.ok(nativeSource.includes('query: encodeURIComponent(JSON.stringify({ uri: uri.toString(), side, revision }))'));
+		assert.ok(nativeSource.includes('query: encodeURIComponent(JSON.stringify({ uri: uri.toString(), side }))'));
+		assert.strictEqual(nativeSource.includes('side, revision'), false);
 		assert.ok(nativeSource.includes('private fileUriFromDiffInput(input: vscode.TabInputTextDiff): vscode.Uri | undefined'));
 		assert.ok(nativeSource.includes('private textDiffInput(tab: vscode.Tab): vscode.TabInputTextDiff | undefined'));
 		assert.ok(nativeSource.includes("'original' in input"));
@@ -497,6 +500,22 @@ suite('Review controller bulk actions', () => {
 		assert.strictEqual(nativeSource.includes('editor.findMatchHighlightBackground'), false);
 		assert.strictEqual(nativeSource.includes("borderWidth: '0 0 0 2px'"), false);
 		assert.strictEqual(nativeSource.includes("borderWidth: '1px 0 1px 2px'"), false);
+	});
+
+	test('keeps native diff document URIs stable across review revisions', () => {
+		const manager = Object.create(NativeReviewEditorManager.prototype) as {
+			reviewDocumentUriForFileUri(uri: vscode.Uri, side: 'before' | 'after'): vscode.Uri;
+			reviewDocumentPayload(uri: vscode.Uri): { fileUri: vscode.Uri; side: 'before' | 'after' } | undefined;
+		};
+		const fileUri = vscode.Uri.file('D:/repo/src/app.ts');
+		const before = manager.reviewDocumentUriForFileUri(fileUri, 'before');
+		const after = manager.reviewDocumentUriForFileUri(fileUri, 'after');
+		const afterAgain = manager.reviewDocumentUriForFileUri(fileUri, 'after');
+
+		assert.strictEqual(after.toString(), afterAgain.toString());
+		assert.strictEqual(decodeURIComponent(after.query).includes('revision'), false);
+		assert.strictEqual(manager.reviewDocumentPayload(before)?.fileUri.toString(), fileUri.toString());
+		assert.strictEqual(manager.reviewDocumentPayload(after)?.side, 'after');
 	});
 });
 
@@ -630,6 +649,76 @@ suite('Review state', () => {
 		assert.strictEqual(refreshedHunks[0].newText, 'new-two\n');
 	});
 
+	test('auto-stages accepted reviewed hunks while keeping pending hunks unstaged', async () => {
+		const uri = vscode.Uri.file('D:/repo/tracked.txt');
+		const indexText = 'a\nold-one\nb\nold-two\nc\n';
+		const acceptedText = 'a\nnew-one\nb\nold-two\nc\n';
+		const currentText = 'a\nnew-one\nb\nnew-two\nc\n';
+		const acceptedHunk = computeLineDiff(uri.toString(), indexText, acceptedText)[0];
+		const pendingHunk = computeLineDiff(uri.toString(), acceptedText, currentText)[0];
+		const file = reviewFileState(uri, 'tracked.txt', {
+			projectId: 'repo',
+			oldText: acceptedText,
+			newText: currentText,
+			hunks: [pendingHunk],
+			acceptedHunks: [reviewedHunkFrom(acceptedHunk, 'accept')],
+			originalText: indexText,
+		});
+		const harness = autoStageControllerHarness(file, currentText, { exists: true, text: indexText, mode: '100644' });
+
+		const result = await harness.controller.stageAcceptedReviewedHunksForManualRefresh(harness.session.files);
+
+		assert.deepStrictEqual(result, { stagedFileCount: 1, skippedFileCount: 0 });
+		assert.deepStrictEqual(harness.stageIndexTextCalls, [{
+			relativePath: 'tracked.txt',
+			text: acceptedText,
+			mode: '100644',
+			add: false,
+		}]);
+		assert.deepStrictEqual(harness.stageFileCalls, []);
+	});
+
+	test('skips auto-staging when the index has diverged', async () => {
+		const uri = vscode.Uri.file('D:/repo/tracked.txt');
+		const indexText = 'old\n';
+		const acceptedText = 'new\n';
+		const acceptedHunk = computeLineDiff(uri.toString(), indexText, acceptedText)[0];
+		const file = reviewFileState(uri, 'tracked.txt', {
+			projectId: 'repo',
+			oldText: acceptedText,
+			newText: acceptedText,
+			acceptedHunks: [reviewedHunkFrom(acceptedHunk, 'accept')],
+			originalText: indexText,
+		});
+		const harness = autoStageControllerHarness(file, acceptedText, { exists: true, text: 'externally staged\n', mode: '100644' });
+
+		const result = await harness.controller.stageAcceptedReviewedHunksForManualRefresh(harness.session.files);
+
+		assert.deepStrictEqual(result, { stagedFileCount: 0, skippedFileCount: 1 });
+		assert.deepStrictEqual(harness.stageIndexTextCalls, []);
+		assert.deepStrictEqual(harness.stageFileCalls, []);
+	});
+
+	test('skips auto-staging dirty files', async () => {
+		const uri = vscode.Uri.file('D:/repo/tracked.txt');
+		const acceptedHunk = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
+		const file = reviewFileState(uri, 'tracked.txt', {
+			projectId: 'repo',
+			oldText: 'new\n',
+			newText: 'new\n',
+			acceptedHunks: [reviewedHunkFrom(acceptedHunk, 'accept')],
+			originalText: 'old\n',
+		});
+		const harness = autoStageControllerHarness(file, 'new\n', { exists: true, text: 'old\n', mode: '100644' }, true);
+
+		const result = await harness.controller.stageAcceptedReviewedHunksForManualRefresh(harness.session.files);
+
+		assert.deepStrictEqual(result, { stagedFileCount: 0, skippedFileCount: 1 });
+		assert.deepStrictEqual(harness.stageIndexTextCalls, []);
+		assert.deepStrictEqual(harness.stageFileCalls, []);
+		assert.strictEqual(harness.readIndexEntryCalls, 0);
+	});
+
 	test('does not apply manual Git baselines to skipped pairs', () => {
 		const uri = vscode.Uri.file('D:/repo/tracked.txt');
 		const baseline = { oldText: 'base\naccepted\n', baselineExists: true };
@@ -738,13 +827,69 @@ suite('Review state', () => {
 			createdAt: 1,
 			files: new Map([[file.uri.toString(), file]]),
 		};
-		const provider = new ReviewTreeProvider(() => session);
+		const provider = new ReviewTreeProvider(() => session, () => storedAiReview({
+			findings: [{
+				id: 'finding-skipped',
+				uri: file.uri.toString(),
+				relativePath: file.relativePath,
+				hunkId: 'skipped-hunk',
+				line: 1,
+				severity: 'warning',
+				title: 'Skipped finding',
+				explanation: 'Risk',
+				recommendation: 'Fix',
+				evidence: [],
+				generationOrder: 0,
+			}],
+			suggestions: [{
+				id: 'suggestion-skipped',
+				uri: file.uri.toString(),
+				relativePath: file.relativePath,
+				hunkId: 'skipped-hunk',
+				line: 1,
+				replacementText: 'suggested\n',
+				rationale: 'Prefer this.',
+				generationOrder: 0,
+			}],
+		}));
 		const [child] = provider.getChildren();
 		const item = provider.getTreeItem(child);
 
 		assert.strictEqual(child, file);
 		assert.strictEqual(item.description, 'skipped');
 		assert.strictEqual(item.contextValue, 'cliDiffFileSkipped');
+	});
+
+	test('appends AI review counts to review tree file descriptions', () => {
+		const uri = vscode.Uri.file('D:/repo/src/app.ts');
+		const hunk = computeLineDiff(uri.toString(), 'a\n', 'b\n')[0];
+		const file = reviewFileState(uri, 'src/app.ts', { hunks: [hunk] });
+		const session: ReviewSession = {
+			id: 'tree-ai-review',
+			mode: 'git',
+			rootUri: vscode.Uri.file('D:/repo'),
+			createdAt: 1,
+			files: new Map([[uri.toString(), file]]),
+		};
+		const defaultProvider = new ReviewTreeProvider(() => session);
+		const singularProvider = new ReviewTreeProvider(() => session, () => storedAiReview({
+			findings: [aiReviewFinding(uri, 'src/app.ts', hunk)],
+			suggestions: [aiReviewSuggestion(uri, 'src/app.ts', hunk)],
+		}));
+		const pluralProvider = new ReviewTreeProvider(() => session, () => storedAiReview({
+			findings: [
+				aiReviewFinding(uri, 'src/app.ts', hunk, 'finding-1', 0),
+				aiReviewFinding(uri, 'src/app.ts', hunk, 'finding-2', 1),
+			],
+			suggestions: [
+				aiReviewSuggestion(uri, 'src/app.ts', hunk, 'suggestion-1', 0),
+				aiReviewSuggestion(uri, 'src/app.ts', hunk, 'suggestion-2', 1),
+			],
+		}));
+
+		assert.strictEqual(defaultProvider.getTreeItem(file).description, '1 pending');
+		assert.strictEqual(singularProvider.getTreeItem(file).description, '1 pending, 1 finding, 1 suggestion');
+		assert.strictEqual(pluralProvider.getTreeItem(file).description, '1 pending, 2 findings, 2 suggestions');
 	});
 
 	test('groups aggregate Git review files by project and filters selected projects', () => {
@@ -772,9 +917,13 @@ suite('Review state', () => {
 			projects,
 			trackingTarget: { kind: 'aggregate' },
 		};
-		const provider = new ReviewTreeProvider(() => session);
+		const provider = new ReviewTreeProvider(() => session, () => storedAiReview({
+			findings: [aiReviewFinding(apiFile.uri, apiFile.relativePath, apiFile.hunks[0])],
+			suggestions: [aiReviewSuggestion(apiFile.uri, apiFile.relativePath, apiFile.hunks[0])],
+		}));
 		const groups = provider.getChildren();
 		assert.deepStrictEqual(groups.map((group) => provider.getTreeItem(group).label), ['api', 'web']);
+		assert.strictEqual(provider.getTreeItem(groups[0]).description, '1 pending');
 		assert.strictEqual(provider.getChildren(groups[0]).length, 1);
 		assert.strictEqual(provider.getChildren(groups[1]).length, 1);
 
@@ -885,9 +1034,9 @@ suite('Review state', () => {
 				generationOrder: 0,
 			}],
 		});
-		const mappedFindingChunk = findingPayload.files
-			.find((file) => file.relativePath === 'src/pending.ts')
-			?.chunks.find((chunk) => chunk.hunkId === pendingHunk.id);
+		const mappedFindingFile = findingPayload.files.find((file) => file.relativePath === 'src/pending.ts');
+		const mappedFindingChunk = mappedFindingFile?.chunks.find((chunk) => chunk.hunkId === pendingHunk.id);
+		assert.strictEqual(mappedFindingFile?.description, '1 pending, 1 finding');
 		assert.strictEqual(mappedFindingChunk?.findings[0].title, 'Mapped finding');
 		session.files.set(pendingUri.toString(), reviewFileState(pendingUri, 'src/pending.ts', {
 			hunks: [pendingHunk],
@@ -926,9 +1075,31 @@ suite('Review state', () => {
 			}],
 		});
 		const suggestionFile = suggestionPayload.files.find((file) => file.relativePath === 'src/pending.ts');
+		assert.strictEqual(suggestionFile?.description, '1 pending, 1 suggestion');
 		assert.strictEqual(suggestionFile?.chunks[0].suggestions[0].replacementText, 'suggested\n');
 		assert.strictEqual(suggestionFile?.chunks[0].appliedSuggestion?.suggestionId, 'suggestion-1');
 		assert.strictEqual(suggestionFile?.aiReviewResult?.summary, 'Model returned 0 findings. Accepted 1 of 1 suggestions.');
+		const pluralReviewPayload = buildReviewDashboardPayload(session, pendingUri, () => false, {
+			...defaultLlmWikiDashboardState(),
+			reviewFindings: [
+				aiReviewFinding(pendingUri, 'src/pending.ts', pendingHunk, 'finding-1', 0),
+				aiReviewFinding(pendingUri, 'src/pending.ts', pendingHunk, 'finding-2', 1),
+			],
+			reviewSuggestions: [
+				aiReviewSuggestion(pendingUri, 'src/pending.ts', pendingHunk, 'suggestion-1', 0),
+				aiReviewSuggestion(pendingUri, 'src/pending.ts', pendingHunk, 'suggestion-2', 1),
+			],
+		});
+		assert.strictEqual(
+			pluralReviewPayload.files.find((file) => file.relativePath === 'src/pending.ts')?.description,
+			'1 pending, 2 findings, 2 suggestions',
+		);
+		const skippedReviewPayload = buildReviewDashboardPayload(session, pendingUri, () => false, {
+			...defaultLlmWikiDashboardState(),
+			reviewFindings: [aiReviewFinding(skippedUri, 'src/skipped.ts', pendingHunk, 'finding-skipped', 0)],
+			reviewSuggestions: [aiReviewSuggestion(skippedUri, 'src/skipped.ts', pendingHunk, 'suggestion-skipped', 0)],
+		});
+		assert.strictEqual(skippedReviewPayload.files.find((file) => file.relativePath === 'src/skipped.ts')?.description, 'skipped');
 		session.files.set(pendingUri.toString(), reviewFileState(pendingUri, 'src/pending.ts', { hunks: [pendingHunk] }));
 		session.files.set(reviewedUri.toString(), reviewFileState(reviewedUri, 'src/reviewed.ts', {
 			acceptedHunks: [{
@@ -990,6 +1161,7 @@ suite('Review state', () => {
 		const otherFileChunk = reviewedFindingPayload.files
 			.find((file) => file.relativePath === 'src/pending.ts')
 			?.chunks.find((chunk) => chunk.hunkId === pendingHunk.id);
+		assert.strictEqual(reviewedFindingFile?.description, '1 reviewed, 1 finding, 1 suggestion');
 		assert.strictEqual(reviewedFindingFile?.chunks.length, 1);
 		assert.notStrictEqual(reviewedFindingChunk?.hunkId, reviewedHunk.id);
 		assert.strictEqual(reviewedFindingChunk?.reviewStatus, 'reviewed');
@@ -2688,6 +2860,117 @@ suite('AI review findings', () => {
 		await store.save(session, { ...review, signature: restoredSignature });
 		assert.strictEqual(store.load(session)?.suggestions[0].id, 'suggestion-1');
 	});
+
+	test('file-level undo restores accepted AI suggestion chunks to their original pending text', async () => {
+		const sourceUri = vscode.Uri.file('/repo/src/app.ts');
+		const originalHunk = computeLineDiff(sourceUri.toString(), 'old\n', 'new\n')[0];
+		const appliedHunk = { ...originalHunk, newText: 'suggested\n' };
+		const appliedSuggestion = {
+			suggestionId: 'suggestion-1',
+			hunkId: originalHunk.id,
+			originalHunk,
+			replacementText: 'suggested\n',
+			appliedHunk,
+			appliedAt: 1,
+		};
+		const acceptedAppliedHunk: ReviewedHunk = {
+			...reviewedHunkFrom(appliedHunk, 'accept'),
+			id: `accept-1-${originalHunk.id}`,
+			appliedAiSuggestion: appliedSuggestion,
+		};
+		const source = reviewFileState(sourceUri, 'src/app.ts', {
+			oldText: 'suggested\n',
+			newText: 'suggested\n',
+			hunks: [],
+			acceptedHunks: [acceptedAppliedHunk],
+			originalText: 'old\n',
+		});
+		const session: ReviewSession = { id: 'file-ai-suggestion-undo', mode: 'git', rootUri: vscode.Uri.file('/repo'), createdAt: 1, files: new Map([[sourceUri.toString(), source]]) };
+		const store = new AiReviewStore(new TestMemento() as unknown as vscode.Memento);
+		const appliedSignature = reviewChangeSignature(session);
+		await store.save(session, storedAiReview({
+			signature: appliedSignature,
+			suggestions: [{
+				id: 'suggestion-1',
+				uri: sourceUri.toString(),
+				relativePath: 'src/app.ts',
+				hunkId: originalHunk.id,
+				line: originalHunk.newStart,
+				replacementText: 'suggested\n',
+				rationale: 'Prefer suggested code.',
+				generationOrder: 0,
+			}],
+			completedFiles: [sourceUri.toString()],
+		}));
+		const harness = reviewControllerHarness(session, 'suggested\n', store);
+
+		await harness.controller.undoFileCore(source);
+
+		assert.strictEqual(source.acceptedHunks.length, 0);
+		assert.strictEqual(source.oldText, 'old\n');
+		assert.strictEqual(source.newText, 'new\n');
+		assert.strictEqual(harness.currentText(), 'new\n');
+		assert.deepStrictEqual(harness.writes, ['new\n']);
+		assert.strictEqual(source.hunks.length, 1);
+		assert.strictEqual(source.hunks[0].oldText, 'old\n');
+		assert.strictEqual(source.hunks[0].newText, 'new\n');
+		assert.strictEqual(source.hunks.some((hunk) => hunk.newText.includes('suggested')), false);
+		assert.strictEqual(store.load(session)?.suggestions[0].id, 'suggestion-1');
+	});
+
+	test('file-level undo restores mixed accepted AI suggestion and rejected chunks in current order', async () => {
+		const sourceUri = vscode.Uri.file('/repo/src/mixed.ts');
+		const baseline = 'old\nsame\nreject-old\n';
+		const pending = 'new\nsame\nreject-new\n';
+		const [originalHunk, rejectedOriginalHunk] = computeLineDiff(sourceUri.toString(), baseline, pending);
+		assert.ok(originalHunk);
+		assert.ok(rejectedOriginalHunk);
+		const suggestionText = 'suggested-a\nsuggested-b\n';
+		const appliedHunk = {
+			...originalHunk,
+			newLines: 2,
+			newText: suggestionText,
+		};
+		const appliedSuggestion = {
+			suggestionId: 'suggestion-1',
+			hunkId: originalHunk.id,
+			originalHunk,
+			replacementText: suggestionText,
+			appliedHunk,
+			appliedAt: 1,
+		};
+		const acceptedAppliedHunk: ReviewedHunk = {
+			...reviewedHunkFrom(appliedHunk, 'accept'),
+			id: `accept-1-${originalHunk.id}`,
+			appliedAiSuggestion: appliedSuggestion,
+		};
+		const rejectedHunk: ReviewedHunk = {
+			...reviewedHunkFrom(rejectedOriginalHunk, 'reject'),
+			currentStart: rejectedOriginalHunk.newStart + 1,
+		};
+		const reviewedText = 'suggested-a\nsuggested-b\nsame\nreject-old\n';
+		const source = reviewFileState(sourceUri, 'src/mixed.ts', {
+			oldText: reviewedText,
+			newText: reviewedText,
+			hunks: [],
+			acceptedHunks: [acceptedAppliedHunk],
+			rejectedHunks: [rejectedHunk],
+			originalText: baseline,
+		});
+		const session: ReviewSession = { id: 'file-mixed-ai-suggestion-undo', mode: 'git', rootUri: vscode.Uri.file('/repo'), createdAt: 1, files: new Map([[sourceUri.toString(), source]]) };
+		const harness = reviewControllerHarness(session, reviewedText);
+
+		await harness.controller.undoFileCore(source);
+
+		assert.strictEqual(source.acceptedHunks.length, 0);
+		assert.strictEqual(source.rejectedHunks.length, 0);
+		assert.strictEqual(source.oldText, baseline);
+		assert.strictEqual(source.newText, pending);
+		assert.strictEqual(harness.currentText(), pending);
+		assert.deepStrictEqual(harness.writes, [pending]);
+		assert.strictEqual(source.hunks.length, 2);
+		assert.deepStrictEqual(source.hunks.map((hunk) => hunk.newText), ['new\n', 'reject-new\n']);
+	});
 });
 
 suite('Git service', () => {
@@ -2790,6 +3073,74 @@ suite('Git service', () => {
 			assert.strictEqual(byPath.has('.agents/skills/llm-code-wiki/.state.json'), false);
 			assert.strictEqual(byPath.has('.agents/skills/other-skill/SKILL.md'), false);
 			assert.strictEqual(byPath.has('.skills/llm-code-wiki/SKILL.md'), false);
+		} finally {
+			removeTempRepo(root);
+		}
+	});
+
+	test('stages accepted-only index text for tracked files with remaining pending work', async function (this: Mocha.Context) {
+		this.timeout(10000);
+		const root = createTempGitRepo();
+		try {
+			writeRepoFile(root, 'tracked.txt', 'old\npending-old\n');
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+			writeRepoFile(root, 'tracked.txt', 'accepted\npending-new\n');
+
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			const entry = await service.readIndexEntry(folder, 'tracked.txt');
+			assert.strictEqual(entry.exists, true);
+
+			await service.stageIndexText(folder, 'tracked.txt', 'accepted\npending-old\n', entry.mode, false);
+
+			const pairs = await service.createFilePairs(folder);
+			const byPath = filePairsByPath(pairs);
+			assert.strictEqual(byPath.get('tracked.txt')?.oldText, 'accepted\npending-old\n');
+			assert.strictEqual(byPath.get('tracked.txt')?.newText, 'accepted\npending-new\n');
+		} finally {
+			removeTempRepo(root);
+		}
+	});
+
+	test('stages complete files with git add', async function (this: Mocha.Context) {
+		this.timeout(10000);
+		const root = createTempGitRepo();
+		try {
+			writeRepoFile(root, 'tracked.txt', 'old\n');
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+			writeRepoFile(root, 'tracked.txt', 'accepted\n');
+
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			await service.stageFile(folder, 'tracked.txt');
+
+			const pairs = await service.createFilePairs(folder);
+			assert.strictEqual(filePairsByPath(pairs).has('tracked.txt'), false);
+		} finally {
+			removeTempRepo(root);
+		}
+	});
+
+	test('stages accepted-only index text for untracked files with remaining pending work', async function (this: Mocha.Context) {
+		this.timeout(10000);
+		const root = createTempGitRepo();
+		try {
+			writeRepoFile(root, 'tracked.txt', 'base\n');
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+			writeRepoFile(root, 'loose.txt', 'accepted\npending\n');
+
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			await service.stageIndexText(folder, 'loose.txt', 'accepted\n', '100644', true);
+
+			const pairs = await service.createFilePairs(folder);
+			const byPath = filePairsByPath(pairs);
+			assert.strictEqual(byPath.get('loose.txt')?.oldText, 'accepted\n');
+			assert.strictEqual(byPath.get('loose.txt')?.newText, 'accepted\npending\n');
+			assert.strictEqual(byPath.get('loose.txt')?.baselineExists, true);
 		} finally {
 			removeTempRepo(root);
 		}
@@ -2952,6 +3303,161 @@ function reviewFileState(
 		currentExists: true,
 		revision: 0,
 		...overrides,
+	};
+}
+
+function storedAiReview(overrides: Partial<StoredAiReview> = {}): StoredAiReview {
+	return {
+		signature: 'test',
+		findings: [],
+		suggestions: [],
+		fileResults: [],
+		generatedAt: '2026-06-25T00:00:00.000Z',
+		status: 'complete',
+		completedFiles: [],
+		...overrides,
+	};
+}
+
+function aiReviewFinding(
+	uri: vscode.Uri,
+	relativePath: string,
+	hunk: ReviewHunk,
+	id = 'finding-1',
+	generationOrder = 0,
+): StoredAiReview['findings'][number] {
+	return {
+		id,
+		uri: uri.toString(),
+		relativePath,
+		hunkId: hunk.id,
+		line: hunk.newStart,
+		severity: 'warning',
+		title: 'Finding',
+		explanation: 'Risk',
+		recommendation: 'Fix',
+		evidence: [],
+		generationOrder,
+	};
+}
+
+function aiReviewSuggestion(
+	uri: vscode.Uri,
+	relativePath: string,
+	hunk: ReviewHunk,
+	id = 'suggestion-1',
+	generationOrder = 0,
+): StoredAiReview['suggestions'][number] {
+	return {
+		id,
+		uri: uri.toString(),
+		relativePath,
+		hunkId: hunk.id,
+		line: hunk.newStart,
+		replacementText: 'suggested\n',
+		rationale: 'Prefer this.',
+		generationOrder,
+	};
+}
+
+type TestReviewController = {
+	undoFileCore(uriString?: string | ReviewFileState, expectedRevision?: number): Promise<void>;
+};
+
+type AutoStageReviewController = {
+	stageAcceptedReviewedHunksForManualRefresh(files: Map<string, ReviewFileState>): Promise<{ stagedFileCount: number; skippedFileCount: number }>;
+};
+
+function reviewControllerHarness(
+	session: ReviewSession,
+	initialCurrentText: string,
+	store = new AiReviewStore(new TestMemento() as unknown as vscode.Memento),
+): { controller: TestReviewController; writes: string[]; currentText: () => string } {
+	let currentText = initialCurrentText;
+	const writes: string[] = [];
+	const controller = Object.create(ReviewController.prototype) as TestReviewController;
+	Object.assign(controller as unknown as Record<string, unknown>, {
+		activeSession: session,
+		aiReviewStore: store,
+		manualGitBaselines: new Map<string, unknown>(),
+		resolveFile: (target?: string | ReviewFileState) => {
+			if (!target) {
+				return [...session.files.values()][0];
+			}
+			return typeof target === 'string' ? session.files.get(target) : target;
+		},
+		isStaleMutation: () => false,
+		ensureFileCleanForReviewMutation: () => true,
+		readCurrentText: async () => ({ exists: true, text: currentText }),
+		writeCurrentFileText: async (_uri: vscode.Uri, text: string) => {
+			currentText = text;
+			writes.push(text);
+		},
+		updateSnapshotBaselineFile: async () => undefined,
+		refreshFile: async () => undefined,
+		syncNativeReviewAfterMutation: async () => undefined,
+		showError: (error: unknown) => {
+			throw error;
+		},
+	});
+	return {
+		controller,
+		writes,
+		currentText: () => currentText,
+	};
+}
+
+function autoStageControllerHarness(
+	file: ReviewFileState,
+	currentText: string,
+	indexEntry: { exists: boolean; text: string; mode: string },
+	dirty = false,
+): {
+	controller: AutoStageReviewController;
+	session: ReviewSession;
+	stageFileCalls: string[];
+	stageIndexTextCalls: Array<{ relativePath: string; text: string; mode: string; add: boolean }>;
+	readIndexEntryCalls: number;
+} {
+	const project: ReviewProject = { id: 'repo', name: 'repo', rootUri: vscode.Uri.file('D:/repo') };
+	const session: ReviewSession = {
+		id: 'auto-stage',
+		mode: 'git',
+		rootUri: project.rootUri,
+		createdAt: 1,
+		files: new Map([[file.uri.toString(), file]]),
+		projects: [project],
+	};
+	const stageFileCalls: string[] = [];
+	const stageIndexTextCalls: Array<{ relativePath: string; text: string; mode: string; add: boolean }> = [];
+	let readIndexEntryCalls = 0;
+	const controller = Object.create(ReviewController.prototype) as AutoStageReviewController;
+	Object.assign(controller as unknown as Record<string, unknown>, {
+		activeSession: session,
+		gitService: {
+			readIndexEntry: async () => {
+				readIndexEntryCalls += 1;
+				return indexEntry;
+			},
+			stageFile: async (_root: vscode.WorkspaceFolder, relativePath: string) => {
+				stageFileCalls.push(relativePath);
+			},
+			stageIndexText: async (_root: vscode.WorkspaceFolder, relativePath: string, text: string, mode: string, add: boolean) => {
+				stageIndexTextCalls.push({ relativePath, text, mode, add });
+			},
+		},
+		isOpenDocumentDirty: () => dirty,
+		readCurrentText: async () => ({ exists: file.currentExists, text: currentText }),
+	});
+
+	return {
+		controller,
+		session,
+		stageFileCalls,
+		stageIndexTextCalls,
+		get readIndexEntryCalls() {
+			return readIndexEntryCalls;
+		},
 	};
 }
 

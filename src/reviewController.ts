@@ -64,6 +64,11 @@ type GitSessionRefreshRequest =
 	| { source: 'manual' }
 	| { source: 'gitIndexChanged' };
 
+interface AutoStageAcceptedReviewedResult {
+	stagedFileCount: number;
+	skippedFileCount: number;
+}
+
 interface ReviewNavigationTarget extends vscode.QuickPickItem {
 	uri: vscode.Uri;
 	range: vscode.Range;
@@ -128,7 +133,7 @@ export class ReviewController implements vscode.Disposable {
 		this.llmConfigStore = new LlmConfigStore(context);
 		this.wikiInitializationService = new WikiInitializationService(context.extensionUri);
 		this.aiReviewStore = new AiReviewStore(context.workspaceState);
-		this.treeProvider = new ReviewTreeProvider(() => this.activeSession);
+		this.treeProvider = new ReviewTreeProvider(() => this.activeSession, () => this.dashboardStoredAiReview());
 		this.dashboardProvider = new ReviewDashboardProvider(() => buildReviewDashboardPayload(
 			this.activeSession,
 			this.currentReviewUri,
@@ -980,12 +985,18 @@ export class ReviewController implements vscode.Disposable {
 				return;
 			}
 
+			const aiReviewSession = file.acceptedHunks.some((hunk) => hunk.appliedAiSuggestion)
+				? this.sessionForFile(file)
+				: undefined;
+			const aiReviewToResign = aiReviewSession ? this.aiReviewStore.load(aiReviewSession) : undefined;
 			await this.restoreDecisionsToPending(file);
+			this.refreshPendingHunksFromReviewState(file);
 			if (this.activeSession?.mode === 'snapshot') {
 				await this.updateSnapshotBaselineFile(file);
 			}
 			this.touchFileRevision(file);
 			this.syncManualGitBaseline(file);
+			await this.saveAiReviewWithCurrentSignature(aiReviewToResign, aiReviewSession);
 			await this.refreshFile(file.uri, { reconcileExternalChanges: false });
 			await this.syncNativeReviewAfterMutation(file.uri);
 		} catch (error) {
@@ -2016,6 +2027,7 @@ export class ReviewController implements vscode.Disposable {
 				onFileComplete: async (review) => {
 					if (this.currentWikiTask === task) {
 						await this.aiReviewStore.save(session, review);
+						this.treeProvider.refresh();
 						await this.refreshLlmWikiDashboardState({
 							status: 'reviewing',
 							progress: `AI review progress: ${review.completedFiles.length} file${review.completedFiles.length === 1 ? '' : 's'} completed.`,
@@ -2026,6 +2038,7 @@ export class ReviewController implements vscode.Disposable {
 			});
 			if (this.currentWikiTask === task) {
 				await this.aiReviewStore.save(session, result);
+				this.treeProvider.refresh();
 				this.appendWikiRunLog({
 					kind: 'run_complete',
 					title: 'AI review completed',
@@ -2040,6 +2053,7 @@ export class ReviewController implements vscode.Disposable {
 			if (!isAbortError(error)) {
 				if (error instanceof AiReviewPartialError) {
 					await this.aiReviewStore.save(session, error.review);
+					this.treeProvider.refresh();
 				}
 				this.showError(error);
 				this.appendWikiRunLog({
@@ -2362,6 +2376,96 @@ export class ReviewController implements vscode.Disposable {
 		file.currentExists = false;
 	}
 
+	private async stageAcceptedReviewedHunksForManualRefresh(files: Map<string, ReviewFileState>): Promise<AutoStageAcceptedReviewedResult> {
+		const result: AutoStageAcceptedReviewedResult = { stagedFileCount: 0, skippedFileCount: 0 };
+		for (const file of files.values()) {
+			if (file.skippedReason || file.acceptedHunks.length === 0) {
+				continue;
+			}
+
+			try {
+				if (await this.stageAcceptedReviewedHunksForFile(file)) {
+					result.stagedFileCount += 1;
+				} else {
+					result.skippedFileCount += 1;
+				}
+			} catch {
+				result.skippedFileCount += 1;
+			}
+		}
+		return result;
+	}
+
+	private async stageAcceptedReviewedHunksForFile(file: ReviewFileState): Promise<boolean> {
+		if (this.isOpenDocumentDirty(file.uri)) {
+			return false;
+		}
+
+		const folder = this.gitWorkspaceFolderForReviewFile(file);
+		if (!folder) {
+			return false;
+		}
+
+		const current = await this.readCurrentText(file.uri, { preferDisk: true });
+		if (current.exists !== file.currentExists || current.text !== file.newText) {
+			return false;
+		}
+
+		const originalIndexText = this.originalIndexTextBeforeAcceptedHunks(file);
+		if (originalIndexText === undefined) {
+			return false;
+		}
+
+		const indexEntry = await this.gitService.readIndexEntry(folder, file.relativePath);
+		const indexText = indexEntry.exists ? indexEntry.text : '';
+		const targetIndexExists = file.currentExists || file.oldText.length > 0;
+		const indexMatchesOriginal = indexEntry.exists === file.originalExists && indexText === originalIndexText;
+		const indexAlreadyStaged = indexEntry.exists === targetIndexExists && indexText === file.oldText;
+		if (!indexMatchesOriginal && !indexAlreadyStaged) {
+			return false;
+		}
+		if (indexAlreadyStaged) {
+			return true;
+		}
+
+		if (file.hunks.length === 0) {
+			await this.gitService.stageFile(folder, file.relativePath);
+		} else {
+			await this.gitService.stageIndexText(folder, file.relativePath, file.oldText, indexEntry.mode, !indexEntry.exists);
+		}
+		return true;
+	}
+
+	private originalIndexTextBeforeAcceptedHunks(file: ReviewFileState): string | undefined {
+		let text = file.oldText;
+		for (const hunk of [...file.acceptedHunks].sort((left, right) => right.baselineStart - left.baselineStart)) {
+			if (!this.reviewedBaselineSideMatches(text, hunk, hunk.baselineStart, hunk.newLines, hunk.newText)) {
+				return undefined;
+			}
+			text = replaceLineBlock(text, hunk.baselineStart, hunk.newLines, hunk.oldText);
+		}
+		return text;
+	}
+
+	private gitWorkspaceFolderForReviewFile(file: ReviewFileState): vscode.WorkspaceFolder | undefined {
+		const project = file.projectId
+			? this.activeSession?.projects?.find((candidate) => candidate.id === file.projectId)
+			: this.gitProjectForUri(file.uri);
+		if (project) {
+			return reviewProjectFolder(project);
+		}
+		return this.activeGitWorkspaceFolder();
+	}
+
+	private showAutoStageAcceptedReviewedWarning(result: AutoStageAcceptedReviewedResult): void {
+		if (result.skippedFileCount === 0) {
+			return;
+		}
+
+		const fileLabel = result.skippedFileCount === 1 ? 'file' : 'files';
+		void vscode.window.showWarningMessage(`Cli Diff Review skipped auto-staging accepted reviewed chunks in ${result.skippedFileCount} ${fileLabel}. Save files or resolve staged changes, then refresh again.`);
+	}
+
 	private async refreshGitSessionFiles(request: GitSessionRefreshRequest): Promise<void> {
 		if (!this.activeSession || this.activeSession.mode !== 'git') {
 			return;
@@ -2374,6 +2478,8 @@ export class ReviewController implements vscode.Disposable {
 
 		const previousFiles = this.activeSession.files;
 		if (request.source === 'manual') {
+			const autoStageResult = await this.stageAcceptedReviewedHunksForManualRefresh(previousFiles);
+			this.showAutoStageAcceptedReviewedWarning(autoStageResult);
 			this.captureManualGitBaselines(previousFiles);
 		} else {
 			this.manualGitBaselines.clear();
@@ -3405,11 +3511,11 @@ export class ReviewController implements vscode.Disposable {
 		return Math.max(0, mappedLine);
 	}
 
-	private async restoreDecisionsToPending(file: ReviewFileState): Promise<void> {
+	private async restoreDecisionsToPending(file: ReviewFileState): Promise<{ changedCurrent: boolean }> {
 		const accepted = [...file.acceptedHunks].sort((left, right) => right.baselineStart - left.baselineStart);
 		const rejected = [...file.rejectedHunks].sort((left, right) => right.currentStart - left.currentStart);
 		if (accepted.length === 0 && rejected.length === 0) {
-			return;
+			return { changedCurrent: false };
 		}
 
 		for (const hunk of accepted) {
@@ -3423,15 +3529,36 @@ export class ReviewController implements vscode.Disposable {
 		}
 
 		const current = await this.readCurrentText(file.uri);
+		const acceptedWithSuggestions = accepted
+			.filter((hunk): hunk is ReviewedHunk & { appliedAiSuggestion: AppliedAiSuggestion } => Boolean(hunk.appliedAiSuggestion))
+			.sort((left, right) => right.currentStart - left.currentStart);
+		for (const hunk of acceptedWithSuggestions) {
+			if (!current.exists || !this.reviewedCurrentSideMatches(current.text, hunk, hunk.currentStart, hunk.displayLines, hunk.newText)) {
+				throw new Error('A reviewed Cli Diff Review change no longer matches the current file. Refresh the review and try again.');
+			}
+		}
 		for (const hunk of rejected) {
 			if (!this.reviewedCurrentSideMatches(current.text, hunk, hunk.currentStart, hunk.displayLines, hunk.oldText)) {
 				throw new Error('A reviewed Cli Diff Review change no longer matches the current file. Refresh the review and try again.');
 			}
 		}
 		let currentText = current.text;
-		for (const hunk of rejected) {
-			currentText = replaceLineBlock(currentText, hunk.currentStart, hunk.displayLines, hunk.newText);
+		const currentRestorations = [
+			...acceptedWithSuggestions.map((hunk) => ({
+				start: hunk.currentStart,
+				lines: hunk.displayLines,
+				text: hunk.appliedAiSuggestion.originalHunk.newText,
+			})),
+			...rejected.map((hunk) => ({
+				start: hunk.currentStart,
+				lines: hunk.displayLines,
+				text: hunk.newText,
+			})),
+		].sort((left, right) => right.start - left.start);
+		for (const edit of currentRestorations) {
+			currentText = replaceLineBlock(currentText, edit.start, edit.lines, edit.text);
 		}
+		const changedCurrent = currentRestorations.length > 0;
 
 		file.oldText = baselineText;
 		file.newText = currentText;
@@ -3439,10 +3566,11 @@ export class ReviewController implements vscode.Disposable {
 		this.syncBaselineExistsForPending(file);
 		file.acceptedHunks = [];
 		file.rejectedHunks = [];
-		if (rejected.length > 0) {
+		if (changedCurrent) {
 			file.currentExists = true;
 			await this.writeCurrentFileText(file.uri, currentText);
 		}
+		return { changedCurrent };
 	}
 
 	private syncDecisionHunksAfterEdit(

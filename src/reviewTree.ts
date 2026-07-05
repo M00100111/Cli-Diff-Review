@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import type { StoredAiReview } from './agent/codeReview';
 import { hasAggregateReviewTarget, ReviewFileState, ReviewProject, ReviewSession, visibleReviewFiles } from './types';
 
 export interface ReviewProjectTreeNode {
@@ -12,7 +13,10 @@ export class ReviewTreeProvider implements vscode.TreeDataProvider<ReviewTreeNod
 	private readonly emitter = new vscode.EventEmitter<ReviewTreeNode | undefined | null | void>();
 	public readonly onDidChangeTreeData = this.emitter.event;
 
-	public constructor(private readonly getSession: () => ReviewSession | undefined) {}
+	public constructor(
+		private readonly getSession: () => ReviewSession | undefined,
+		private readonly getAiReview: () => StoredAiReview | undefined = () => undefined,
+	) {}
 
 	public getTreeItem(element: ReviewTreeNode): vscode.TreeItem {
 		if (isProjectNode(element)) {
@@ -27,9 +31,7 @@ export class ReviewTreeProvider implements vscode.TreeDataProvider<ReviewTreeNod
 			item.tooltip = `${element.relativePath}\n${element.skippedReason}`;
 			item.contextValue = 'cliDiffFileSkipped';
 		} else {
-			item.description = pending > 0 && reviewed > 0
-				? `${pending} pending, ${reviewed} reviewed`
-				: pending > 0 ? `${pending} pending` : `${reviewed} reviewed`;
+			item.description = fileDescription(pending, reviewed, fileAiReviewCounts(element, this.getAiReview()));
 			item.contextValue = pending > 0 && reviewed > 0
 			? 'cliDiffFilePendingReviewed'
 			: pending > 0 ? 'cliDiffFilePending' : reviewed > 0 ? 'cliDiffFileReviewed' : 'cliDiffFile';
@@ -83,4 +85,36 @@ export class ReviewTreeProvider implements vscode.TreeDataProvider<ReviewTreeNod
 
 function isProjectNode(element: ReviewTreeNode): element is ReviewProjectTreeNode {
 	return 'kind' in element && element.kind === 'project';
+}
+
+function fileDescription(
+	pending: number,
+	reviewed: number,
+	aiCounts: { findings: number; suggestions: number },
+): string {
+	const parts: string[] = [];
+	if (pending > 0) {
+		parts.push(`${pending} pending`);
+	}
+	if (reviewed > 0 || parts.length === 0) {
+		parts.push(`${reviewed} reviewed`);
+	}
+	if (aiCounts.findings > 0) {
+		parts.push(`${aiCounts.findings} ${aiCounts.findings === 1 ? 'finding' : 'findings'}`);
+	}
+	if (aiCounts.suggestions > 0) {
+		parts.push(`${aiCounts.suggestions} ${aiCounts.suggestions === 1 ? 'suggestion' : 'suggestions'}`);
+	}
+	return parts.join(', ');
+}
+
+function fileAiReviewCounts(file: ReviewFileState, review: StoredAiReview | undefined): { findings: number; suggestions: number } {
+	if (!review) {
+		return { findings: 0, suggestions: 0 };
+	}
+	const uri = file.uri.toString();
+	return {
+		findings: review.findings.filter((finding) => finding.uri === uri).length,
+		suggestions: review.suggestions.filter((suggestion) => suggestion.uri === uri).length,
+	};
 }

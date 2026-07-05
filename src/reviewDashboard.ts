@@ -2569,16 +2569,19 @@ export function buildReviewDashboardPayload(
 				const pendingHunks = dashboardPendingHunks(file);
 				const pendingCount = pendingHunks.length;
 				const reviewedCount = file.acceptedHunks.length + file.rejectedHunks.length;
+				const fileUri = file.uri.toString();
+				const findingCount = findingsByFile.get(fileUri)?.length ?? 0;
+				const suggestionCount = suggestionsByFile.get(fileUri)?.length ?? 0;
 				const dirty = isDirty(file.uri);
 				const mutationDisabled = dirty || Boolean(file.skippedReason);
 				const status = dashboardStatus(file);
 				const displayPath = aggregate && file.projectName ? `${file.projectName}/${file.relativePath}` : file.relativePath;
 				return {
-					uri: file.uri.toString(),
+					uri: fileUri,
 					revision: file.revision,
 					relativePath: displayPath,
 					fileExtension: dashboardExtension(displayPath),
-					description: dashboardDescription(pendingCount, reviewedCount, dirty, file.skippedReason),
+					description: dashboardDescription(pendingCount, reviewedCount, findingCount, suggestionCount, dirty, file.skippedReason),
 					statusLabel: status.label,
 					statusKind: status.kind,
 					pendingCount,
@@ -2770,7 +2773,14 @@ function dashboardPendingHunks(file: ReviewFileState): ReviewHunk[] {
 	return file.hunks.filter((hunk) => !reviewedIdentities.has(reviewHunkIdentity(hunk)));
 }
 
-function dashboardDescription(pendingCount: number, reviewedCount: number, dirty: boolean, skippedReason?: string): string {
+function dashboardDescription(
+	pendingCount: number,
+	reviewedCount: number,
+	findingCount: number,
+	suggestionCount: number,
+	dirty: boolean,
+	skippedReason?: string,
+): string {
 	if (skippedReason) {
 		return 'skipped';
 	}
@@ -2780,6 +2790,12 @@ function dashboardDescription(pendingCount: number, reviewedCount: number, dirty
 	}
 	if (reviewedCount > 0) {
 		parts.push(`${reviewedCount} reviewed`);
+	}
+	if (findingCount > 0) {
+		parts.push(`${findingCount} ${findingCount === 1 ? 'finding' : 'findings'}`);
+	}
+	if (suggestionCount > 0) {
+		parts.push(`${suggestionCount} ${suggestionCount === 1 ? 'suggestion' : 'suggestions'}`);
 	}
 	if (dirty) {
 		parts.push('dirty');

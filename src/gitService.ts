@@ -6,6 +6,12 @@ import { gitIgnoredReviewPaths, isGitIgnoredReviewPath, normalizeReviewPath, sho
 import { FilePair, ReviewProject, uriKey } from './types';
 import { decodeUtf8, isProbablyBinary, uriFromRelativePath } from './text';
 
+export interface GitIndexEntry {
+	exists: boolean;
+	text: string;
+	mode: string;
+}
+
 export class GitService {
 	public async discoverProjects(workspaceRoot: vscode.WorkspaceFolder): Promise<ReviewProject[]> {
 		if (await this.isGitRoot(workspaceRoot.uri)) {
@@ -101,6 +107,24 @@ export class GitService {
 		return this.indexStateSignaturePath(root.uri.fsPath);
 	}
 
+	public async readIndexEntry(root: vscode.WorkspaceFolder, relativePath: string): Promise<GitIndexEntry> {
+		return this.readIndexEntryPath(root.uri.fsPath, relativePath);
+	}
+
+	public async stageFile(root: vscode.WorkspaceFolder, relativePath: string): Promise<void> {
+		await this.git(root, ['add', '--', relativePath]);
+	}
+
+	public async stageIndexText(root: vscode.WorkspaceFolder, relativePath: string, text: string, mode = '100644', add = false): Promise<void> {
+		const blob = (await this.git(root, ['hash-object', '-w', '--stdin', `--path=${relativePath}`], { input: text })).trim();
+		const args = ['update-index'];
+		if (add) {
+			args.push('--add');
+		}
+		args.push('--cacheinfo', mode, blob, relativePath);
+		await this.git(root, args);
+	}
+
 	private async indexStateSignaturePath(rootPath: string): Promise<string> {
 		const head = await this.headOidPath(rootPath);
 		const index = await this.gitInPath(rootPath, ['ls-files', '-s']);
@@ -128,10 +152,22 @@ export class GitService {
 	}
 
 	private async readIndexTextPath(rootPath: string, relativePath: string): Promise<{ exists: boolean; text: string }> {
+		const entry = await this.readIndexEntryPath(rootPath, relativePath);
+		return { exists: entry.exists, text: entry.text };
+	}
+
+	private async readIndexEntryPath(rootPath: string, relativePath: string): Promise<GitIndexEntry> {
 		try {
-			return { exists: true, text: await this.gitInPath(rootPath, ['show', `:${relativePath}`]) };
+			const listing = (await this.gitInPath(rootPath, ['ls-files', '-s', '--', relativePath]))
+				.split(/\r?\n/g)
+				.find((line) => line.trim().length > 0);
+			if (!listing) {
+				return { exists: false, text: '', mode: '100644' };
+			}
+			const mode = listing.match(/^(\d{6})\s+/)?.[1] ?? '100644';
+			return { exists: true, text: await this.gitInPath(rootPath, ['show', `:${relativePath}`]), mode };
 		} catch {
-			return { exists: false, text: '' };
+			return { exists: false, text: '', mode: '100644' };
 		}
 	}
 
@@ -140,13 +176,13 @@ export class GitService {
 		return output.split(/\r?\n/g).map((line) => line.trim()).filter(Boolean);
 	}
 
-	private git(root: vscode.WorkspaceFolder, args: string[]): Promise<string> {
-		return this.gitInPath(root.uri.fsPath, args);
+	private git(root: vscode.WorkspaceFolder, args: string[], options: { input?: string } = {}): Promise<string> {
+		return this.gitInPath(root.uri.fsPath, args, options);
 	}
 
-	private gitInPath(cwd: string, args: string[]): Promise<string> {
+	private gitInPath(cwd: string, args: string[], options: { input?: string } = {}): Promise<string> {
 		return new Promise((resolve, reject) => {
-			execFile('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
+			const child = execFile('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
 				if (error) {
 					reject(new Error(stderr || error.message));
 					return;
@@ -154,6 +190,9 @@ export class GitService {
 
 				resolve(stdout);
 			});
+			if (options.input !== undefined) {
+				child.stdin?.end(options.input);
+			}
 		});
 	}
 }
