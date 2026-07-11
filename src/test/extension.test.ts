@@ -967,6 +967,7 @@ suite('Review state', () => {
 		const skippedUri = vscode.Uri.file('D:/repo/src/skipped.ts');
 		const htmlUri = vscode.Uri.file('D:/repo/src/page.html');
 		const jsonUri = vscode.Uri.file('D:/repo/src/config.json');
+		const noExtensionUri = vscode.Uri.file('D:/repo/README');
 		const pendingHunk = computeLineDiff(pendingUri.toString(), 'a\n', 'b\n')[0];
 		const reviewedHunk = computeLineDiff(reviewedUri.toString(), 'one\n', 'two\n')[0];
 		const session: ReviewSession = {
@@ -984,6 +985,7 @@ suite('Review state', () => {
 				})],
 				[htmlUri.toString(), reviewFileState(htmlUri, 'src/page.html')],
 				[jsonUri.toString(), reviewFileState(jsonUri, 'src/config.json')],
+				[noExtensionUri.toString(), reviewFileState(noExtensionUri, 'README')],
 			]),
 		};
 
@@ -994,12 +996,14 @@ suite('Review state', () => {
 		const skipped = payload.files.find((file) => file.relativePath === 'src/skipped.ts');
 		const html = payload.files.find((file) => file.relativePath === 'src/page.html');
 		const json = payload.files.find((file) => file.relativePath === 'src/config.json');
+		const noExtension = payload.files.find((file) => file.relativePath === 'README');
 
 		assert.deepStrictEqual(empty.files, []);
 		assert.strictEqual(payload.currentReviewLabel, 'pending.ts');
-		assert.strictEqual(payload.files.length, 5);
+		assert.strictEqual(payload.files.length, 6);
 		assert.strictEqual(html?.fileExtension, 'html');
 		assert.strictEqual(json?.fileExtension, 'json');
+		assert.strictEqual(noExtension?.fileExtension, 'file');
 		assert.strictEqual(pending?.active, true);
 		assert.strictEqual(pending?.dirty, true);
 		assert.strictEqual(pending?.acceptDisabled, true);
@@ -1271,9 +1275,13 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('function renderRunLogRound'));
 		assert.ok(view.webview.html.includes('function renderReviewFileDetail'));
 		assert.ok(view.webview.html.includes('function restoreScrollTop'));
+		assert.ok(view.webview.html.includes('const pendingScrollTops = new WeakMap()'));
+		assert.ok(view.webview.html.includes('const pendingScrollTop = pendingScrollTops.get(container)'));
+		assert.ok(view.webview.html.includes('pendingScrollTops.delete(container)'));
 		assert.ok(view.webview.html.includes('const listScrollTop = list.scrollTop'));
 		assert.ok(view.webview.html.includes('restoreScrollTop(list, listScrollTop)'));
 		assert.ok(view.webview.html.includes('renderedReviewDetailUri === file.uri'));
+		assert.ok(view.webview.html.includes('pendingScrollTops.get(reviewFileDetail)'));
 		assert.ok(view.webview.html.includes('restoreScrollTop(reviewFileDetail, detailScrollTop)'));
 		assert.ok(view.webview.html.includes('function aiReviewActionLabel'));
 		assert.ok(view.webview.html.includes("return 'Generate AI review'"));
@@ -1335,6 +1343,12 @@ suite('Review state', () => {
 		assert.strictEqual(view.webview.html.includes('review-chunk-preview'), false);
 		const dashboardSource = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewDashboard.ts'), 'utf8');
 		assert.strictEqual(dashboardSource.includes('dashboardChunkPreview'), false);
+		assert.strictEqual(view.webview.html.includes('width: 36px;'), false);
+		assert.ok(view.webview.html.includes('var(--file-extension-column-width, auto)'));
+		assert.ok(view.webview.html.includes("tree.style.removeProperty('--file-extension-column-width')"));
+		assert.ok(view.webview.html.includes('function updateFileExtensionColumnWidth'));
+		assert.ok(view.webview.html.includes('icon.getBoundingClientRect().width'));
+		assert.ok(view.webview.html.includes("tree.style.setProperty('--file-extension-column-width', width + 'px')"));
 		assert.match(view.webview.html, /\.wiki-run-title\s*{[\s\S]*?font-size: 12px;/);
 		assert.match(view.webview.html, /\.wiki-run-meta\s*{[\s\S]*?font-size: 10px;/);
 		assert.match(view.webview.html, /\.wiki-run-detail pre\s*{[\s\S]*?font-size: 11px;/);
@@ -1486,6 +1500,67 @@ suite('Review state', () => {
 		assert.strictEqual(lineBlockWithContextMatchesUniquely(text, 3, 1, 'x\n', context), false);
 	});
 
+	test('accepts file-level added hunks at their recorded duplicated context', async () => {
+		const uri = vscode.Uri.file('/repo/src/repeated.ts');
+		const block = 'before1\nbefore2\nbefore3\nafter1\nafter2\nafter3\n';
+		const baseline = block + block;
+		const current = replaceLineBlock(baseline, 3, 0, 'added\n');
+		const [hunk] = computeLineDiff(uri.toString(), baseline, current);
+		assert.ok(hunk);
+		assert.strictEqual(lineBlockWithContextMatchesUniquely(baseline, hunk.oldStart, hunk.oldLines, hunk.oldText, {
+			before: hunk.oldContextBefore,
+			after: hunk.oldContextAfter,
+		}), false);
+
+		const file = reviewFileState(uri, 'src/repeated.ts', { oldText: baseline, newText: current, hunks: [hunk] });
+		const session: ReviewSession = { id: 'duplicate-file-accept', mode: 'git', rootUri: vscode.Uri.file('/repo'), createdAt: 1, files: new Map([[uri.toString(), file]]) };
+		const harness = reviewControllerHarness(session, current);
+
+		await harness.controller.acceptFileCore(file);
+
+		assert.strictEqual(file.oldText, current);
+		assert.strictEqual(file.hunks.length, 0);
+		assert.strictEqual(file.acceptedHunks.length, 1);
+		assert.deepStrictEqual(harness.writes, []);
+		assert.strictEqual(harness.unmatchedMutationCount(), 0);
+	});
+
+	test('matches duplicate added chunk content at its recorded current coordinate', () => {
+		const uri = vscode.Uri.file('/repo/src/repeated-add.ts');
+		const emptyBlock = 'before1\nbefore2\nbefore3\nafter1\nafter2\nafter3\n';
+		const existingBlock = 'before1\nbefore2\nbefore3\nadded\nafter1\nafter2\nafter3\n';
+		const baseline = emptyBlock + existingBlock;
+		const current = replaceLineBlock(baseline, 3, 0, 'added\n');
+		const [hunk] = computeLineDiff(uri.toString(), baseline, current);
+		assert.ok(hunk);
+		assert.strictEqual(hunk.kind, 'add');
+		assert.strictEqual(lineBlockWithContextMatchesUniquely(current, hunk.newStart, hunk.newLines, hunk.newText, {
+			before: hunk.newContextBefore,
+			after: hunk.newContextAfter,
+		}), false);
+
+		const controller = Object.create(ReviewController.prototype) as TestReviewController;
+		assert.strictEqual(controller.originalHunkSideMatches(current, hunk, 'new', hunk.newStart), true);
+		assert.strictEqual(replaceLineBlock(current, hunk.newStart, hunk.newLines, hunk.oldText), baseline);
+	});
+
+	test('refreshes instead of accepting an unmatched file hunk', async () => {
+		const uri = vscode.Uri.file('/repo/src/stale.ts');
+		const [original] = computeLineDiff(uri.toString(), 'old\n', 'new\n');
+		assert.ok(original);
+		const hunk = { ...original, oldText: 'stale\n' };
+		const file = reviewFileState(uri, 'src/stale.ts', { oldText: 'old\n', newText: 'new\n', hunks: [hunk] });
+		const session: ReviewSession = { id: 'stale-file-accept', mode: 'git', rootUri: vscode.Uri.file('/repo'), createdAt: 1, files: new Map([[uri.toString(), file]]) };
+		const harness = reviewControllerHarness(session, 'new\n');
+
+		await harness.controller.acceptFileCore(file);
+
+		assert.strictEqual(file.oldText, 'old\n');
+		assert.strictEqual(file.hunks.length, 1);
+		assert.strictEqual(file.acceptedHunks.length, 0);
+		assert.deepStrictEqual(harness.writes, []);
+		assert.strictEqual(harness.unmatchedMutationCount(), 1);
+	});
 	test('keeps file-level accept undo coordinates in final baseline space', () => {
 		const baseline = 'a\nb\nkeep1\nc\nkeep2\nd\n';
 		const current = 'x\na\nB\nkeep1\nkeep2\nd\nz\n';
@@ -3374,7 +3449,9 @@ function aiReviewSuggestion(
 }
 
 type TestReviewController = {
+	acceptFileCore(uriString?: string | ReviewFileState, expectedRevision?: number): Promise<void>;
 	undoFileCore(uriString?: string | ReviewFileState, expectedRevision?: number): Promise<void>;
+	originalHunkSideMatches(text: string, hunk: ReviewHunk, side: 'old' | 'new', startLine: number): boolean;
 };
 
 type AutoStageReviewController = {
@@ -3385,9 +3462,10 @@ function reviewControllerHarness(
 	session: ReviewSession,
 	initialCurrentText: string,
 	store = new AiReviewStore(new TestMemento() as unknown as vscode.Memento),
-): { controller: TestReviewController; writes: string[]; currentText: () => string } {
+): { controller: TestReviewController; writes: string[]; currentText: () => string; unmatchedMutationCount: () => number } {
 	let currentText = initialCurrentText;
 	const writes: string[] = [];
+	let unmatchedMutationCount = 0;
 	const controller = Object.create(ReviewController.prototype) as TestReviewController;
 	Object.assign(controller as unknown as Record<string, unknown>, {
 		activeSession: session,
@@ -3408,6 +3486,7 @@ function reviewControllerHarness(
 		},
 		updateSnapshotBaselineFile: async () => undefined,
 		refreshFile: async () => undefined,
+		refreshUnmatchedMutation: async () => { unmatchedMutationCount += 1; },
 		syncNativeReviewAfterMutation: async () => undefined,
 		showError: (error: unknown) => {
 			throw error;
@@ -3417,6 +3496,7 @@ function reviewControllerHarness(
 		controller,
 		writes,
 		currentText: () => currentText,
+		unmatchedMutationCount: () => unmatchedMutationCount,
 	};
 }
 

@@ -26,7 +26,6 @@ import {
 	GitManualBaseline,
 	isStaleRevision,
 	lineBlockWithContextMatches,
-	lineBlockWithContextMatchesUniquely,
 	mapLineAfterFileEdits,
 	mapLineAfterLineEdits,
 	manualGitBaselineFromReviewedFile,
@@ -646,7 +645,7 @@ export class ReviewController implements vscode.Disposable {
 				return;
 			}
 			if (!this.originalHunkSideMatches(target.file.oldText, target.hunk, 'old', target.hunk.oldStart)) {
-				await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
+				await this.refreshUnmatchedMutation(target.file);
 				return;
 			}
 
@@ -721,7 +720,7 @@ export class ReviewController implements vscode.Disposable {
 
 			const document = await vscode.workspace.openTextDocument(target.file.uri);
 			if (!this.originalHunkSideMatches(document.getText(), target.hunk, 'new', target.hunk.newStart)) {
-				await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
+				await this.refreshUnmatchedMutation(target.file);
 				return;
 			}
 
@@ -879,7 +878,7 @@ export class ReviewController implements vscode.Disposable {
 			file.currentExists = current.exists;
 			const pendingHunks = [...file.hunks];
 			if (pendingHunks.some((hunk) => !this.originalHunkSideMatches(file.oldText, hunk, 'old', hunk.oldStart))) {
-				await this.refreshFile(file.uri, { reconcileExternalChanges: false });
+				await this.refreshUnmatchedMutation(file);
 				return;
 			}
 			const baselineEdits = pendingHunks.map((hunk) => ({
@@ -935,7 +934,7 @@ export class ReviewController implements vscode.Disposable {
 
 			let currentText = refreshedFile.newText;
 			if (pendingHunks.some((hunk) => !this.originalHunkSideMatches(currentText, hunk, 'new', hunk.newStart))) {
-				await this.refreshFile(refreshedFile.uri, { reconcileExternalChanges: false });
+				await this.refreshUnmatchedMutation(refreshedFile);
 				return;
 			}
 			for (const hunk of [...pendingHunks].sort((left, right) => right.newStart - left.newStart)) {
@@ -3735,7 +3734,12 @@ export class ReviewController implements vscode.Disposable {
 			: { before: hunk.newContextBefore, after: hunk.newContextAfter };
 		const lineCount = side === 'old' ? hunk.oldLines : hunk.newLines;
 		const expectedText = side === 'old' ? hunk.oldText : hunk.newText;
-		return lineBlockWithContextMatchesUniquely(text, startLine, lineCount, expectedText, context);
+		return lineBlockWithContextMatches(text, startLine, lineCount, expectedText, context);
+	}
+
+	private async refreshUnmatchedMutation(file: ReviewFileState): Promise<void> {
+		await this.refreshFile(file.uri, { reconcileExternalChanges: false });
+		vscode.window.showInformationMessage('Cli Diff Review refreshed because the change no longer matches the expected content. Please retry.');
 	}
 
 	private reviewedBaselineSideMatches(

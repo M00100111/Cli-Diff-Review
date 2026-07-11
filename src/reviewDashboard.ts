@@ -1211,15 +1211,15 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			overflow: hidden;
 		}
 		.file-icon {
-			flex: 0 0 auto;
-			width: 36px;
+			flex: 0 0 var(--file-extension-column-width, auto);
+			width: var(--file-extension-column-width, auto);
 			color: var(--vscode-symbolIcon-fileForeground, var(--vscode-icon-foreground));
 			font-size: 9px;
 			font-weight: 700;
 			letter-spacing: 0;
 			white-space: nowrap;
 			text-transform: uppercase;
-			text-align: center;
+			text-align: left;
 		}
 		.path {
 			min-width: 0;
@@ -1528,6 +1528,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		let lastFiles = [];
 		let reviewDetailUri;
 		let renderedReviewDetailUri;
+		const pendingScrollTops = new WeakMap();
 		toggle.addEventListener('click', () => setExpanded(!expanded));
 		toggle.addEventListener('keydown', (event) => {
 			if (event.key === 'Enter' || event.key === ' ') {
@@ -1564,6 +1565,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		function render(payload) {
 			const files = payload.files || [];
 			const listScrollTop = list.scrollTop;
+			tree.style.removeProperty('--file-extension-column-width');
 			lastFiles = files;
 			renderTrackingTarget(payload.trackingTarget);
 			updateBulkActionButtons(files);
@@ -1588,13 +1590,30 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			for (const file of files) {
 				list.appendChild(fileRow(file));
 			}
+			updateFileExtensionColumnWidth();
 			restoreScrollTop(list, listScrollTop);
 		}
 
+		function updateFileExtensionColumnWidth() {
+			const width = Array.from(list.querySelectorAll('.file-icon')).reduce((maximum, icon) => (
+				Math.max(maximum, Math.ceil(icon.getBoundingClientRect().width))
+			), 0);
+			if (width > 0) {
+				tree.style.setProperty('--file-extension-column-width', width + 'px');
+			}
+		}
+
 		function restoreScrollTop(container, scrollTop) {
+			const pendingScrollTop = pendingScrollTops.get(container);
+			const targetScrollTop = pendingScrollTop === undefined ? scrollTop : pendingScrollTop;
+			pendingScrollTops.set(container, targetScrollTop);
 			requestAnimationFrame(() => {
+				if (pendingScrollTops.get(container) !== targetScrollTop) {
+					return;
+				}
 				const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
-				container.scrollTop = Math.min(scrollTop, maxScrollTop);
+				container.scrollTop = Math.min(targetScrollTop, maxScrollTop);
+				pendingScrollTops.delete(container);
 			});
 		}
 
@@ -1939,12 +1958,19 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 
 		function renderReviewFileDetail(file) {
 			const shouldRestoreScroll = Boolean(file) && renderedReviewDetailUri === file.uri;
-			const detailScrollTop = shouldRestoreScroll ? reviewFileDetail.scrollTop : 0;
+			const pendingDetailScrollTop = pendingScrollTops.get(reviewFileDetail);
+			const detailScrollTop = shouldRestoreScroll
+				? (pendingDetailScrollTop === undefined ? reviewFileDetail.scrollTop : pendingDetailScrollTop)
+				: 0;
+			if (!shouldRestoreScroll) {
+				pendingScrollTops.delete(reviewFileDetail);
+			}
 			renderedReviewDetailUri = file?.uri;
 			reviewFileDetail.replaceChildren();
 			reviewFileDetail.hidden = !file;
 			if (!file) {
 				reviewFileDetail.scrollTop = 0;
+				pendingScrollTops.delete(reviewFileDetail);
 				return;
 			}
 
@@ -1971,6 +1997,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				empty.className = 'review-empty';
 				empty.textContent = 'No pending chunks for this file.';
 				reviewFileDetail.appendChild(empty);
+				pendingScrollTops.delete(reviewFileDetail);
 				return;
 			}
 
@@ -2833,7 +2860,7 @@ function isDashboardAgentRunning(status: LlmWikiStatus): boolean {
 }
 
 function dashboardExtension(relativePath: string): string {
-	return path.posix.extname(relativePath).replace(/^\./, '');
+	return path.posix.extname(relativePath).replace(/^\./, '') || 'file';
 }
 
 function dashboardStatus(file: ReviewFileState): { label: string; kind: ReviewDashboardFile['statusKind'] } {
