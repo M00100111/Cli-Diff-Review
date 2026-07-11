@@ -1212,12 +1212,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 		.file-icon {
 			flex: 0 0 auto;
-			min-width: 16px;
-			max-width: 22px;
+			width: 36px;
 			color: var(--vscode-symbolIcon-fileForeground, var(--vscode-icon-foreground));
 			font-size: 9px;
 			font-weight: 700;
 			letter-spacing: 0;
+			white-space: nowrap;
 			text-transform: uppercase;
 			text-align: center;
 		}
@@ -1527,6 +1527,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		let lastWikiState;
 		let lastFiles = [];
 		let reviewDetailUri;
+		let renderedReviewDetailUri;
 		toggle.addEventListener('click', () => setExpanded(!expanded));
 		toggle.addEventListener('keydown', (event) => {
 			if (event.key === 'Enter' || event.key === ' ') {
@@ -1562,6 +1563,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 
 		function render(payload) {
 			const files = payload.files || [];
+			const listScrollTop = list.scrollTop;
 			lastFiles = files;
 			renderTrackingTarget(payload.trackingTarget);
 			updateBulkActionButtons(files);
@@ -1580,11 +1582,20 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				empty.className = 'empty';
 				empty.textContent = 'No changes';
 				list.appendChild(empty);
+				restoreScrollTop(list, listScrollTop);
 				return;
 			}
 			for (const file of files) {
 				list.appendChild(fileRow(file));
 			}
+			restoreScrollTop(list, listScrollTop);
+		}
+
+		function restoreScrollTop(container, scrollTop) {
+			requestAnimationFrame(() => {
+				const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+				container.scrollTop = Math.min(scrollTop, maxScrollTop);
+			});
 		}
 
 		function renderTrackingTarget(target) {
@@ -1927,9 +1938,13 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 
 		function renderReviewFileDetail(file) {
+			const shouldRestoreScroll = Boolean(file) && renderedReviewDetailUri === file.uri;
+			const detailScrollTop = shouldRestoreScroll ? reviewFileDetail.scrollTop : 0;
+			renderedReviewDetailUri = file?.uri;
 			reviewFileDetail.replaceChildren();
 			reviewFileDetail.hidden = !file;
 			if (!file) {
+				reviewFileDetail.scrollTop = 0;
 				return;
 			}
 
@@ -1961,6 +1976,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 
 			for (const chunk of file.chunks) {
 				reviewFileDetail.appendChild(renderReviewChunk(file, chunk));
+			}
+			if (shouldRestoreScroll) {
+				restoreScrollTop(reviewFileDetail, detailScrollTop);
+			} else {
+				reviewFileDetail.scrollTop = 0;
 			}
 		}
 
@@ -2449,6 +2469,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const icon = document.createElement('span');
 			icon.className = 'file-icon';
 			icon.textContent = file.fileExtension || '';
+			icon.title = file.fileExtension || '';
 			main.appendChild(icon);
 
 			const filePath = document.createElement('div');
@@ -2812,8 +2833,7 @@ function isDashboardAgentRunning(status: LlmWikiStatus): boolean {
 }
 
 function dashboardExtension(relativePath: string): string {
-	const extension = path.posix.extname(relativePath).replace(/^\./, '');
-	return extension.slice(0, 3);
+	return path.posix.extname(relativePath).replace(/^\./, '');
 }
 
 function dashboardStatus(file: ReviewFileState): { label: string; kind: ReviewDashboardFile['statusKind'] } {

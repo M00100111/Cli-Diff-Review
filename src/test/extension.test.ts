@@ -965,6 +965,8 @@ suite('Review state', () => {
 		const pendingUri = vscode.Uri.file('D:/repo/src/pending.ts');
 		const reviewedUri = vscode.Uri.file('D:/repo/src/reviewed.ts');
 		const skippedUri = vscode.Uri.file('D:/repo/src/skipped.ts');
+		const htmlUri = vscode.Uri.file('D:/repo/src/page.html');
+		const jsonUri = vscode.Uri.file('D:/repo/src/config.json');
 		const pendingHunk = computeLineDiff(pendingUri.toString(), 'a\n', 'b\n')[0];
 		const reviewedHunk = computeLineDiff(reviewedUri.toString(), 'one\n', 'two\n')[0];
 		const session: ReviewSession = {
@@ -980,6 +982,8 @@ suite('Review state', () => {
 				[skippedUri.toString(), reviewFileState(skippedUri, 'src/skipped.ts', {
 					skippedReason: 'File diff exceeds cliDiff.maxDiffCells.',
 				})],
+				[htmlUri.toString(), reviewFileState(htmlUri, 'src/page.html')],
+				[jsonUri.toString(), reviewFileState(jsonUri, 'src/config.json')],
 			]),
 		};
 
@@ -988,10 +992,14 @@ suite('Review state', () => {
 		const pending = payload.files.find((file) => file.relativePath === 'src/pending.ts');
 		const reviewed = payload.files.find((file) => file.relativePath === 'src/reviewed.ts');
 		const skipped = payload.files.find((file) => file.relativePath === 'src/skipped.ts');
+		const html = payload.files.find((file) => file.relativePath === 'src/page.html');
+		const json = payload.files.find((file) => file.relativePath === 'src/config.json');
 
 		assert.deepStrictEqual(empty.files, []);
 		assert.strictEqual(payload.currentReviewLabel, 'pending.ts');
-		assert.strictEqual(payload.files.length, 3);
+		assert.strictEqual(payload.files.length, 5);
+		assert.strictEqual(html?.fileExtension, 'html');
+		assert.strictEqual(json?.fileExtension, 'json');
 		assert.strictEqual(pending?.active, true);
 		assert.strictEqual(pending?.dirty, true);
 		assert.strictEqual(pending?.acceptDisabled, true);
@@ -1262,6 +1270,11 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('function renderRunLogFile'));
 		assert.ok(view.webview.html.includes('function renderRunLogRound'));
 		assert.ok(view.webview.html.includes('function renderReviewFileDetail'));
+		assert.ok(view.webview.html.includes('function restoreScrollTop'));
+		assert.ok(view.webview.html.includes('const listScrollTop = list.scrollTop'));
+		assert.ok(view.webview.html.includes('restoreScrollTop(list, listScrollTop)'));
+		assert.ok(view.webview.html.includes('renderedReviewDetailUri === file.uri'));
+		assert.ok(view.webview.html.includes('restoreScrollTop(reviewFileDetail, detailScrollTop)'));
 		assert.ok(view.webview.html.includes('function aiReviewActionLabel'));
 		assert.ok(view.webview.html.includes("return 'Generate AI review'"));
 		assert.ok(view.webview.html.includes("'Retry AI review'"));
