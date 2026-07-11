@@ -2149,6 +2149,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 
 		function renderRunLog(items, source) {
+			const openRunLogKeys = new Set();
+			for (const details of wikiRunList.querySelectorAll('details[data-run-log-key][open]')) {
+				openRunLogKeys.add(details.dataset.runLogKey);
+			}
+			const runLogScrollTop = wikiRunList.scrollTop;
 			wikiRunList.replaceChildren();
 			wikiRunList.hidden = items.length === 0;
 			const blocks = source === 'review' || items.some((item) => item.source === 'review' || item.fileUri)
@@ -2156,11 +2161,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				: groupRunLog(items);
 			for (const block of blocks) {
 				wikiRunList.appendChild(block.type === 'round'
-					? renderRunLogRound(block)
+					? renderRunLogRound(block, openRunLogKeys)
 					: block.type === 'file'
-						? renderRunLogFile(block)
-					: renderRunLogEntry(block.item));
+						? renderRunLogFile(block, openRunLogKeys)
+					: renderRunLogEntry(block.item, openRunLogKeys));
 			}
+			restoreScrollTop(wikiRunList, runLogScrollTop);
 		}
 
 		function groupRunLog(items) {
@@ -2221,10 +2227,30 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			return [...leading, ...files, ...trailing];
 		}
 
-		function renderRunLogFile(group) {
+		function applyRunLogDetailsState(details, key, openRunLogKeys) {
+			details.dataset.runLogKey = key;
+			details.open = openRunLogKeys.has(key);
+			return details;
+		}
+
+		function runLogFileKey(group) {
+			return 'file:' + (group.fileUri || group.relativePath || '');
+		}
+
+		function runLogRoundKey(group, parentKey) {
+			return (parentKey || '') + 'round:' + group.round;
+		}
+
+		function runLogEntryKey(item, parentKey) {
+			const identity = item.id || (typeof item.sequence === 'number' ? 'sequence:' + item.sequence : item.timestamp || item.title || item.kind || '');
+			return (parentKey || '') + 'event:' + identity;
+		}
+
+		function renderRunLogFile(group, openRunLogKeys) {
 			const details = document.createElement('details');
 			const statusValue = runLogGroupStatus(group.items);
 			details.className = 'wiki-run-file ' + statusValue;
+			applyRunLogDetailsState(details, runLogFileKey(group), openRunLogKeys);
 
 			const summary = document.createElement('summary');
 			summary.className = 'wiki-run-file-summary';
@@ -2246,19 +2272,21 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 
 			const body = document.createElement('div');
 			body.className = 'wiki-run-file-items';
+			const parentKey = runLogFileKey(group) + '/';
 			for (const block of groupRunLog(group.items)) {
 				body.appendChild(block.type === 'round'
-					? renderRunLogRound(block)
-					: renderRunLogEntry(block.item));
+					? renderRunLogRound(block, openRunLogKeys, parentKey)
+					: renderRunLogEntry(block.item, openRunLogKeys, parentKey));
 			}
 			details.appendChild(body);
 			return details;
 		}
 
-		function renderRunLogRound(group) {
+		function renderRunLogRound(group, openRunLogKeys, parentKey) {
 			const details = document.createElement('details');
 			const statusValue = roundStatus(group.items);
 			details.className = 'wiki-run-round ' + statusValue;
+			applyRunLogDetailsState(details, runLogRoundKey(group, parentKey), openRunLogKeys);
 
 			const summary = document.createElement('summary');
 			summary.className = 'wiki-run-round-summary';
@@ -2280,16 +2308,17 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const body = document.createElement('div');
 			body.className = 'wiki-run-round-items';
 			for (const item of group.items) {
-				body.appendChild(renderRunLogEntry(item));
+				body.appendChild(renderRunLogEntry(item, openRunLogKeys, (parentKey || '') + 'round:' + group.round + '/'));
 			}
 			details.appendChild(body);
 			return details;
 		}
 
-		function renderRunLogEntry(item) {
+		function renderRunLogEntry(item, openRunLogKeys, parentKey) {
 			const details = document.createElement('details');
 			details.className = 'wiki-run-item ' + (item.status || 'info');
 			details.id = item.id || '';
+			applyRunLogDetailsState(details, runLogEntryKey(item, parentKey), openRunLogKeys);
 
 			const summary = document.createElement('summary');
 			summary.className = 'wiki-run-summary';

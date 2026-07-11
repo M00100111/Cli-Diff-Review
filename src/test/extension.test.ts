@@ -1273,6 +1273,15 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('function groupRunLogByFile'));
 		assert.ok(view.webview.html.includes('function renderRunLogFile'));
 		assert.ok(view.webview.html.includes('function renderRunLogRound'));
+		assert.ok(view.webview.html.includes('const openRunLogKeys = new Set()'));
+		assert.ok(view.webview.html.includes('details[data-run-log-key][open]'));
+		assert.ok(view.webview.html.includes('function applyRunLogDetailsState'));
+		assert.ok(view.webview.html.includes('details.dataset.runLogKey = key'));
+		assert.ok(view.webview.html.includes('details.open = openRunLogKeys.has(key)'));
+		assert.ok(view.webview.html.includes('function runLogRoundKey'));
+		assert.ok(view.webview.html.includes('function runLogEntryKey'));
+		assert.ok(view.webview.html.includes('const runLogScrollTop = wikiRunList.scrollTop'));
+		assert.ok(view.webview.html.includes('restoreScrollTop(wikiRunList, runLogScrollTop)'));
 		assert.ok(view.webview.html.includes('function renderReviewFileDetail'));
 		assert.ok(view.webview.html.includes('function restoreScrollTop'));
 		assert.ok(view.webview.html.includes('const pendingScrollTops = new WeakMap()'));
