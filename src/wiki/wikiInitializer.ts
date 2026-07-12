@@ -10,6 +10,7 @@ import { agentsGuidanceStartMarker, removeManagedAgentsGuidance } from './agents
 import { isAbortError, OperationCancelledError, throwIfAborted } from './cancellation';
 import { agentsGuidanceFileName, wikiDirectoryPath } from './paths';
 import { SourceFingerprintDiff, WikiState, WikiStateService } from './state';
+import type { WikiFreshnessAssessment } from './state';
 
 export interface WikiInitializationProgress {
 	message: string;
@@ -140,6 +141,9 @@ export class WikiInitializationService {
 			|| !await this.hasAgentsGuidance(root.uri);
 	}
 
+	public async assessFreshness(root: vscode.WorkspaceFolder, signal?: AbortSignal): Promise<WikiFreshnessAssessment> {
+		return this.stateService.assessFreshness(root, signal);
+	}
 	public async state(rootUri: vscode.Uri): Promise<WikiState | undefined> {
 		return this.stateService.read(rootUri);
 	}

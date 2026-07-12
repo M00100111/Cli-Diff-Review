@@ -55,6 +55,7 @@ import {
 } from './types';
 import { isAbortError } from './wiki/cancellation';
 import { wikiReferencesPath } from './wiki/paths';
+import type { WikiFreshnessAssessment } from './wiki/state';
 import { WikiInitializationService } from './wiki/wikiInitializer';
 
 type InternalWriteSource = 'plugin' | 'human';
@@ -2000,6 +2001,21 @@ export class ReviewController implements vscode.Disposable {
 		}
 	}
 
+	private async aiReviewKnowledgeFreshness(task: WikiInitializationTask, includeWikiTools: boolean): Promise<WikiFreshnessAssessment> {
+		if (includeWikiTools) {
+			return this.wikiInitializationService.assessFreshness(task.root, task.abortController.signal);
+		}
+		return {
+			status: 'unknown',
+			checkedAt: new Date().toISOString(),
+			addedSourcePaths: [],
+			modifiedSourcePaths: [],
+			deletedSourcePaths: [],
+			totalChangedSourceCount: 0,
+			reason: 'Wiki is not initialized for this review root.',
+		};
+	}
+
 	private async runAiReview(
 		task: WikiInitializationTask,
 		config: LlmRuntimeConfig,
@@ -2013,6 +2029,7 @@ export class ReviewController implements vscode.Disposable {
 		existingReview?: StoredAiReview,
 	): Promise<void> {
 		try {
+			const knowledgeFreshness = await this.aiReviewKnowledgeFreshness(task, includeWikiTools);
 			const result = await this.codeReviewAgentService.review({
 				session,
 				root: task.root,
@@ -2023,6 +2040,7 @@ export class ReviewController implements vscode.Disposable {
 				fileConcurrency,
 				existingReview,
 				includeWikiTools,
+				knowledgeFreshness,
 				maxRounds,
 				signal: task.abortController.signal,
 				onProgress: (message) => this.currentWikiTask === task
@@ -2272,6 +2290,12 @@ export class ReviewController implements vscode.Disposable {
 		if (reviews.length === 0) {
 			return undefined;
 		}
+		const freshness = reviews
+			.map((review) => review.knowledgeFreshness)
+			.filter((value): value is NonNullable<StoredAiReview['knowledgeFreshness']> => Boolean(value));
+		const knowledgeFreshness = freshness.find((value) => value.status === 'stale')
+			?? freshness.find((value) => value.status === 'unknown')
+			?? freshness[0];
 		return {
 			signature: reviews.map((review) => review.signature).join('\n'),
 			findings: reviews.flatMap((review) => review.findings),
@@ -2280,6 +2304,12 @@ export class ReviewController implements vscode.Disposable {
 			generatedAt: reviews.map((review) => review.generatedAt).sort().at(-1) ?? new Date(0).toISOString(),
 			status: reviews.every((review) => review.status === 'complete') ? 'complete' : 'partial',
 			completedFiles: reviews.flatMap((review) => review.completedFiles),
+			knowledgeContextSummary: reviews.map((review) => review.knowledgeContextSummary).filter(Boolean).join('\n') || undefined,
+			knowledgeFreshness,
+			knowledgeClaims: reviews.flatMap((review) => review.knowledgeClaims ?? []),
+			completedIntegration: reviews.some((review) => review.completedIntegration === false)
+				? false
+				: reviews.every((review) => review.completedIntegration === true) ? true : undefined,
 			failedFile: reviews.find((review) => review.failedFile)?.failedFile,
 			error: reviews.find((review) => review.error)?.error,
 		};
@@ -2872,6 +2902,7 @@ export class ReviewController implements vscode.Disposable {
 			aiReviewCompletedFileCount: update.aiReviewCompletedFileCount ?? aiReviewCompletedFileCount,
 			aiReviewTotalFileCount: update.aiReviewTotalFileCount ?? aiReviewTotalFileCount,
 			aiReviewError: update.aiReviewError ?? storedReview?.error,
+			aiReviewKnowledgeFreshness: storedReview?.knowledgeFreshness,
 		};
 		this.dashboardProvider.refresh();
 	}

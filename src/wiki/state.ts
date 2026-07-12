@@ -2,7 +2,7 @@ import { createHash } from 'crypto';
 import * as vscode from 'vscode';
 import { gitIgnoredReviewPaths, normalizeReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
 import { decodeUtf8, encodeUtf8, isProbablyBinary, relativePath } from '../text';
-import { throwIfAborted } from './cancellation';
+import { isAbortError, throwIfAborted } from './cancellation';
 import {
 	agentsDirectoryName,
 	isGeneratedAgentsGuidancePath,
@@ -33,9 +33,22 @@ export interface SourceFingerprintDiff {
 	deleted: string[];
 	current: Record<string, string>;
 }
+export type WikiFreshnessStatus = 'fresh' | 'stale' | 'unknown';
+
+export interface WikiFreshnessAssessment {
+	status: WikiFreshnessStatus;
+	checkedAt: string;
+	lastSyncedAt?: string;
+	addedSourcePaths: string[];
+	modifiedSourcePaths: string[];
+	deletedSourcePaths: string[];
+	totalChangedSourceCount: number;
+	reason?: string;
+}
 
 const sourceMaxFiles = 5000;
 const sourceMaxFileBytes = 2 * 1024 * 1024;
+const freshnessPathLimit = 100;
 
 export class WikiStateService {
 	public constructor(private readonly extensionUri: vscode.Uri) {}
@@ -150,6 +163,49 @@ export class WikiStateService {
 		};
 	}
 
+	public async assessFreshness(root: vscode.WorkspaceFolder, signal?: AbortSignal): Promise<WikiFreshnessAssessment> {
+		const checkedAt = new Date().toISOString();
+		const state = await this.read(root.uri);
+		if (!state || state.status !== 'ready') {
+			return {
+				status: 'unknown',
+				checkedAt,
+				addedSourcePaths: [],
+				modifiedSourcePaths: [],
+				deletedSourcePaths: [],
+				totalChangedSourceCount: 0,
+				reason: !state ? 'Wiki state is unavailable.' : 'Wiki is not ready: ' + state.status + '.',
+			};
+		}
+		try {
+			const diff = await this.sourceDiff(root, state, signal);
+			const totalChangedSourceCount = diff.added.length + diff.modified.length + diff.deleted.length;
+			return {
+				status: totalChangedSourceCount > 0 ? 'stale' : 'fresh',
+				checkedAt,
+				lastSyncedAt: state.lastSyncedAt,
+				addedSourcePaths: diff.added.slice(0, freshnessPathLimit),
+				modifiedSourcePaths: diff.modified.slice(0, freshnessPathLimit),
+				deletedSourcePaths: diff.deleted.slice(0, freshnessPathLimit),
+				totalChangedSourceCount,
+				reason: totalChangedSourceCount > 0 ? 'Source files changed since the last Wiki synchronization.' : undefined,
+			};
+		} catch (error) {
+			if (isAbortError(error)) {
+				throw error;
+			}
+			return {
+				status: 'unknown',
+				checkedAt,
+				lastSyncedAt: state.lastSyncedAt,
+				addedSourcePaths: [],
+				modifiedSourcePaths: [],
+				deletedSourcePaths: [],
+				totalChangedSourceCount: 0,
+				reason: error instanceof Error ? error.message : String(error),
+			};
+		}
+	}
 	public async computeSourceFingerprints(root: vscode.WorkspaceFolder, signal?: AbortSignal): Promise<Record<string, string>> {
 		throwIfAborted(signal);
 		const uris = await vscode.workspace.findFiles(

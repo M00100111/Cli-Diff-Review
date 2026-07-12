@@ -1440,6 +1440,11 @@ suite('Review state', () => {
 		assert.strictEqual(view.webview.html.includes("type: applied ? 'undoAiSuggestion' : 'applyAiSuggestion'"), false);
 		assert.ok(view.webview.html.includes('review-file-result'));
 		assert.ok(view.webview.html.includes("details.setAttribute('open', '')"));
+		assert.ok(view.webview.html.includes('const reviewChunkOpenStates = new Map()'));
+		assert.ok(view.webview.html.includes('details.dataset.reviewChunkKey = chunkKey'));
+		assert.ok(view.webview.html.includes('reviewChunkOpenStates.has(chunkKey)'));
+		assert.ok(view.webview.html.includes("details.addEventListener('toggle'"));
+		assert.ok(view.webview.html.includes('reviewChunkOpenStates.set(chunkKey, details.open)'));
 		assert.strictEqual(view.webview.html.includes('No findings for this chunk.'), false);
 		assert.ok(view.webview.html.includes("chunk.reviewStatus === 'reviewed'"));
 		assert.strictEqual(view.webview.html.includes('review-chunk-preview'), false);
@@ -2570,6 +2575,10 @@ suite('Agent runtime', () => {
 		const toolsWithWiki = createReadOnlyAgentTools({ root: workspaceFolder('/repo'), reviewSession: session, includeWikiTools: true });
 		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'list_wiki_files'), true);
 		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'read_wiki_file'), true);
+		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'search_workspace'), true);
+		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'read_workspace_file'), true);
+		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'read_pending_change'), true);
+		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'write_wiki_file'), false);
 		const list = await tools.find((tool) => tool.name === 'list_workspace_files')?.execute({}, undefined) as { files: string[] };
 		const read = await tools.find((tool) => tool.name === 'read_workspace_file')?.execute({ path: 'src/deleted.ts' }, undefined) as {
 			content: string;
@@ -2669,11 +2678,22 @@ suite('Wiki state', () => {
 			writeRepoFile(repositoryRoot, 'AGENTS.md', mergeManagedAgentsGuidance(undefined, '# Project Agents\n\nRead the wiki.'));
 			assert.strictEqual(await initialization.needsUpdate(folder), false);
 
+			const fresh = await service.assessFreshness(folder);
+			assert.strictEqual(fresh.status, 'fresh');
+			assert.strictEqual(fresh.totalChangedSourceCount, 0);
+
 			writeRepoFile(repositoryRoot, 'src/app.ts', 'export const value = 2;\n');
 			writeRepoFile(repositoryRoot, 'src/new.ts', 'export const next = true;\n');
 			const diff = await service.sourceDiff(folder, ready);
 			assert.deepStrictEqual(diff.added, ['src/new.ts']);
 			assert.deepStrictEqual(diff.modified, ['src/app.ts']);
+			const stale = await service.assessFreshness(folder);
+			assert.strictEqual(stale.status, 'stale');
+			assert.strictEqual(stale.totalChangedSourceCount, 2);
+			assert.deepStrictEqual(stale.addedSourcePaths, ['src/new.ts']);
+			assert.deepStrictEqual(stale.modifiedSourcePaths, ['src/app.ts']);
+			const unknown = await service.assessFreshness(workspaceFolder(path.join(repositoryRoot, 'missing-root')));
+			assert.strictEqual(unknown.status, 'unknown');
 		} finally {
 			fs.rmSync(extensionRoot, { recursive: true, force: true });
 			fs.rmSync(repositoryRoot, { recursive: true, force: true });
@@ -2839,6 +2859,74 @@ suite('AI review findings', () => {
 		assert.deepStrictEqual(integrationFinding?.relatedPaths, ['src/caller.ts']);
 	});
 
+
+	test('retrieves Wiki context with source tools and preserves freshness claims', async () => {
+		const firstUri = vscode.Uri.file('/repo/src/api.ts');
+		const secondUri = vscode.Uri.file('/repo/src/caller.ts');
+		const firstHunk = computeLineDiff(firstUri.toString(), 'old\n', 'new\n')[0];
+		const secondHunk = computeLineDiff(secondUri.toString(), 'old\n', 'new\n')[0];
+		const session: ReviewSession = {
+			id: 'ai-review-knowledge-freshness',
+			mode: 'git',
+			rootUri: vscode.Uri.file('/repo'),
+			createdAt: 1,
+			files: new Map([
+				[firstUri.toString(), reviewFileState(firstUri, 'src/api.ts', { hunks: [firstHunk] })],
+				[secondUri.toString(), reviewFileState(secondUri, 'src/caller.ts', { hunks: [secondHunk] })],
+			]),
+		};
+		const freshness = {
+			status: 'stale' as const,
+			checkedAt: '2026-07-12T00:00:00.000Z',
+			lastSyncedAt: '2026-07-11T00:00:00.000Z',
+			addedSourcePaths: [],
+			modifiedSourcePaths: ['src/api.ts'],
+			deletedSourcePaths: [],
+			totalChangedSourceCount: 1,
+			reason: 'Source files changed since the last Wiki synchronization.',
+		};
+		const responses = [
+			'{"type":"final","result":{"summary":"KB context","relevantPages":["interfaces.md"],"knowledgeClaims":[{"page":"interfaces.md","claim":"API returns new","status":"confirmed","evidencePaths":["src/api.ts:1"],"confidence":0.9},{"page":"bad","claim":"drop","status":"invalid","evidencePaths":[],"confidence":2}]}}',
+			'{"type":"final","result":{"summary":"Plan","filePlans":{"src/api.ts":"Check API.","src/caller.ts":"Check caller."}}}',
+			'{"type":"final","result":{"findings":[],"suggestions":[]}}',
+			'{"type":"final","result":{"findings":[],"suggestions":[]}}',
+			'{"type":"final","result":{"findings":[]}}'
+		];
+		const requests: Array<{ system: string; user: string; tools: string[] }> = [];
+		const result = await new CodeReviewAgentService().review({
+			session,
+			root: workspaceFolder('/repo'),
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: {
+				completeJson: async (request) => {
+					requests.push({
+						system: request.messages?.find((message) => message.role === 'system')?.content ?? '',
+						user: request.messages?.find((message) => message.role === 'user')?.content ?? '',
+						tools: (request.tools ?? []).map((tool) => tool.name),
+					});
+					return responses.shift() ?? '{"type":"final","result":{"findings":[]}}';
+				},
+			},
+			language: 'en',
+			strategy: 'Multi',
+			includeWikiTools: true,
+			knowledgeFreshness: freshness,
+		});
+
+		assert.strictEqual(requests.length, 5);
+		assert.ok(requests[0].system.includes('current source code is authoritative'));
+		assert.ok(requests[0].tools.includes('read_workspace_file'));
+		assert.ok(requests[0].tools.includes('search_workspace'));
+		assert.ok(requests[0].tools.includes('read_wiki_file'));
+		assert.strictEqual(requests[0].tools.includes('write_wiki_file'), false);
+		assert.ok(requests[0].user.includes('"status":"stale"'));
+		assert.ok(requests[4].user.includes('Knowledge claims to verify:'));
+		assert.ok(requests[4].user.includes('API returns new'));
+		assert.strictEqual(result.knowledgeFreshness?.status, 'stale');
+		assert.strictEqual(result.knowledgeClaims?.length, 1);
+		assert.strictEqual(result.findings.length, 0);
+	});
+
 	test('resumes partial multi-agent review by rerunning only integration', async () => {
 		const apiUri = vscode.Uri.file('/repo/src/api.ts');
 		const callerUri = vscode.Uri.file('/repo/src/caller.ts');
@@ -2889,7 +2977,7 @@ suite('AI review findings', () => {
 			client: {
 				completeJson: async (request) => {
 					retryPrompts.push(request.messages?.find((message) => message.role === 'user')?.content ?? '');
-					return '{"type":"final","result":{"findings":[{"hunkId":"' + apiHunk.id + '","relatedHunkIds":["' + callerHunk.id + '"],"severity":"warning","title":"Integration","explanation":"Risk","recommendation":"Fix"}]}}';
+					return '{"type":"final","result":{"findings":[{"hunkId":"' + apiHunk.id + '","relatedHunkIds":["' + callerHunk.id + '"],"severity":"warning","title":"Integration","explanation":"Risk","recommendation":"Fix","evidence":["src/api.ts:1"]}]}}';
 				},
 			},
 			language: 'en',

@@ -6,6 +6,7 @@ import { isJsonObject } from '../llm/json';
 import { ReviewFileState, ReviewHunk, ReviewSession } from '../types';
 import { isAbortError } from '../wiki/cancellation';
 import { isWikiPath } from '../wiki/paths';
+import type { WikiFreshnessAssessment } from '../wiki/state';
 import { createReadOnlyAgentTools } from './tools';
 import { AgentRunner, AgentTraceDetail, AgentTraceEvent } from './runtime';
 
@@ -15,6 +16,16 @@ export type AiReviewLanguage = 'zh-CN' | 'en';
 export type AiReviewStrategy = 'Auto' | 'Multi' | 'FileOnly';
 export type AiReviewPipeline = 'fileOnly' | 'multi';
 export type AiReviewTraceStage = 'knowledge' | 'plan' | 'file' | 'integration';
+
+export type KnowledgeClaimStatus = 'confirmed' | 'conflicted' | 'unverified';
+
+export interface AiReviewKnowledgeClaim {
+	page: string;
+	claim: string;
+	status: KnowledgeClaimStatus;
+	evidencePaths: string[];
+	confidence?: number;
+}
 
 export interface AiReviewFinding {
 	id: string;
@@ -70,6 +81,8 @@ export interface StoredAiReview {
 	pipeline?: AiReviewPipeline;
 	completedIntegration?: boolean;
 	knowledgeContextSummary?: string;
+	knowledgeFreshness?: WikiFreshnessAssessment;
+	knowledgeClaims?: AiReviewKnowledgeClaim[];
 	planSummary?: string;
 	failedFile?: string;
 	error?: string;
@@ -130,6 +143,7 @@ export interface CodeReviewAgentOptions {
 	language: AiReviewLanguage;
 	existingReview?: StoredAiReview;
 	includeWikiTools?: boolean;
+	knowledgeFreshness?: WikiFreshnessAssessment;
 	strategy?: AiReviewStrategy;
 	fileConcurrency?: number;
 	maxRounds?: number | 'unlimited';
@@ -161,6 +175,9 @@ export class CodeReviewAgentService {
 		const limits = aiReviewRunLimits(options.maxRounds);
 		review.strategy = strategy;
 		review.pipeline = pipeline;
+		if (pipeline === 'multi') {
+			review.knowledgeFreshness = normalizeKnowledgeFreshness(options.knowledgeFreshness) ?? review.knowledgeFreshness;
+		}
 		if (pipeline === 'multi' && review.completedIntegration === undefined) {
 			review.completedIntegration = false;
 		}
@@ -170,8 +187,10 @@ export class CodeReviewAgentService {
 		if (pipeline === 'multi' && !review.planSummary) {
 			try {
 				knowledgeContext = await this.runKnowledgeRetrieval(options, files, limits);
-				plan = await this.runPlanning(options, files, knowledgeContext, limits);
 				review.knowledgeContextSummary = knowledgeContext.summary;
+				review.knowledgeFreshness = knowledgeContext.freshness;
+				review.knowledgeClaims = knowledgeContext.claims;
+				plan = await this.runPlanning(options, files, knowledgeContext, limits);
 				review.planSummary = plan.summary;
 				review.completedIntegration = false;
 			} catch (error) {
@@ -187,6 +206,8 @@ export class CodeReviewAgentService {
 					review.pipeline = pipeline;
 					review.completedIntegration = undefined;
 					review.knowledgeContextSummary = undefined;
+					review.knowledgeFreshness = undefined;
+					review.knowledgeClaims = undefined;
 					review.planSummary = undefined;
 					knowledgeContext = storedKnowledgeContext(review, Boolean(options.includeWikiTools));
 					plan = storedReviewPlan(review);
@@ -404,13 +425,13 @@ export class CodeReviewAgentService {
 	): Promise<AiReviewKnowledgeContext> {
 		const context = stageTraceContext('knowledge', files);
 		if (!options.includeWikiTools) {
-			const skipped = defaultKnowledgeContext(false);
+			const skipped = defaultKnowledgeContext(false, options.knowledgeFreshness);
 			emitReviewTrace(options, context, {
 				kind: 'run_complete',
 				title: 'KB Retrieval skipped',
 				summary: skipped.summary,
 				status: 'info',
-				details: [jsonTraceDetail('Knowledge context', skipped)],
+				details: [jsonTraceDetail('Wiki freshness', skipped.freshness), jsonTraceDetail('Knowledge context', skipped)],
 			});
 			return skipped;
 		}
@@ -419,15 +440,26 @@ export class CodeReviewAgentService {
 			config: options.config,
 			client: options.client,
 			systemPrompt: knowledgeRetrievalSystemPrompt(),
-			userPrompt: knowledgeRetrievalUserPrompt(files),
+			userPrompt: knowledgeRetrievalUserPrompt(files, options.knowledgeFreshness),
 			tools: createReadOnlyAgentTools({ root: options.root, reviewSession: options.session, includeWikiTools: true })
-				.filter((tool) => tool.name === 'list_wiki_files' || tool.name === 'read_wiki_file'),
+				.filter((tool) => ['list_wiki_files', 'read_wiki_file', 'search_workspace', 'read_workspace_file', 'read_pending_change', 'list_pending_changes'].includes(tool.name)),
 			signal: options.signal,
 			onProgress: (progress) => options.onProgress?.(`Knowledge: ${progress.message}`),
 			onTrace: (event) => options.onTrace?.(event, context),
 			...stageRunLimits(limits),
 		});
-		return knowledgeContextFromResult(result.result);
+		const knowledgeContext = knowledgeContextFromResult(result.result, options.knowledgeFreshness);
+		emitReviewTrace(options, context, {
+			kind: 'parse_success',
+			title: 'Knowledge context parsed',
+			summary: 'Wiki freshness: ' + (knowledgeContext.freshness?.status ?? 'unknown') + '; ' + knowledgeContext.claims.length + ' claims accepted; ' + knowledgeContext.claimsDropped + ' dropped.',
+			status: knowledgeContext.freshness?.status === 'stale' ? 'info' : 'success',
+			details: [
+				jsonTraceDetail('Wiki freshness', knowledgeContext.freshness),
+				jsonTraceDetail('Knowledge claims', knowledgeContext.claims),
+			],
+		});
+		return knowledgeContext;
 	}
 
 	private async runPlanning(
@@ -558,6 +590,8 @@ function normalizeStoredReview(review: StoredAiReview, signature: string, files:
 		pipeline: review.pipeline === 'multi' ? 'multi' : review.pipeline === 'fileOnly' ? 'fileOnly' : undefined,
 		completedIntegration: typeof review.completedIntegration === 'boolean' ? review.completedIntegration : undefined,
 		knowledgeContextSummary: typeof review.knowledgeContextSummary === 'string' ? review.knowledgeContextSummary : undefined,
+		knowledgeFreshness: normalizeKnowledgeFreshness(review.knowledgeFreshness),
+		knowledgeClaims: normalizeKnowledgeClaims(review.knowledgeClaims),
 		planSummary: typeof review.planSummary === 'string' ? review.planSummary : undefined,
 		failedFile: typeof review.failedFile === 'string' ? review.failedFile : undefined,
 		error: typeof review.error === 'string' ? review.error : undefined,
@@ -571,6 +605,9 @@ interface AiReviewKnowledgeContext {
 	perFileHints: Record<string, string>;
 	interfaceContracts: string[];
 	workflowRisks: string[];
+	freshness?: WikiFreshnessAssessment;
+	claims: AiReviewKnowledgeClaim[];
+	claimsDropped: number;
 }
 
 interface AiReviewPlan {
@@ -607,6 +644,29 @@ function normalizedAiReviewFileConcurrency(value: unknown, pendingFileCount: num
 	return Math.max(1, Math.min(pendingFileCount, configured));
 }
 
+function normalizeKnowledgeFreshness(value: unknown): WikiFreshnessAssessment | undefined {
+	if (!isJsonObject(value) || (value.status !== 'fresh' && value.status !== 'stale' && value.status !== 'unknown') || typeof value.checkedAt !== 'string') {
+		return undefined;
+	}
+	const addedSourcePaths = stringArray(value.addedSourcePaths);
+	const modifiedSourcePaths = stringArray(value.modifiedSourcePaths);
+	const deletedSourcePaths = stringArray(value.deletedSourcePaths);
+	const totalChangedSourceCount = typeof value.totalChangedSourceCount === 'number' && Number.isFinite(value.totalChangedSourceCount) && value.totalChangedSourceCount >= 0 ? Math.floor(value.totalChangedSourceCount) : addedSourcePaths.length + modifiedSourcePaths.length + deletedSourcePaths.length;
+	return {
+		status: value.status,
+		checkedAt: value.checkedAt,
+		lastSyncedAt: typeof value.lastSyncedAt === 'string' ? value.lastSyncedAt : undefined,
+		addedSourcePaths,
+		modifiedSourcePaths,
+		deletedSourcePaths,
+		totalChangedSourceCount,
+		reason: typeof value.reason === 'string' ? value.reason : undefined,
+	};
+}
+
+function normalizeKnowledgeClaims(value: unknown): AiReviewKnowledgeClaim[] {
+	return knowledgeClaimsFromResult(value).claims;
+}
 function normalizeAiReviewStrategy(value: unknown): AiReviewStrategy {
 	return value === 'Multi' || value === 'FileOnly' ? value : 'Auto';
 }
@@ -672,7 +732,19 @@ function emitReviewTrace(options: CodeReviewAgentOptions, context: CodeReviewTra
 	options.onTrace?.(event, context);
 }
 
-function defaultKnowledgeContext(wikiAvailable: boolean): AiReviewKnowledgeContext {
+function unknownKnowledgeFreshness(reason: string): WikiFreshnessAssessment {
+	return {
+		status: 'unknown',
+		checkedAt: new Date().toISOString(),
+		addedSourcePaths: [],
+		modifiedSourcePaths: [],
+		deletedSourcePaths: [],
+		totalChangedSourceCount: 0,
+		reason,
+	};
+}
+
+function defaultKnowledgeContext(wikiAvailable: boolean, freshness?: WikiFreshnessAssessment): AiReviewKnowledgeContext {
 	return {
 		enabled: wikiAvailable,
 		summary: wikiAvailable ? 'Knowledge base context was not retrieved.' : 'Knowledge base is not initialized; KB Retrieval skipped.',
@@ -680,15 +752,20 @@ function defaultKnowledgeContext(wikiAvailable: boolean): AiReviewKnowledgeConte
 		perFileHints: {},
 		interfaceContracts: [],
 		workflowRisks: [],
+		freshness: freshness ?? unknownKnowledgeFreshness(wikiAvailable ? 'Freshness was not checked.' : 'Knowledge base is not initialized.'),
+		claims: [],
+		claimsDropped: 0,
 	};
 }
 
 function storedKnowledgeContext(review: StoredAiReview, wikiAvailable: boolean): AiReviewKnowledgeContext {
-	const context = defaultKnowledgeContext(wikiAvailable);
+	const context = defaultKnowledgeContext(wikiAvailable, review.knowledgeFreshness);
 	if (review.knowledgeContextSummary) {
 		context.summary = review.knowledgeContextSummary;
 		context.enabled = wikiAvailable;
 	}
+	context.claims = review.knowledgeClaims ?? [];
+	context.claimsDropped = 0;
 	return context;
 }
 
@@ -702,7 +779,8 @@ function storedReviewPlan(review: StoredAiReview): AiReviewPlan {
 	};
 }
 
-function knowledgeContextFromResult(result: Record<string, unknown>): AiReviewKnowledgeContext {
+function knowledgeContextFromResult(result: Record<string, unknown>, freshness?: WikiFreshnessAssessment): AiReviewKnowledgeContext {
+	const claims = knowledgeClaimsFromResult(result.knowledgeClaims);
 	return {
 		enabled: true,
 		summary: stringValue(result.summary, 'Knowledge context retrieved.'),
@@ -710,7 +788,32 @@ function knowledgeContextFromResult(result: Record<string, unknown>): AiReviewKn
 		perFileHints: stringRecord(result.perFileHints),
 		interfaceContracts: stringArray(result.interfaceContracts),
 		workflowRisks: stringArray(result.workflowRisks),
+		freshness: freshness ?? unknownKnowledgeFreshness('Freshness was not provided.'),
+		claims: claims.claims,
+		claimsDropped: claims.dropped,
 	};
+}
+
+function knowledgeClaimsFromResult(value: unknown): { claims: AiReviewKnowledgeClaim[]; dropped: number } {
+	if (!Array.isArray(value)) {
+		return { claims: [], dropped: 0 };
+	}
+	const claims: AiReviewKnowledgeClaim[] = [];
+	let dropped = 0;
+	for (const candidate of value) {
+		if (!isJsonObject(candidate) || typeof candidate.page !== 'string' || !candidate.page.trim() || typeof candidate.claim !== 'string' || !candidate.claim.trim() || (candidate.status !== 'confirmed' && candidate.status !== 'conflicted' && candidate.status !== 'unverified') || !Array.isArray(candidate.evidencePaths) || candidate.evidencePaths.some((item) => typeof item !== 'string' || !item.trim()) || (candidate.confidence !== undefined && (typeof candidate.confidence !== 'number' || !Number.isFinite(candidate.confidence) || candidate.confidence < 0 || candidate.confidence > 1))) {
+			dropped += 1;
+			continue;
+		}
+		claims.push({
+			page: candidate.page.trim(),
+			claim: candidate.claim.trim(),
+			status: candidate.status,
+			evidencePaths: uniqueStrings(candidate.evidencePaths),
+			confidence: typeof candidate.confidence === 'number' ? candidate.confidence : undefined,
+		});
+	}
+	return { claims, dropped };
 }
 
 function reviewPlanFromResult(result: Record<string, unknown>, files: ReviewFileState[]): AiReviewPlan {
@@ -800,6 +903,11 @@ function validateIntegrationReviewFindingsWithDiagnostics(result: Record<string,
 			dropped.push({ index, reason: 'Finding must include title, explanation, and recommendation strings.', hunkId: candidate.hunkId, candidate });
 			continue;
 		}
+		const evidence = stringArray(candidate.evidence);
+		if (evidence.length === 0) {
+			dropped.push({ index, reason: 'Integration finding must include current source evidence.', hunkId: candidate.hunkId, candidate });
+			continue;
+		}
 		const relatedHunkIds = uniqueStrings(candidate.relatedHunkIds).filter((hunkId) => hunkId !== primary.hunkId && Boolean(uniqueHunkReference(hunkIndex, hunkId)));
 		const generationOrder = startOrder + findings.length;
 		findings.push({
@@ -812,7 +920,7 @@ function validateIntegrationReviewFindingsWithDiagnostics(result: Record<string,
 			title: candidate.title,
 			explanation: candidate.explanation,
 			recommendation: candidate.recommendation,
-			evidence: stringArray(candidate.evidence),
+			evidence,
 			generationOrder,
 			source: 'integration',
 			relatedHunkIds,
@@ -1163,21 +1271,24 @@ export function sortFindings(
 function knowledgeRetrievalSystemPrompt(): string {
 	return [
 		'You are a source-grounded Knowledge Retrieval Agent for code review.',
-		'Read only repository Wiki pages through the provided Wiki tools.',
-		'Return concise review-relevant context. Do not invent repository facts.',
-		'Finish with {"type":"final","result":{"summary":"...","relevantPages":["architecture.md"],"perFileHints":{"src/app.ts":"..."},"interfaceContracts":["..."],"workflowRisks":["..."]}}.',
+		'Read relevant Wiki pages and use read-only source tools to verify a small number of claims against current code.',
+		'Current source code is authoritative; Wiki content is advisory context and may be stale.',
+		'Never create review findings. Return claims as confirmed, conflicted, or unverified with current code evidence paths.',
+		'When Wiki freshness is stale, keep using it only as low-confidence context and do not treat staleness alone as a finding.',
+		'Finish with {"type":"final","result":{"summary":"...","relevantPages":["architecture.md"],"perFileHints":{"src/app.ts":"..."},"interfaceContracts":["..."],"workflowRisks":["..."],"knowledgeClaims":[{"page":"interfaces.md","claim":"...","status":"confirmed","evidencePaths":["src/api.ts"],"confidence":0.9}]}}.',
 	].join('\n');
 }
 
-function knowledgeRetrievalUserPrompt(files: ReviewFileState[]): string {
+function knowledgeRetrievalUserPrompt(files: ReviewFileState[], freshness?: WikiFreshnessAssessment): string {
 	return [
 		'Retrieve Wiki context relevant to this pending change set.',
 		'Pending changes:',
 		changeSetSummary(files),
-		'Prefer index.md first, then read only pages that are relevant to review risks.',
+		'Controller freshness assessment:',
+		JSON.stringify(freshness ?? unknownKnowledgeFreshness('Freshness was not provided.')),
+		'Prefer index.md first, then read only pages relevant to review risks. Verify only a small number of key contracts in current source.',
 	].join('\n');
 }
-
 function planningSystemPrompt(): string {
 	return [
 		'You are a source-grounded AI Review Planning Agent.',
@@ -1194,6 +1305,10 @@ function planningUserPrompt(files: ReviewFileState[], knowledgeContext: AiReview
 		changeSetSummary(files),
 		'Knowledge context:',
 		JSON.stringify(knowledgeContext),
+		'Wiki freshness:',
+		JSON.stringify(knowledgeContext.freshness),
+		'Knowledge claims to verify:',
+		JSON.stringify(knowledgeContext.claims),
 	].join('\n');
 }
 
@@ -1202,6 +1317,7 @@ function integrationSystemPrompt(language: AiReviewLanguage): string {
 		'You are a source-grounded Integration Review Agent.',
 		'Review the whole pending change set after file-level review. Look only for cross-file, cross-module, workflow, configuration, or contract risks missed by file review.',
 		'Every finding must bind to one primary current hunkId. Put other affected hunk IDs in relatedHunkIds.',
+		'Use current source evidence to confirm any Wiki conflict. Wiki staleness alone is not a finding.',
 		'Do not return code suggestions. Do not duplicate existing file-level findings.',
 		languageInstruction(language),
 		'Finish with {"type":"final","result":{"findings":[{"hunkId":"primary-hunk","relatedHunkIds":["other-hunk"],"relatedPaths":["src/other.ts"],"severity":"warning","title":"...","explanation":"...","recommendation":"...","evidence":["path:line"]}]}}.',
@@ -1217,6 +1333,10 @@ function integrationUserPrompt(files: ReviewFileState[], fileFindings: AiReviewF
 		JSON.stringify(fileFindings.map((finding) => ({ hunkId: finding.hunkId, relativePath: finding.relativePath, severity: finding.severity, title: finding.title, explanation: finding.explanation }))),
 		'Knowledge context:',
 		JSON.stringify(knowledgeContext),
+		'Wiki freshness:',
+		JSON.stringify(knowledgeContext.freshness),
+		'Knowledge claims to verify:',
+		JSON.stringify(knowledgeContext.claims),
 		'Review plan:',
 		JSON.stringify(plan),
 		'Return an empty findings array when no additional integration issue is supported by evidence.',
@@ -1370,6 +1490,8 @@ function cloneStoredReview(review: StoredAiReview): StoredAiReview {
 		pipeline: review.pipeline,
 		completedIntegration: review.completedIntegration,
 		knowledgeContextSummary: review.knowledgeContextSummary,
+		knowledgeFreshness: review.knowledgeFreshness,
+		knowledgeClaims: review.knowledgeClaims ? [...review.knowledgeClaims] : undefined,
 		planSummary: review.planSummary,
 	};
 }

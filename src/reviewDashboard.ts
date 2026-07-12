@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import type { AiReviewChunkSuggestion, AiReviewFileResult, AiReviewFinding } from './agent/codeReview';
 import type { AgentTraceDetail, AgentTraceEventKind, AgentTraceStatus } from './agent/runtime';
 import type { LlmConfigProfile, LlmProvider, LlmThinkingMode } from './llm/config';
+import type { WikiFreshnessAssessment } from './wiki/state';
 import { reviewHunkIdentity } from './reviewState';
 import { currentReviewProject, hasAggregateReviewTarget, ReviewFileState, ReviewHunk, ReviewSession, uriKey, visibleReviewFiles } from './types';
 
@@ -158,6 +159,7 @@ export interface LlmWikiDashboardState {
 	aiReviewCompletedFileCount: number;
 	aiReviewTotalFileCount: number;
 	aiReviewError?: string;
+	aiReviewKnowledgeFreshness?: WikiFreshnessAssessment;
 }
 
 export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vscode.Disposable {
@@ -1542,6 +1544,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		let reviewDetailUri;
 		let renderedReviewDetailUri;
 		const pendingScrollTops = new WeakMap();
+		const reviewChunkOpenStates = new Map();
 		toggle.addEventListener('click', () => setExpanded(!expanded));
 		toggle.addEventListener('keydown', (event) => {
 			if (event.key === 'Enter' || event.key === ' ') {
@@ -1933,6 +1936,13 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					? 'AI review failed after ' + completed + '/' + total + ' files'
 					: 'AI review partial: ' + completed + '/' + total + ' files';
 			}
+			const freshness = wiki.aiReviewKnowledgeFreshness;
+			if (freshness?.status === 'stale') {
+				return 'Wiki knowledge may be stale: ' + freshness.totalChangedSourceCount + ' source files changed since the last synchronization';
+			}
+			if (freshness?.status === 'unknown' && wiki.aiReviewStatus !== 'none') {
+				return 'Wiki freshness is unknown; current source remains authoritative';
+			}
 			if (initialized) {
 				return 'Knowledge base initialized';
 			}
@@ -2028,14 +2038,27 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const findings = chunk.findings || [];
 			const suggestions = chunk.suggestions || [];
 			const expandable = findings.length > 0 || suggestions.length > 0;
+			const chunkKey = file.uri + '#' + chunk.hunkId;
 			const details = document.createElement(expandable ? 'details' : 'div');
 			const kindClass = ['add', 'delete', 'modify'].includes(chunk.kind) ? chunk.kind : 'modify';
 			details.className = 'review-chunk ' + kindClass
 				+ (findings.length > 0 ? ' has-findings' : ' no-findings')
 				+ (suggestions.length > 0 ? ' has-suggestion' : '');
 			if (expandable) {
-				details.open = true;
-				details.setAttribute('open', '');
+				const openState = reviewChunkOpenStates.has(chunkKey)
+					? reviewChunkOpenStates.get(chunkKey)
+					: true;
+				details.dataset.reviewChunkKey = chunkKey;
+				details.open = openState;
+				if (openState) {
+					details.setAttribute('open', '');
+				} else {
+					details.removeAttribute('open');
+				}
+				reviewChunkOpenStates.set(chunkKey, openState);
+				details.addEventListener('toggle', () => {
+					reviewChunkOpenStates.set(chunkKey, details.open);
+				});
 			}
 
 			const summary = document.createElement(expandable ? 'summary' : 'div');
