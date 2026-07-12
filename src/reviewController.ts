@@ -1,6 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { AiReviewLanguage, AiReviewPartialError, AiReviewStore, CodeReviewAgentService, CodeReviewTraceContext, normalizeAiSuggestionReplacementText, reviewChangeSignature, StoredAiReview, sortFindings, sourcePendingFiles } from './agent/codeReview';
+import { AiReviewLanguage, AiReviewPartialError, AiReviewStore, AiReviewStrategy, CodeReviewAgentService, CodeReviewTraceContext, normalizeAiSuggestionReplacementText, reviewChangeSignature, StoredAiReview, sortFindings, sourcePendingFiles } from './agent/codeReview';
 import type { AgentTraceEvent } from './agent/runtime';
 import { acceptHunkInBaseline, computeLineDiff } from './diffEngine';
 import { GitService } from './gitService';
@@ -76,7 +76,7 @@ interface ReviewNavigationTarget extends vscode.QuickPickItem {
 type RunLogSource = 'wiki' | 'review';
 type ReviewEditorMode = 'nativeEditor' | 'reviewPage';
 
-type RunLogMetadata = Pick<LlmWikiRunLogEntry, 'source' | 'fileUri' | 'relativePath' | 'fileIndex' | 'fileCount'>;
+type RunLogMetadata = Pick<LlmWikiRunLogEntry, 'source' | 'stage' | 'fileUri' | 'relativePath' | 'fileIndex' | 'fileCount'>;
 
 interface WikiInitializationTask {
 	kind: 'initialize' | 'update' | 'review';
@@ -180,7 +180,8 @@ export class ReviewController implements vscode.Disposable {
 					this.refreshReviewPresentation();
 				} else if (event.affectsConfiguration('cliDiff.aiReviewFindingOrder')
 					|| event.affectsConfiguration('cliDiff.aiReviewLanguage')
-					|| event.affectsConfiguration('cliDiff.aiReviewMaxRounds')) {
+					|| event.affectsConfiguration('cliDiff.aiReviewMaxRounds')
+					|| event.affectsConfiguration('cliDiff.aiReviewStrategy')) {
 					void this.refreshLlmWikiDashboardState();
 				}
 			}),
@@ -1964,6 +1965,8 @@ export class ReviewController implements vscode.Disposable {
 			this.currentWikiTask = task;
 			const language = vscode.workspace.getConfiguration('cliDiff').get<AiReviewLanguage>('aiReviewLanguage', 'zh-CN');
 			const maxRounds = this.aiReviewMaxRounds();
+			const strategy = this.aiReviewStrategy();
+			const fileConcurrency = this.aiReviewFileConcurrency();
 			const storedReview = this.aiReviewStore.load(session);
 			const existingReview = storedReview?.status === 'partial' ? storedReview : undefined;
 			if (!existingReview) {
@@ -1981,6 +1984,8 @@ export class ReviewController implements vscode.Disposable {
 					model: config.model,
 					language,
 					maxRounds: maxRounds === 'unlimited' ? 'unlimited' : maxRounds,
+					strategy,
+					fileConcurrency,
 					mode: existingReview ? 'continue' : 'generate',
 					wikiContext: includeWikiTools ? 'enabled' : 'disabled',
 					completedFiles: existingReview?.completedFiles.length ?? 0,
@@ -1988,7 +1993,7 @@ export class ReviewController implements vscode.Disposable {
 				})],
 			}, 'review');
 			this.applyLlmWikiDashboardState({ status: 'reviewing', progress: 'Preparing AI review', error: undefined });
-			task.done = this.runAiReview(task, config, createLlmClient(config), session, language, maxRounds, includeWikiTools, existingReview);
+			task.done = this.runAiReview(task, config, createLlmClient(config), session, language, strategy, fileConcurrency, maxRounds, includeWikiTools, existingReview);
 			await task.done;
 		} catch (error) {
 			this.showError(error);
@@ -2001,6 +2006,8 @@ export class ReviewController implements vscode.Disposable {
 		client: LlmClient,
 		session: ReviewSession,
 		language: AiReviewLanguage,
+		strategy: AiReviewStrategy,
+		fileConcurrency: number,
 		maxRounds: number | 'unlimited',
 		includeWikiTools: boolean,
 		existingReview?: StoredAiReview,
@@ -2012,6 +2019,8 @@ export class ReviewController implements vscode.Disposable {
 				config,
 				client,
 				language,
+				strategy,
+				fileConcurrency,
 				existingReview,
 				includeWikiTools,
 				maxRounds,
@@ -2340,6 +2349,16 @@ export class ReviewController implements vscode.Disposable {
 		return config;
 	}
 
+	private aiReviewStrategy(): AiReviewStrategy {
+		const configured = vscode.workspace.getConfiguration('cliDiff').get<string>('aiReviewStrategy', 'Auto');
+		return configured === 'Multi' || configured === 'FileOnly' ? configured : 'Auto';
+	}
+	private aiReviewFileConcurrency(): number {
+		const configured = vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewFileConcurrency', 1);
+		return typeof configured === 'number' && Number.isFinite(configured)
+			? Math.max(0, Math.floor(configured))
+			: 1;
+	}
 	private aiReviewMaxRounds(): number | 'unlimited' {
 		const configured = vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewMaxRounds', 64);
 		if (configured === 0) {
@@ -2697,6 +2716,7 @@ export class ReviewController implements vscode.Disposable {
 			sequence: this.wikiRunLogSequence,
 			timestamp: new Date().toISOString(),
 			source: metadata.source ?? this.wikiRunLogSource ?? 'wiki',
+			stage: metadata.stage,
 			fileUri: metadata.fileUri,
 			relativePath: metadata.relativePath,
 			fileIndex: metadata.fileIndex,
@@ -2726,6 +2746,7 @@ export class ReviewController implements vscode.Disposable {
 	private reviewRunLogMetadata(context: CodeReviewTraceContext): RunLogMetadata {
 		return {
 			source: 'review',
+			stage: context.stage,
 			fileUri: context.fileUri,
 			relativePath: context.relativePath,
 			fileIndex: context.fileIndex,

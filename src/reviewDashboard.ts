@@ -44,13 +44,22 @@ type DashboardMessage =
 	| { type: 'undoAiSuggestion'; uri: string; hunkId: string; suggestionId: string }
 	| { type: 'cancelAgent' };
 
+export interface ReviewDashboardRelatedChunk {
+	uri: string;
+	hunkId: string;
+	relativePath: string;
+	line: number;
+}
+
+export type ReviewDashboardFinding = AiReviewFinding & { relatedChunks?: ReviewDashboardRelatedChunk[] };
+
 export interface ReviewDashboardChunk {
 	hunkId: string;
 	kind: string;
 	line: number;
 	oldLines: number;
 	newLines: number;
-	findings: AiReviewFinding[];
+	findings: ReviewDashboardFinding[];
 	suggestions: AiReviewChunkSuggestion[];
 	appliedSuggestion?: {
 		suggestionId: string;
@@ -105,6 +114,7 @@ export interface LlmWikiRunLogEntry {
 	sequence: number;
 	timestamp: string;
 	source?: 'wiki' | 'review';
+	stage?: 'knowledge' | 'plan' | 'file' | 'integration';
 	fileUri?: string;
 	relativePath?: string;
 	fileIndex?: number;
@@ -133,7 +143,7 @@ export interface LlmWikiDashboardState {
 	wikiInitializationAvailable?: boolean;
 	wikiUpdateAvailable?: boolean;
 	wikiOpenAvailable?: boolean;
-	findings: AiReviewFinding[];
+	findings: ReviewDashboardFinding[];
 	jsonOutputEnabled: boolean;
 	thinkingMode: LlmThinkingMode;
 	strictTools: boolean;
@@ -1007,6 +1017,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			line-height: 1.35;
 			overflow-wrap: anywhere;
 		}
+		.review-related-chunks { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+		.review-related-chunk { border: 1px solid var(--tree-border); border-radius: 3px; background: transparent; color: var(--accent); font-size: 10px; line-height: 16px; padding: 0 5px; cursor: pointer; }
+		.review-related-chunk:hover { background: var(--toolbar-hover); }
 		.review-suggestion {
 			border: 1px solid color-mix(in srgb, var(--vscode-editorInfo-foreground) 42%, transparent);
 			border-radius: 4px;
@@ -2126,17 +2139,27 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 
 		function renderReviewChunkFinding(file, finding) {
-			const button = document.createElement('button');
-			button.className = 'review-finding ' + finding.severity;
-			button.title = finding.explanation + '\\n\\n' + finding.recommendation;
-			button.addEventListener('click', () => vscode.postMessage({ type: 'openFinding', uri: file.uri, hunkId: finding.hunkId }));
+			const container = document.createElement('div');
+			container.className = 'review-finding ' + finding.severity;
+			container.title = finding.explanation + '\\n\\n' + finding.recommendation;
+			container.setAttribute('role', 'button');
+			container.tabIndex = 0;
+			const openPrimary = () => vscode.postMessage({ type: 'openFinding', uri: file.uri, hunkId: finding.hunkId });
+			container.addEventListener('click', openPrimary);
+			container.addEventListener('keydown', (event) => {
+				if (event.target !== container || (event.key !== 'Enter' && event.key !== ' ')) {
+					return;
+				}
+				event.preventDefault();
+				openPrimary();
+			});
 			const marker = document.createElement('span');
 			marker.className = 'review-finding-marker';
-			button.appendChild(marker);
+			container.appendChild(marker);
 			const body = document.createElement('span');
 			const title = document.createElement('span');
 			title.className = 'review-finding-title';
-			title.textContent = finding.severity + ': ' + finding.title;
+			title.textContent = (finding.source === 'integration' ? 'integration ' : '') + finding.severity + ': ' + finding.title;
 			const explanation = document.createElement('span');
 			explanation.className = 'review-finding-text';
 			explanation.textContent = finding.explanation;
@@ -2144,8 +2167,25 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			recommendation.className = 'review-finding-text';
 			recommendation.textContent = finding.recommendation;
 			body.append(title, explanation, recommendation);
-			button.appendChild(body);
-			return button;
+			if (finding.relatedChunks && finding.relatedChunks.length > 0) {
+				const related = document.createElement('span');
+				related.className = 'review-related-chunks';
+				for (const chunk of finding.relatedChunks) {
+					const relatedButton = document.createElement('button');
+					relatedButton.type = 'button';
+					relatedButton.className = 'review-related-chunk';
+					relatedButton.textContent = chunk.relativePath + ':' + (chunk.line + 1);
+					relatedButton.title = 'Open related chunk ' + chunk.relativePath + ':' + (chunk.line + 1);
+					relatedButton.addEventListener('click', (event) => {
+						event.stopPropagation();
+						vscode.postMessage({ type: 'openChunk', uri: chunk.uri, hunkId: chunk.hunkId });
+					});
+					related.appendChild(relatedButton);
+				}
+				body.appendChild(related);
+			}
+			container.appendChild(body);
+			return container;
 		}
 
 		function renderRunLog(items, source) {
@@ -2612,18 +2652,20 @@ export function buildReviewDashboardPayload(
 	llmWiki: LlmWikiDashboardState = defaultLlmWikiDashboardState(),
 ): ReviewDashboardPayload {
 	const currentKey = currentReviewUri ? uriKey(currentReviewUri) : undefined;
-	const findingsByChunk = new Map<string, AiReviewFinding[]>();
-	const findingsByFile = new Map<string, AiReviewFinding[]>();
+	const hunkLinksById = dashboardHunkLinks(session);
+	const findingsByChunk = new Map<string, ReviewDashboardFinding[]>();
+	const findingsByFile = new Map<string, ReviewDashboardFinding[]>();
 	const suggestionsByChunk = new Map<string, AiReviewChunkSuggestion[]>();
 	const suggestionsByFile = new Map<string, AiReviewChunkSuggestion[]>();
 	const fileResultsByUri = new Map((llmWiki.aiReviewFileResults ?? []).map((result) => [result.uri, result]));
 	for (const finding of llmWiki.reviewFindings ?? []) {
+		const dashboardFinding = dashboardFindingWithRelatedChunks(finding, hunkLinksById);
 		const key = `${finding.uri}#${finding.hunkId}`;
 		const list = findingsByChunk.get(key) ?? [];
-		list.push(finding);
+		list.push(dashboardFinding);
 		findingsByChunk.set(key, list);
 		const fileList = findingsByFile.get(finding.uri) ?? [];
-		fileList.push(finding);
+		fileList.push(dashboardFinding);
 		findingsByFile.set(finding.uri, fileList);
 	}
 	for (const suggestion of llmWiki.reviewSuggestions ?? []) {
@@ -2733,11 +2775,43 @@ export function defaultLlmWikiDashboardState(): LlmWikiDashboardState {
 	};
 }
 
+function dashboardHunkLinks(session: ReviewSession | undefined): Map<string, ReviewDashboardRelatedChunk[]> {
+	const links = new Map<string, ReviewDashboardRelatedChunk[]>();
+	for (const file of visibleReviewFiles(session)) {
+		for (const hunk of file.hunks) {
+			addDashboardHunkLink(links, hunk.id, { uri: file.uri.toString(), hunkId: hunk.id, relativePath: file.relativePath, line: hunk.newStart });
+		}
+		for (const hunk of [...file.acceptedHunks, ...file.rejectedHunks]) {
+			const link = { uri: file.uri.toString(), hunkId: hunk.id, relativePath: file.relativePath, line: hunk.displayStart };
+			addDashboardHunkLink(links, hunk.id, link);
+			const original = originalReviewedHunkId(hunk.id);
+			if (original !== hunk.id) {
+				addDashboardHunkLink(links, original, { ...link, hunkId: original });
+			}
+		}
+	}
+	return links;
+}
+
+function addDashboardHunkLink(links: Map<string, ReviewDashboardRelatedChunk[]>, key: string, link: ReviewDashboardRelatedChunk): void {
+	const list = links.get(key) ?? [];
+	if (!list.some((item) => item.uri === link.uri && item.hunkId === link.hunkId)) {
+		list.push(link);
+	}
+	links.set(key, list);
+}
+
+function dashboardFindingWithRelatedChunks(finding: AiReviewFinding, links: Map<string, ReviewDashboardRelatedChunk[]>): ReviewDashboardFinding {
+	const relatedChunks = (finding.relatedHunkIds ?? [])
+		.flatMap((hunkId) => links.get(hunkId) ?? [])
+		.filter((link, index, items) => items.findIndex((item) => item.uri === link.uri && item.hunkId === link.hunkId) === index);
+	return relatedChunks.length > 0 ? { ...finding, relatedChunks } : finding;
+}
 function dashboardChunks(
 	file: ReviewFileState,
 	pendingHunks: ReviewHunk[],
-	findingsByChunk: Map<string, AiReviewFinding[]>,
-	findingsByFile: Map<string, AiReviewFinding[]>,
+	findingsByChunk: Map<string, ReviewDashboardFinding[]>,
+	findingsByFile: Map<string, ReviewDashboardFinding[]>,
 	suggestionsByChunk: Map<string, AiReviewChunkSuggestion[]>,
 	suggestionsByFile: Map<string, AiReviewChunkSuggestion[]>,
 	mutationDisabled: boolean,

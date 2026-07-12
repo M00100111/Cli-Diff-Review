@@ -46,6 +46,14 @@ export function createReadOnlyAgentTools(options: AgentToolOptions): AgentTool[]
 		}), async (args, signal) => {
 			return searchWorkspace(options, stringArgument(args, 'query'), numberArgument(args, 'limit', 50), signal);
 		}),
+		tool('list_pending_changes', 'List all pending review changes and their hunks. Arguments: {}.', objectSchema({}), async (_args, signal) => {
+			throwIfAborted(signal);
+			return { files: pendingChangeFiles(options) };
+		}),
+		tool('read_pending_change', 'Read pending review hunks for one file. Arguments: {"path":"src/app.ts"}.', objectSchema({ path: stringSchema('Repository-relative pending review path.') }), async (args, signal) => {
+			throwIfAborted(signal);
+			return readPendingChange(options, stringArgument(args, 'path'));
+		}),
 	];
 	if (!options.includeWikiTools) {
 		return tools;
@@ -243,6 +251,47 @@ async function searchWorkspace(options: AgentToolOptions, query: string, limit: 
 	return { matches };
 }
 
+function pendingChangeFiles(options: AgentToolOptions): Array<{ path: string; uri: string; currentExists: boolean; hunks: Array<Record<string, unknown>> }> {
+	return reviewSnapshotFiles(options)
+		.filter((file) => file.hunks.length > 0)
+		.map((file) => ({
+			path: file.relativePath,
+			uri: file.uri.toString(),
+			currentExists: file.currentExists,
+			hunks: file.hunks.map(pendingHunkForTool),
+		}));
+}
+
+function readPendingChange(options: AgentToolOptions, candidate: string): { path: string; uri: string; oldText: string; newText: string; currentExists: boolean; hunks: Array<Record<string, unknown>> } {
+	const normalized = normalizeSafeRelativePath(candidate);
+	const file = reviewSnapshotFiles(options).find((item) => item.relativePath === normalized);
+	if (!file) {
+		throw new Error(`Pending review file not found: ${candidate}`);
+	}
+	return {
+		path: file.relativePath,
+		uri: file.uri.toString(),
+		oldText: file.oldText,
+		newText: file.newText,
+		currentExists: file.currentExists,
+		hunks: file.hunks.map(pendingHunkForTool),
+	};
+}
+
+function pendingHunkForTool(hunk: ReviewFileState['hunks'][number]): Record<string, unknown> {
+	return {
+		hunkId: hunk.id,
+		kind: hunk.kind,
+		oldStart: hunk.oldStart,
+		newStart: hunk.newStart,
+		oldLines: hunk.oldLines,
+		newLines: hunk.newLines,
+		oldText: hunk.oldText,
+		newText: hunk.newText,
+		contextBefore: hunk.newContextBefore,
+		contextAfter: hunk.newContextAfter,
+	};
+}
 function reviewSnapshotFiles(options: AgentToolOptions): ReviewFileState[] {
 	return options.reviewSession
 		? [...options.reviewSession.files.values()]

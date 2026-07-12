@@ -344,6 +344,41 @@ suite('Extension configuration', () => {
 		assert.match(String(setting.description), /0 means unlimited/);
 	});
 
+	test('declares AI review strategy setting defaults', () => {
+		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+			contributes?: { configuration?: { properties?: Record<string, unknown> } };
+		};
+		const setting = manifest.contributes?.configuration?.properties?.['cliDiff.aiReviewStrategy'] as {
+			type?: unknown;
+			default?: unknown;
+			enum?: unknown[];
+		} | undefined;
+
+		assert.ok(setting);
+		assert.strictEqual(setting.type, 'string');
+		assert.strictEqual(setting.default, 'Auto');
+		assert.deepStrictEqual(setting.enum, ['Auto', 'Multi', 'FileOnly']);
+	});
+
+
+	test('declares AI review file concurrency setting defaults', () => {
+		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+			contributes?: { configuration?: { properties?: Record<string, unknown> } };
+		};
+		const setting = manifest.contributes?.configuration?.properties?.['cliDiff.aiReviewFileConcurrency'] as {
+			type?: unknown;
+			default?: unknown;
+			minimum?: unknown;
+			description?: unknown;
+		} | undefined;
+
+		assert.ok(setting);
+		assert.strictEqual(setting.type, 'number');
+		assert.strictEqual(setting.default, 1);
+		assert.strictEqual(setting.minimum, 0);
+		assert.match(String(setting.description), /0 runs all pending files concurrently/);
+	});
+
 	test('declares review editor mode setting defaults', () => {
 		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
 			contributes?: { configuration?: { properties?: Record<string, unknown> } };
@@ -416,7 +451,15 @@ suite('Review controller bulk actions', () => {
 		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
 
 		assert.ok(source.includes("event.affectsConfiguration('cliDiff.aiReviewMaxRounds')"));
+		assert.ok(source.includes("event.affectsConfiguration('cliDiff.aiReviewStrategy')"));
+		assert.ok(source.includes("event.affectsConfiguration('cliDiff.aiReviewFileConcurrency')"));
 		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewMaxRounds', 64)"));
+		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<string>('aiReviewStrategy', 'Auto')"));
+		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewFileConcurrency', 1)"));
+		assert.ok(source.includes('const strategy = this.aiReviewStrategy();'));
+		assert.ok(source.includes('const fileConcurrency = this.aiReviewFileConcurrency();'));
+		assert.ok(source.includes('strategy,'));
+		assert.ok(source.includes('fileConcurrency,'));
 		assert.ok(source.includes("return 'unlimited';"));
 		assert.ok(source.includes('const existingReview = storedReview?.status === \'partial\' ? storedReview : undefined;'));
 		assert.ok(source.includes('existingReview,'));
@@ -1183,6 +1226,53 @@ suite('Review state', () => {
 		assert.strictEqual(otherFileChunk?.findings[0].title, 'Other file finding');
 	});
 
+	test('maps AI review related hunk ids to dashboard related chunks', () => {
+		const primaryUri = vscode.Uri.file('D:/repo/src/primary.ts');
+		const relatedUri = vscode.Uri.file('D:/repo/src/related.ts');
+		const primaryHunk = computeLineDiff(primaryUri.toString(), 'old\n', 'new\n')[0];
+		const relatedHunk = computeLineDiff(relatedUri.toString(), 'before\n', 'after\n')[0];
+		const session: ReviewSession = {
+			id: 'dashboard-related-chunks',
+			mode: 'git',
+			rootUri: vscode.Uri.file('D:/repo'),
+			createdAt: 1,
+			files: new Map([
+				[primaryUri.toString(), reviewFileState(primaryUri, 'src/primary.ts', { hunks: [primaryHunk] })],
+				[relatedUri.toString(), reviewFileState(relatedUri, 'src/related.ts', { hunks: [relatedHunk] })],
+			]),
+		};
+
+		const payload = buildReviewDashboardPayload(session, primaryUri, () => false, {
+			...defaultLlmWikiDashboardState(),
+			reviewFindings: [{
+				id: 'integration-finding',
+				uri: primaryUri.toString(),
+				relativePath: 'src/primary.ts',
+				hunkId: primaryHunk.id,
+				line: primaryHunk.newStart,
+				severity: 'warning',
+				title: 'Cross-file contract',
+				explanation: 'Risk',
+				recommendation: 'Fix',
+				evidence: [],
+				generationOrder: 0,
+				source: 'integration',
+				relatedHunkIds: [relatedHunk.id, 'missing-related-hunk'],
+			}],
+		});
+
+		const finding = payload.files
+			.find((file) => file.relativePath === 'src/primary.ts')
+			?.chunks.find((chunk) => chunk.hunkId === primaryHunk.id)
+			?.findings[0];
+		assert.deepStrictEqual(finding?.relatedChunks, [{
+			uri: relatedUri.toString(),
+			hunkId: relatedHunk.id,
+			relativePath: 'src/related.ts',
+			line: relatedHunk.newStart,
+		}]);
+	});
+
 	test('deduplicates dashboard chunks when reviewed hunks reappear as pending', () => {
 		const uri = vscode.Uri.file('D:/repo/src/duplicate.ts');
 		const rejectedUri = vscode.Uri.file('D:/repo/src/rejected-duplicate.ts');
@@ -1320,6 +1410,9 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('rejectAllButton.disabled = pendingCount === 0'));
 		assert.ok(view.webview.html.includes('undoAllButton.disabled = reviewedCount === 0'));
 		assert.ok(view.webview.html.includes('openChunk'));
+		assert.ok(view.webview.html.includes('review-related-chunk'));
+		assert.ok(view.webview.html.includes("vscode.postMessage({ type: 'openChunk', uri: chunk.uri, hunkId: chunk.hunkId })"));
+		assert.ok(view.webview.html.includes("container.title = finding.explanation + '\\n\\n' + finding.recommendation;"));
 		assert.ok(view.webview.html.includes("chunkActionButton('acceptChunk'"));
 		assert.ok(view.webview.html.includes("chunkActionButton('rejectChunk'"));
 		assert.ok(view.webview.html.includes("chunkActionButton('undoChunk'"));
@@ -2617,17 +2710,197 @@ suite('AI review findings', () => {
 			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
 			client: { completeJson: async () => responses.shift() ?? '' },
 			language: 'en',
+			strategy: 'FileOnly',
 			onTrace: (event, context) => trace.push({
 				event,
-				relativePath: context.relativePath,
-				fileIndex: context.fileIndex,
-				fileCount: context.fileCount,
+				relativePath: context.relativePath ?? '',
+				fileIndex: context.fileIndex ?? 0,
+				fileCount: context.fileCount ?? 0,
 			}),
 		});
 
 		assert.strictEqual(result.findings.length, 2);
 		assert.ok(trace.some((item) => item.event.kind === 'llm_request' && item.relativePath === 'src/a.ts' && item.fileIndex === 1 && item.fileCount === 2));
 		assert.ok(trace.some((item) => item.event.title === 'Review findings parsed' && item.relativePath === 'src/b.ts'));
+	});
+
+
+	test('runs file review concurrently when file concurrency is zero', async () => {
+		const firstUri = vscode.Uri.file('/repo/src/a.ts');
+		const secondUri = vscode.Uri.file('/repo/src/b.ts');
+		const firstHunk = computeLineDiff(firstUri.toString(), 'a\n', 'aa\n')[0];
+		const secondHunk = computeLineDiff(secondUri.toString(), 'b\n', 'bb\n')[0];
+		const session: ReviewSession = {
+			id: 'ai-review-file-concurrency',
+			mode: 'git',
+			rootUri: vscode.Uri.file('/repo'),
+			createdAt: 1,
+			files: new Map([
+				[firstUri.toString(), reviewFileState(firstUri, 'src/a.ts', { hunks: [firstHunk] })],
+				[secondUri.toString(), reviewFileState(secondUri, 'src/b.ts', { hunks: [secondHunk] })],
+			]),
+		};
+		let activeRequests = 0;
+		let maxActiveRequests = 0;
+		let firstStarted: (() => void) | undefined;
+		const firstStartedPromise = new Promise<void>((resolve) => {
+			firstStarted = resolve;
+		});
+
+		const result = await new CodeReviewAgentService().review({
+			session,
+			root: workspaceFolder('/repo'),
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: {
+				completeJson: async (request) => {
+					const userPrompt = request.messages?.find((message) => message.role === 'user')?.content ?? '';
+					if (userPrompt.includes('src/a.ts')) {
+						activeRequests += 1;
+						maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+						firstStarted?.();
+						await new Promise((resolve) => setTimeout(resolve, 25));
+						activeRequests -= 1;
+						return '{"type":"final","result":{"findings":[{"hunkId":"' + firstHunk.id + '","severity":"warning","title":"A","explanation":"Risk A","recommendation":"Fix A"}]}}';
+					}
+					await firstStartedPromise;
+					activeRequests += 1;
+					maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+					activeRequests -= 1;
+					return '{"type":"final","result":{"findings":[{"hunkId":"' + secondHunk.id + '","severity":"info","title":"B","explanation":"Risk B","recommendation":"Fix B"}]}}';
+				},
+			},
+			language: 'en',
+			strategy: 'FileOnly',
+			fileConcurrency: 0,
+		});
+
+		assert.strictEqual(maxActiveRequests, 2);
+		assert.deepStrictEqual(result.completedFiles, [firstUri.toString(), secondUri.toString()]);
+		assert.deepStrictEqual(result.findings.map((finding) => finding.title), ['A', 'B']);
+		assert.deepStrictEqual(result.findings.map((finding) => finding.generationOrder), [0, 1]);
+	});
+
+	test('runs multi-agent review with skipped KB and integration related hunks', async () => {
+		const apiUri = vscode.Uri.file('/repo/src/api.ts');
+		const callerUri = vscode.Uri.file('/repo/src/caller.ts');
+		const apiHunk = computeLineDiff(apiUri.toString(), 'export const version = 1;\n', 'export const version = 2;\n')[0];
+		const callerHunk = computeLineDiff(callerUri.toString(), 'if (version === 1) {\n}\n', 'if (version === 1) {\n  run();\n}\n')[0];
+		const session: ReviewSession = {
+			id: 'ai-review-multi',
+			mode: 'git',
+			rootUri: vscode.Uri.file('/repo'),
+			createdAt: 1,
+			files: new Map([
+				[apiUri.toString(), reviewFileState(apiUri, 'src/api.ts', { hunks: [apiHunk] })],
+				[callerUri.toString(), reviewFileState(callerUri, 'src/caller.ts', { hunks: [callerHunk] })],
+			]),
+		};
+		const responses = [
+			'{"type":"final","result":{"summary":"Plan summary","changeIntent":"Coordinate API and caller","riskAreas":["contract"],"integrationChecks":["caller"],"filePlans":{"src/api.ts":"Check API contract.","src/caller.ts":"Check caller contract."}}}',
+			'{"type":"final","result":{"findings":[{"hunkId":"' + apiHunk.id + '","severity":"warning","title":"API issue","explanation":"Risk A","recommendation":"Fix A"}],"suggestions":[]}}',
+			'{"type":"final","result":{"findings":[],"suggestions":[]}}',
+			'{"type":"final","result":{"findings":[{"hunkId":"' + apiHunk.id + '","relatedHunkIds":["' + callerHunk.id + '","missing","' + apiHunk.id + '"],"relatedPaths":["src/caller.ts"],"severity":"warning","title":"Caller not updated","explanation":"The caller still assumes the old contract.","recommendation":"Update the caller with the API change.","evidence":["src/caller.ts:1"]},{"hunkId":"' + apiHunk.id + '","severity":"warning","title":"API issue","explanation":"Duplicate","recommendation":"Duplicate"}]}}',
+		];
+		const requests: Array<{ system: string; user: string }> = [];
+
+		const result = await new CodeReviewAgentService().review({
+			session,
+			root: workspaceFolder('/repo'),
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: {
+				completeJson: async (request) => {
+					requests.push({
+						system: request.messages?.find((message) => message.role === 'system')?.content ?? '',
+						user: request.messages?.find((message) => message.role === 'user')?.content ?? '',
+					});
+					return responses.shift() ?? '{"type":"final","result":{"findings":[]}}';
+				},
+			},
+			language: 'en',
+			strategy: 'Multi',
+			includeWikiTools: false,
+		});
+
+		assert.strictEqual(requests.length, 4);
+		assert.ok(requests[0].system.includes('AI Review Planning Agent'));
+		assert.ok(requests.every((request) => !request.system.includes('Knowledge Retrieval Agent')));
+		assert.ok(requests.some((request) => request.user.includes('Change-set summary:') && request.user.includes('Check API contract.')));
+		assert.ok(requests[3].system.includes('Integration Review Agent'));
+		assert.strictEqual(result.strategy, 'Multi');
+		assert.strictEqual(result.pipeline, 'multi');
+		assert.strictEqual(result.completedIntegration, true);
+		assert.strictEqual(result.planSummary, 'Plan summary');
+		assert.ok(result.knowledgeContextSummary?.includes('KB Retrieval skipped'));
+		assert.deepStrictEqual(result.findings.map((finding) => finding.title), ['API issue', 'Caller not updated']);
+		const integrationFinding = result.findings.find((finding) => finding.title === 'Caller not updated');
+		assert.strictEqual(integrationFinding?.source, 'integration');
+		assert.strictEqual(integrationFinding?.uri, apiUri.toString());
+		assert.deepStrictEqual(integrationFinding?.relatedHunkIds, [callerHunk.id]);
+		assert.deepStrictEqual(integrationFinding?.relatedPaths, ['src/caller.ts']);
+	});
+
+	test('resumes partial multi-agent review by rerunning only integration', async () => {
+		const apiUri = vscode.Uri.file('/repo/src/api.ts');
+		const callerUri = vscode.Uri.file('/repo/src/caller.ts');
+		const apiHunk = computeLineDiff(apiUri.toString(), 'a\n', 'aa\n')[0];
+		const callerHunk = computeLineDiff(callerUri.toString(), 'b\n', 'bb\n')[0];
+		const session: ReviewSession = {
+			id: 'ai-review-integration-retry',
+			mode: 'git',
+			rootUri: vscode.Uri.file('/repo'),
+			createdAt: 1,
+			files: new Map([
+				[apiUri.toString(), reviewFileState(apiUri, 'src/api.ts', { hunks: [apiHunk] })],
+				[callerUri.toString(), reviewFileState(callerUri, 'src/caller.ts', { hunks: [callerHunk] })],
+			]),
+		};
+		const responses = [
+			'{"type":"final","result":{"summary":"Retry plan","filePlans":{"src/api.ts":"Check API.","src/caller.ts":"Check caller."}}}',
+			'{"type":"final","result":{"findings":[{"hunkId":"' + apiHunk.id + '","severity":"info","title":"A","explanation":"Risk A","recommendation":"Fix A"}],"suggestions":[]}}',
+			'{"type":"final","result":{"findings":[{"hunkId":"' + callerHunk.id + '","severity":"info","title":"B","explanation":"Risk B","recommendation":"Fix B"}],"suggestions":[]}}',
+			'{"type":"final","result":{"findings":"bad"}}',
+		];
+		let partial: StoredAiReview | undefined;
+		try {
+			await new CodeReviewAgentService().review({
+				session,
+				root: workspaceFolder('/repo'),
+				config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+				client: { completeJson: async () => responses.shift() ?? '' },
+				language: 'en',
+				strategy: 'Multi',
+			});
+			assert.fail('Expected partial integration review failure.');
+		} catch (error) {
+			assert.ok(error instanceof AiReviewPartialError);
+			partial = error.review;
+		}
+
+		assert.ok(partial);
+		assert.strictEqual(partial.completedIntegration, false);
+		assert.deepStrictEqual(partial.completedFiles, [apiUri.toString(), callerUri.toString()]);
+		assert.deepStrictEqual(partial.findings.map((finding) => finding.title), ['A', 'B']);
+
+		const retryPrompts: string[] = [];
+		const retried = await new CodeReviewAgentService().review({
+			session,
+			root: workspaceFolder('/repo'),
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: {
+				completeJson: async (request) => {
+					retryPrompts.push(request.messages?.find((message) => message.role === 'user')?.content ?? '');
+					return '{"type":"final","result":{"findings":[{"hunkId":"' + apiHunk.id + '","relatedHunkIds":["' + callerHunk.id + '"],"severity":"warning","title":"Integration","explanation":"Risk","recommendation":"Fix"}]}}';
+				},
+			},
+			language: 'en',
+			strategy: 'Multi',
+			existingReview: partial,
+		});
+
+		assert.deepStrictEqual(retryPrompts.map((prompt) => prompt.startsWith('Run integration review')), [true]);
+		assert.strictEqual(retryPrompts.some((prompt) => prompt.includes('Review all pending chunks')), false);
+		assert.strictEqual(retried.completedIntegration, true);
+		assert.deepStrictEqual(retried.findings.map((finding) => finding.title), ['A', 'B', 'Integration']);
 	});
 
 	test('keeps completed file findings after a later AI review file fails and resumes from partial review', async () => {
@@ -2663,6 +2936,7 @@ suite('AI review findings', () => {
 					},
 				},
 				language: 'en',
+				strategy: 'FileOnly',
 				maxRounds: 64,
 				onFileComplete: (review) => {
 					completions.push(review);
@@ -2695,6 +2969,7 @@ suite('AI review findings', () => {
 				},
 			},
 			language: 'en',
+			strategy: 'FileOnly',
 			existingReview: partial,
 			maxRounds: 'unlimited',
 		});

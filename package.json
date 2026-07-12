@@ -311,11 +311,27 @@
           "default": "zh-CN",
           "description": "AI review findings language."
         },
+        "cliDiff.aiReviewStrategy": {
+          "type": "string",
+          "enum": [
+            "Auto",
+            "Multi",
+            "FileOnly"
+          ],
+          "default": "Auto",
+          "description": "AI Review agent strategy. Auto chooses between lightweight file review and multi-agent review; Multi always runs planning and integration review; FileOnly uses only per-file review."
+        },
         "cliDiff.aiReviewMaxRounds": {
           "type": "number",
           "default": 64,
           "minimum": 0,
           "description": "Maximum AI Review agent rounds per file. 0 means unlimited."
+        },
+        "cliDiff.aiReviewFileConcurrency": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "description": "Maximum number of file-level AI review agents to run concurrently. 1 runs serially; 0 runs all pending files concurrently."
         }
       }
     }
