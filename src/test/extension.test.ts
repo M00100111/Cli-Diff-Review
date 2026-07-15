@@ -2339,6 +2339,30 @@ suite('Agent runtime', () => {
 		assert.ok(trace.some((event) => event.kind === 'parse_success' && event.summary === 'Parsed final result'));
 	});
 
+	test('rejects native tool arguments outside an enum', async () => {
+		const trace: AgentTraceEvent[] = [];
+		const completions = [
+			{ content: '', toolCalls: [{ id: 'call-1', name: 'search', arguments: '{"mode":"unsupported"}' }] },
+			{ content: '{"type":"final","result":{"summary":"done"}}', toolCalls: [] },
+		];
+		const result = await new AgentRunner().run({
+			config: { provider: 'deepseek', baseUrl: 'https://api.deepseek.com', model: 'test', apiKey: 'secret' },
+			client: { completeJson: async () => '', complete: async () => completions.shift() ?? { content: '', toolCalls: [] } },
+			systemPrompt: 'test',
+			userPrompt: 'test',
+			tools: [{
+				name: 'search',
+				description: 'Search.',
+				parameters: { type: 'object', properties: { mode: { type: 'string', enum: ['literal', 'regex'] } }, required: ['mode'], additionalProperties: false },
+				execute: async (args) => args,
+			}],
+			onTrace: (event) => trace.push(event),
+		});
+
+		assert.strictEqual(result.result.summary, 'done');
+		assert.ok(trace.some((event) => event.kind === 'parse_error' && event.summary.includes('allowed values')));
+	});
+
 	test('uses DeepSeek native tools and returns reasoning content on the next round', async () => {
 		const requests: Array<{ messages?: Array<{ role: string; reasoningContent?: string; toolCallId?: string }> }> = [];
 		const trace: AgentTraceEvent[] = [];
@@ -2572,9 +2596,11 @@ suite('Agent runtime', () => {
 		const tools = createReadOnlyAgentTools({ root: workspaceFolder('/repo'), reviewSession: session });
 		assert.strictEqual(tools.some((tool) => tool.name === 'list_wiki_files'), false);
 		assert.strictEqual(tools.some((tool) => tool.name === 'read_wiki_file'), false);
+		assert.strictEqual(tools.some((tool) => tool.name === 'search_wiki_files'), false);
 		const toolsWithWiki = createReadOnlyAgentTools({ root: workspaceFolder('/repo'), reviewSession: session, includeWikiTools: true });
 		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'list_wiki_files'), true);
 		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'read_wiki_file'), true);
+		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'search_wiki_files'), true);
 		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'search_workspace'), true);
 		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'read_workspace_file'), true);
 		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'read_pending_change'), true);
@@ -2585,8 +2611,18 @@ suite('Agent runtime', () => {
 			currentExists: boolean;
 			contentSource: string;
 		};
-		const search = await tools.find((tool) => tool.name === 'search_workspace')?.execute({ query: 'removed', limit: 10 }, undefined) as {
+		const searchTool = tools.find((tool) => tool.name === 'search_workspace');
+		if (!searchTool) {
+			throw new Error('search_workspace tool is unavailable');
+		}
+		const search = await searchTool.execute({ query: 'removed', mode: 'literal', limit: 10 }, undefined) as {
 			matches: Array<{ path: string; text: string }>;
+		};
+		const fuzzy = await searchTool.execute({ query: 'eprtd', mode: 'fuzzy', limit: 10 }, undefined) as {
+			matches: Array<{ path: string }>;
+		};
+		const regex = await searchTool.execute({ query: 'removed\\s*=\\s*true', mode: 'regex', limit: 10 }, undefined) as {
+			matches: Array<{ path: string }>;
 		};
 
 		assert.ok(list.files.includes('src/deleted.ts'));
@@ -2595,17 +2631,25 @@ suite('Agent runtime', () => {
 		assert.strictEqual(read.contentSource, 'reviewOldText');
 		assert.strictEqual(search.matches[0].path, 'src/deleted.ts');
 		assert.ok(search.matches[0].text.includes('removed'));
+		assert.strictEqual(fuzzy.matches[0].path, 'src/deleted.ts');
+		assert.strictEqual(regex.matches[0].path, 'src/deleted.ts');
+		await assert.rejects(
+			() => searchTool.execute({ query: '[', mode: 'regex', limit: 10 }, undefined),
+			/SyntaxError/,
+		);
 	});
 
 	test('protects Wiki template and state files from Agent writes', async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-agent-'));
 		try {
 			writeRepoFile(root, '.agents/skills/llm-code-wiki/references/schema.md', '# Schema\n');
+			writeRepoFile(root, '.agents/skills/llm-code-wiki/references/interfaces/api.md', '# API Contract\nThe API returns a token.\n');
 			writeRepoFile(root, 'AGENTS.md', '# Human notes\n\nKeep me.\n');
 			let agentsGuidanceWritten = false;
 			const tools = createWikiAgentTools({ root: workspaceFolder(root), generatedFiles: new Set() });
 			const list = tools.find((tool) => tool.name === 'list_wiki_files');
 			const read = tools.find((tool) => tool.name === 'read_wiki_file');
+			const search = tools.find((tool) => tool.name === 'search_wiki_files');
 			const write = tools.find((tool) => tool.name === 'write_wiki_file');
 			const writeAgents = createWikiAgentTools({
 				root: workspaceFolder(root),
@@ -2616,12 +2660,19 @@ suite('Agent runtime', () => {
 			}).find((tool) => tool.name === 'write_agents_guidance');
 			assert.ok(list);
 			assert.ok(read);
+			assert.ok(search);
 			assert.ok(write);
 			assert.ok(writeAgents);
 			assert.ok(JSON.stringify(writeAgents.parameters).includes('durable project knowledge'));
 			assert.ok(JSON.stringify(writeAgents.parameters).includes('formatting-only/comment-only/mechanical cleanups'));
 			assert.ok(JSON.stringify(writeAgents.parameters).includes('SKILL.md, references/schema.md, and .state.json are protected'));
-			assert.deepStrictEqual(await list.execute({}, undefined), { files: ['schema.md'] });
+			assert.deepStrictEqual(await list.execute({}, undefined), { files: ['interfaces/api.md', 'schema.md'] });
+			assert.deepStrictEqual(await search.execute({ query: 'api returns', mode: 'fuzzy', limit: 10 }, undefined), {
+				matches: [{ path: 'interfaces/api.md', line: 2, text: 'The API returns a token.' }],
+			});
+			assert.deepStrictEqual(await search.execute({ query: 'API\\s+returns', mode: 'regex', limit: 10 }, undefined), {
+				matches: [{ path: 'interfaces/api.md', line: 2, text: 'The API returns a token.' }],
+			});
 			assert.deepStrictEqual(await read.execute({ path: 'schema.md' }, undefined), {
 				path: '.agents/skills/llm-code-wiki/references/schema.md',
 				content: '# Schema\n',
@@ -2914,11 +2965,13 @@ suite('AI review findings', () => {
 		});
 
 		assert.strictEqual(requests.length, 5);
-		assert.ok(requests[0].system.includes('current source code is authoritative'));
-		assert.ok(requests[0].tools.includes('read_workspace_file'));
-		assert.ok(requests[0].tools.includes('search_workspace'));
-		assert.ok(requests[0].tools.includes('read_wiki_file'));
-		assert.strictEqual(requests[0].tools.includes('write_wiki_file'), false);
+		assert.ok(requests[0].system.includes('Current source code is authoritative'));
+		assert.ok(requests[0].system.includes('Use search_wiki_files to locate relevant Wiki pages'));
+		assert.ok(requests[0].system.includes('read_workspace_file'));
+		assert.ok(requests[0].system.includes('search_workspace'));
+		assert.ok(requests[0].system.includes('read_wiki_file'));
+		assert.ok(requests[0].system.includes('search_wiki_files'));
+		assert.strictEqual(requests[0].system.includes('write_wiki_file'), false);
 		assert.ok(requests[0].user.includes('"status":"stale"'));
 		assert.ok(requests[4].user.includes('Knowledge claims to verify:'));
 		assert.ok(requests[4].user.includes('API returns new'));

@@ -2437,7 +2437,8 @@ export class ReviewController implements vscode.Disposable {
 				} else {
 					result.skippedFileCount += 1;
 				}
-			} catch {
+			} catch (error) {
+				console.warn(`[Cli Diff Review] Skipped auto-staging accepted reviewed chunks for ${file.relativePath}: Git staging failed.`, error);
 				result.skippedFileCount += 1;
 			}
 		}
@@ -2446,21 +2447,25 @@ export class ReviewController implements vscode.Disposable {
 
 	private async stageAcceptedReviewedHunksForFile(file: ReviewFileState): Promise<boolean> {
 		if (this.isOpenDocumentDirty(file.uri)) {
+			console.warn(`[Cli Diff Review] Skipped auto-staging accepted reviewed chunks for ${file.relativePath}: the open document has unsaved changes.`);
 			return false;
 		}
 
 		const folder = this.gitWorkspaceFolderForReviewFile(file);
 		if (!folder) {
+			console.warn(`[Cli Diff Review] Skipped auto-staging accepted reviewed chunks for ${file.relativePath}: no Git workspace folder was found.`);
 			return false;
 		}
 
 		const current = await this.readCurrentText(file.uri, { preferDisk: true });
 		if (current.exists !== file.currentExists || current.text !== file.newText) {
+			console.warn(`[Cli Diff Review] Skipped auto-staging accepted reviewed chunks for ${file.relativePath}: the file changed on disk since it was reviewed.`);
 			return false;
 		}
 
 		const originalIndexText = this.originalIndexTextBeforeAcceptedHunks(file);
 		if (originalIndexText === undefined) {
+			console.warn(`[Cli Diff Review] Skipped auto-staging accepted reviewed chunks for ${file.relativePath}: the accepted hunks no longer match the review baseline.`);
 			return false;
 		}
 
@@ -2470,6 +2475,7 @@ export class ReviewController implements vscode.Disposable {
 		const indexMatchesOriginal = indexEntry.exists === file.originalExists && indexText === originalIndexText;
 		const indexAlreadyStaged = indexEntry.exists === targetIndexExists && indexText === file.oldText;
 		if (!indexMatchesOriginal && !indexAlreadyStaged) {
+			console.warn(`[Cli Diff Review] Skipped auto-staging accepted reviewed chunks for ${file.relativePath}: the Git index changed since the review started.`);
 			return false;
 		}
 		if (indexAlreadyStaged) {

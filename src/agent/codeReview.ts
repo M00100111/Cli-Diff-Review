@@ -442,7 +442,7 @@ export class CodeReviewAgentService {
 			systemPrompt: knowledgeRetrievalSystemPrompt(),
 			userPrompt: knowledgeRetrievalUserPrompt(files, options.knowledgeFreshness),
 			tools: createReadOnlyAgentTools({ root: options.root, reviewSession: options.session, includeWikiTools: true })
-				.filter((tool) => ['list_wiki_files', 'read_wiki_file', 'search_workspace', 'read_workspace_file', 'read_pending_change', 'list_pending_changes'].includes(tool.name)),
+				.filter((tool) => ['list_wiki_files', 'read_wiki_file', 'search_wiki_files', 'search_workspace', 'read_workspace_file', 'read_pending_change', 'list_pending_changes'].includes(tool.name)),
 			signal: options.signal,
 			onProgress: (progress) => options.onProgress?.(`Knowledge: ${progress.message}`),
 			onTrace: (event) => options.onTrace?.(event, context),
@@ -1272,6 +1272,7 @@ function knowledgeRetrievalSystemPrompt(): string {
 	return [
 		'You are a source-grounded Knowledge Retrieval Agent for code review.',
 		'Read relevant Wiki pages and use read-only source tools to verify a small number of claims against current code.',
+		'Use search_wiki_files to locate relevant Wiki pages before reading only the pages needed for review.',
 		'Current source code is authoritative; Wiki content is advisory context and may be stale.',
 		'Never create review findings. Return claims as confirmed, conflicted, or unverified with current code evidence paths.',
 		'When Wiki freshness is stale, keep using it only as low-confidence context and do not treat staleness alone as a finding.',

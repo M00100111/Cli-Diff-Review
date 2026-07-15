@@ -31,6 +31,10 @@ const requiredWikiFiles = new Set([
 	'open-questions.md',
 	'log.md',
 ]);
+const searchModes = ['literal', 'fuzzy', 'regex'] as const;
+
+type SearchMode = typeof searchModes[number];
+type SearchMatch = { path: string; line: number; text: string };
 
 export function createReadOnlyAgentTools(options: AgentToolOptions): AgentTool[] {
 	const tools = [
@@ -40,11 +44,12 @@ export function createReadOnlyAgentTools(options: AgentToolOptions): AgentTool[]
 		tool('read_workspace_file', 'Read one source file. Arguments: {"path":"src/app.ts"}.', objectSchema({ path: stringSchema('Repository-relative source path.') }), async (args, signal) => {
 			return readWorkspaceFile(options, stringArgument(args, 'path'), signal);
 		}),
-		tool('search_workspace', 'Search readable source files for a literal text query. Arguments: {"query":"symbol","limit":50}.', objectSchema({
-			query: stringSchema('Literal text query.'),
+		tool('search_workspace', 'Search readable source files. Arguments: {"query":"symbol","mode":"literal","limit":50}. Modes: literal (case-sensitive substring), fuzzy (case-insensitive ordered characters), regex (JavaScript regular expression per line).', objectSchema({
+			query: stringSchema('Search text or regular expression.'),
+			mode: enumStringSchema('Search mode.', searchModes),
 			limit: { type: 'integer', description: 'Maximum results from 1 to 200.', minimum: 1, maximum: 200 },
 		}), async (args, signal) => {
-			return searchWorkspace(options, stringArgument(args, 'query'), numberArgument(args, 'limit', 50), signal);
+			return searchWorkspace(options, stringArgument(args, 'query'), searchModeArgument(args), numberArgument(args, 'limit', 50), signal);
 		}),
 		tool('list_pending_changes', 'List all pending review changes and their hunks. Arguments: {}.', objectSchema({}), async (_args, signal) => {
 			throwIfAborted(signal);
@@ -65,6 +70,13 @@ export function createReadOnlyAgentTools(options: AgentToolOptions): AgentTool[]
 		}),
 		tool('read_wiki_file', `Read one Markdown file under ${wikiReferencesPath}. Arguments: {"path":"architecture.md"}.`, objectSchema({ path: stringSchema('Path relative to the Wiki references directory.') }), async (args, signal) => {
 			return readTextFile(options, wikiFileUri(options.root.uri, stringArgument(args, 'path'), true), signal);
+		}),
+		tool('search_wiki_files', `Search Markdown files under ${wikiReferencesPath}. Arguments: {"query":"contract","mode":"literal","limit":50}. Modes: literal (case-sensitive substring), fuzzy (case-insensitive ordered characters), regex (JavaScript regular expression per line).`, objectSchema({
+			query: stringSchema('Search text or regular expression.'),
+			mode: enumStringSchema('Search mode.', searchModes),
+			limit: { type: 'integer', description: 'Maximum results from 1 to 200.', minimum: 1, maximum: 200 },
+		}), async (args, signal) => {
+			return searchWikiFiles(options, stringArgument(args, 'query'), searchModeArgument(args), numberArgument(args, 'limit', 50), signal);
 		}),
 	];
 }
@@ -227,28 +239,86 @@ async function readTextFile(options: AgentToolOptions, uri: vscode.Uri, signal?:
 	};
 }
 
-async function searchWorkspace(options: AgentToolOptions, query: string, limit: number, signal?: AbortSignal): Promise<{ matches: Array<{ path: string; line: number; text: string }> }> {
+async function searchWorkspace(options: AgentToolOptions, query: string, mode: SearchMode, limit: number, signal?: AbortSignal): Promise<{ matches: SearchMatch[] }> {
+	return searchFiles(
+		await listWorkspaceFiles(options, signal),
+		async (candidate) => (await readWorkspaceFile(options, candidate, signal)).content,
+		query,
+		mode,
+		limit,
+		signal,
+	);
+}
+
+async function searchWikiFiles(options: AgentToolOptions, query: string, mode: SearchMode, limit: number, signal?: AbortSignal): Promise<{ matches: SearchMatch[] }> {
+	return searchFiles(
+		await listWikiFiles(options.root.uri, signal),
+		async (candidate) => (await readTextFile(options, wikiFileUri(options.root.uri, candidate, true), signal)).content,
+		query,
+		mode,
+		limit,
+		signal,
+	);
+}
+
+async function searchFiles(
+	files: string[],
+	readContent: (path: string) => Promise<string>,
+	query: string,
+	mode: SearchMode,
+	limit: number,
+	signal?: AbortSignal,
+): Promise<{ matches: SearchMatch[] }> {
 	if (!query) {
 		throw new Error('Search query is required.');
 	}
-	const matches: Array<{ path: string; line: number; text: string }> = [];
-	for (const candidate of await listWorkspaceFiles(options, signal)) {
+	const matchesLine = lineMatcher(query, mode);
+	const matches: SearchMatch[] = [];
+	const resultLimit = Math.max(1, Math.min(limit, 200));
+	for (const candidate of files) {
 		throwIfAborted(signal);
 		try {
-			const read = await readWorkspaceFile(options, candidate, signal);
-			for (const [index, line] of read.content.split(/\r?\n/).entries()) {
-				if (line.includes(query)) {
+			const content = await readContent(candidate);
+			for (const [index, line] of content.split(/\r?\n/).entries()) {
+				throwIfAborted(signal);
+				if (matchesLine(line)) {
 					matches.push({ path: candidate, line: index + 1, text: line.slice(0, 500) });
-					if (matches.length >= Math.max(1, Math.min(limit, 200))) {
+					if (matches.length >= resultLimit) {
 						return { matches };
 					}
 				}
 			}
 		} catch {
-			// Files can disappear while an agent is searching.
+			throwIfAborted(signal);
+			// Files can disappear or become unreadable while an agent is searching.
 		}
 	}
 	return { matches };
+}
+
+function lineMatcher(query: string, mode: SearchMode): (line: string) => boolean {
+	if (mode === 'literal') {
+		return (line) => line.includes(query);
+	}
+	if (mode === 'fuzzy') {
+		const normalizedQuery = [...query.toLowerCase()];
+		return (line) => isFuzzyMatch(normalizedQuery, line.toLowerCase());
+	}
+	const expression = new RegExp(query);
+	return (line) => expression.test(line);
+}
+
+function isFuzzyMatch(query: string[], candidate: string): boolean {
+	let queryIndex = 0;
+	for (const character of candidate) {
+		if (character === query[queryIndex]) {
+			queryIndex += 1;
+			if (queryIndex === query.length) {
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 function pendingChangeFiles(options: AgentToolOptions): Array<{ path: string; uri: string; currentExists: boolean; hunks: Array<Record<string, unknown>> }> {
@@ -317,6 +387,10 @@ function stringSchema(description: string): Record<string, unknown> {
 	return { type: 'string', description };
 }
 
+function enumStringSchema(description: string, values: readonly string[]): Record<string, unknown> {
+	return { type: 'string', enum: values, description };
+}
+
 function stringArgument(args: Record<string, unknown>, name: string): string {
 	const value = args[name];
 	if (typeof value !== 'string') {
@@ -328,6 +402,14 @@ function stringArgument(args: Record<string, unknown>, name: string): string {
 function numberArgument(args: Record<string, unknown>, name: string, fallback: number): number {
 	const value = args[name];
 	return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function searchModeArgument(args: Record<string, unknown>): SearchMode {
+	const value = args.mode;
+	if (typeof value === 'string' && (searchModes as readonly string[]).includes(value)) {
+		return value as SearchMode;
+	}
+	throw new Error('Tool argument mode must be literal, fuzzy, or regex.');
 }
 
 function workspaceFileUri(rootUri: vscode.Uri, candidate: string): vscode.Uri {

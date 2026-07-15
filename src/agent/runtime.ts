@@ -542,6 +542,9 @@ function validateToolArguments(tool: AgentTool, argumentsValue: Record<string, u
 		if (schema.type === 'integer' && typeof value === 'number' && !Number.isInteger(value)) {
 			throw new Error(`Native tool ${tool.name} argument ${name} must be an integer.`);
 		}
+		if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
+			throw new Error(`Native tool ${tool.name} argument ${name} must be one of the allowed values.`);
+		}
 		if (typeof value === 'number' && typeof schema.minimum === 'number' && value < schema.minimum) {
 			throw new Error(`Native tool ${tool.name} argument ${name} is below its minimum.`);
 		}
