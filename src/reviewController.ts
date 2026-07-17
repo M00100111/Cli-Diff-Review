@@ -2666,8 +2666,6 @@ export class ReviewController implements vscode.Disposable {
 		if (manualBaseline && !file.skippedReason) {
 			file.oldText = manualBaseline.oldText;
 			file.baselineExists = manualBaseline.baselineExists;
-			file.originalText = manualBaseline.oldText;
-			file.originalExists = manualBaseline.baselineExists;
 		}
 		file.newText = current.text;
 		file.currentExists = current.exists;

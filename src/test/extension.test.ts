@@ -721,6 +721,47 @@ suite('Review state', () => {
 		assert.deepStrictEqual(harness.stageFileCalls, []);
 	});
 
+	test('keeps the absent original index when refreshing an accepted new file', async () => {
+		const uri = vscode.Uri.file('D:/repo/new-file.txt');
+		const newText = 'new\n';
+		const acceptedHunk = computeLineDiff(uri.toString(), '', newText)[0];
+		const file = reviewFileState(uri, 'new-file.txt', {
+			projectId: 'repo',
+			oldText: newText,
+			newText,
+			originalText: '',
+			originalExists: false,
+			baselineExists: true,
+			acceptedHunks: [reviewedHunkFrom(acceptedHunk, 'accept')],
+		});
+		const session: ReviewSession = {
+			id: 'refresh-new-file',
+			mode: 'git',
+			rootUri: vscode.Uri.file('D:/repo'),
+			createdAt: 1,
+			files: new Map([[uri.toString(), file]]),
+		};
+		const controller = Object.create(ReviewController.prototype) as RefreshReviewController;
+		Object.assign(controller as unknown as Record<string, unknown>, {
+			activeSession: session,
+			manualGitBaselines: new Map([[uri.toString(), { oldText: newText, baselineExists: true }]]),
+			isOpenDocumentDirty: () => false,
+			readCurrentText: async () => ({ exists: true, text: newText }),
+			computeReviewHunks: () => ({ hunks: [] }),
+			normalizeReviewedDuplicateHunks: () => undefined,
+			refreshUi: () => undefined,
+		});
+
+		await controller.refreshFile(uri, { reconcileExternalChanges: false });
+
+		assert.strictEqual(file.originalExists, false);
+		assert.strictEqual(file.originalText, '');
+		const staging = autoStageControllerHarness(file, newText, { exists: false, text: '', mode: '100644' });
+		const result = await staging.controller.stageAcceptedReviewedHunksForManualRefresh(staging.session.files);
+		assert.deepStrictEqual(result, { stagedFileCount: 1, skippedFileCount: 0 });
+		assert.deepStrictEqual(staging.stageFileCalls, ['new-file.txt']);
+	});
+
 	test('skips auto-staging when the index has diverged', async () => {
 		const uri = vscode.Uri.file('D:/repo/tracked.txt');
 		const indexText = 'old\n';
@@ -3881,6 +3922,10 @@ type TestReviewController = {
 
 type AutoStageReviewController = {
 	stageAcceptedReviewedHunksForManualRefresh(files: Map<string, ReviewFileState>): Promise<{ stagedFileCount: number; skippedFileCount: number }>;
+};
+
+type RefreshReviewController = {
+	refreshFile(uri: vscode.Uri, options?: { reconcileExternalChanges?: boolean; preferDisk?: boolean }): Promise<void>;
 };
 
 function reviewControllerHarness(
