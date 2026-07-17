@@ -13,8 +13,6 @@
   ],
   "activationEvents": [
     "onStartupFinished",
-    "onCommand:cli-diff.captureBaseline",
-    "onCommand:cli-diff.startSnapshotReview",
     "onCommand:cli-diff.startGitReview",
     "onCommand:cli-diff.acceptChange",
     "onCommand:cli-diff.rejectChange",
@@ -38,16 +36,6 @@
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
-      {
-        "command": "cli-diff.captureBaseline",
-        "title": "Capture Baseline",
-        "category": "Cli Diff Review"
-      },
-      {
-        "command": "cli-diff.startSnapshotReview",
-        "title": "Start Snapshot Review",
-        "category": "Cli Diff Review"
-      },
       {
         "command": "cli-diff.startGitReview",
         "title": "Start Git Review",
@@ -242,33 +230,10 @@
           "minimum": 1024,
           "description": "Maximum file size, in bytes, included in Cli Diff Review baselines and reviews."
         },
-        "cliDiff.maxFiles": {
-          "type": "number",
-          "default": 2000,
-          "minimum": 1,
-          "description": "Maximum number of workspace files captured or scanned for snapshot reviews."
-        },
-        "cliDiff.maxDiffLines": {
-          "type": "number",
-          "default": 12000,
-          "minimum": 100,
-          "description": "Maximum combined old and new line count diffed for one file."
-        },
-        "cliDiff.maxDiffCells": {
-          "type": "number",
-          "default": 16000000,
-          "minimum": 10000,
-          "description": "Maximum old-line by new-line comparison cells diffed for one file."
-        },
         "cliDiff.autoStartGitReview": {
           "type": "boolean",
           "default": true,
           "description": "Automatically start a lightweight Git review session so changed files appear in the Cli Diff Review view."
-        },
-        "cliDiff.exclude": {
-          "type": "string",
-          "default": "**/{.git,node_modules,dist,out,.vscode-test}/**",
-          "description": "Glob pattern excluded when capturing or scanning snapshot review files."
         },
         "cliDiff.reviewWikiChanges": {
           "type": "boolean",

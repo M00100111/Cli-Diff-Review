@@ -1,9 +1,11 @@
-import { execFile } from 'child_process';
+import { spawn } from 'child_process';
 import { realpathSync } from 'fs';
 import { dirname as pathDirname, relative as pathRelative, resolve as pathResolve } from 'path';
+import { StringDecoder } from 'string_decoder';
 import * as vscode from 'vscode';
-import { gitIgnoredReviewPaths, isGitIgnoredReviewPath, normalizeReviewPath, shouldSkipReviewPath } from './reviewFileFilter';
-import { FilePair, ReviewProject, uriKey } from './types';
+import { combineGitHunkPatches, parseGitPatch, ParsedGitFilePatch, reviewedHunkFromGit } from './gitPatch';
+import { isGitIgnoredReviewPath, normalizeReviewPath, shouldSkipReviewPath } from './reviewFileFilter';
+import { FilePair, GitReviewHunk, ReviewProject, uriKey } from './types';
 import { decodeUtf8, isProbablyBinary, uriFromRelativePath } from './text';
 
 export interface GitIndexEntry {
@@ -12,23 +14,28 @@ export interface GitIndexEntry {
 	mode: string;
 }
 
+export interface GitApplyOptions {
+	cached?: boolean;
+	reverse?: boolean;
+	check?: boolean;
+}
+
+const diffOptions = [
+	'--full-index', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames', '--unified=3', '--relative', '--',
+];
+
 export class GitService {
 	public async discoverProjects(workspaceRoot: vscode.WorkspaceFolder): Promise<ReviewProject[]> {
-		if (await this.isGitRoot(workspaceRoot.uri)) {
-			return [reviewProject(workspaceRoot.uri, workspaceRoot.name)];
+		const workspaceProject = await this.reviewProjectIfRoot(workspaceRoot.uri, workspaceRoot.name);
+		if (workspaceProject) {
+			return [workspaceProject];
 		}
-
 		const entries = await vscode.workspace.fs.readDirectory(workspaceRoot.uri);
-		const projects: ReviewProject[] = [];
-		for (const [name, type] of entries) {
-			if (type !== vscode.FileType.Directory) {
-				continue;
-			}
-			const uri = vscode.Uri.joinPath(workspaceRoot.uri, name);
-			if (await this.isGitRoot(uri)) {
-				projects.push(reviewProject(uri, name));
-			}
-		}
+		const directories = entries.filter(([, type]) => type === vscode.FileType.Directory);
+		const projects = (await mapWithConcurrency(directories, 8, ([name]) => (
+			this.reviewProjectIfRoot(vscode.Uri.joinPath(workspaceRoot.uri, name), name)
+		)))
+			.filter((project): project is ReviewProject => Boolean(project));
 		return projects.sort((left, right) => left.name.localeCompare(right.name));
 	}
 
@@ -42,37 +49,121 @@ export class GitService {
 	}
 
 	public async createFilePairs(root: vscode.WorkspaceFolder): Promise<FilePair[]> {
-		await this.git(root, ['rev-parse', '--show-toplevel']);
-		const tracked = await this.gitLines(root, ['diff', '--name-only', '--relative', '--']);
-		const untracked = await this.gitLines(root, ['ls-files', '--others', '--exclude-standard']);
-		const untrackedPaths = new Set(untracked.map((relativePath) => normalizeReviewPath(relativePath)));
-		const paths = [...new Set([...tracked, ...untracked])]
-			.map((relativePath) => normalizeReviewPath(relativePath))
-			.filter((relativePath) => relativePath.length > 0 && !shouldSkipReviewPath(relativePath));
-		const ignoredPaths = await gitIgnoredReviewPaths(root, paths);
-		const pairs: FilePair[] = [];
+		const projectId = uriKey(root.uri);
+		const maxFileBytes = vscode.workspace.getConfiguration('cliDiff').get<number>('maxFileBytes', 2097152);
+		const [acceptedBlocks, pendingBlocks, statusOutput, headOid] = await Promise.all([
+			this.gitPatchBlocks(root, ['diff', '--cached', ...diffOptions], maxFileBytes, [0, 1]),
+			this.gitPatchBlocks(root, ['diff', ...diffOptions], maxFileBytes, [0, 1]),
+			this.gitBuffer(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=no']),
+			this.headOid(root),
+		]);
+		const accepted = acceptedBlocks.flatMap((block) => parseGitPatch(block, projectId, 'accepted', maxFileBytes));
+		const pending = pendingBlocks.flatMap((block) => parseGitPatch(block, projectId, 'pending', maxFileBytes));
+		const status = parsePorcelainStatus(statusOutput);
+		const untrackedPaths = status.untrackedPaths.map(normalizeReviewPath).filter(Boolean);
+		const untrackedPatches = await mapWithConcurrency(
+			untrackedPaths.filter((relativePath) => !shouldSkipReviewPath(relativePath)),
+			4,
+			async (relativePath) => {
+				const blocks = await this.gitPatchBlocks(root, [
+					'diff', '--no-index', '--full-index', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames', '--unified=3', '--relative', '--', '/dev/null', relativePath,
+				], maxFileBytes, [0, 1]);
+				return blocks.flatMap((block) => parseGitPatch(block, projectId, 'pending', maxFileBytes));
+			},
+		);
+		pending.push(...untrackedPatches.flat());
 
-		for (const relativePath of paths) {
-			if (ignoredPaths.has(relativePath)) {
-				continue;
+		return this.buildFilePairs(root, accepted, pending, new Set(status.conflictPaths.map(normalizeReviewPath)), headOid, maxFileBytes);
+	}
+
+	private async buildFilePairs(
+		root: vscode.WorkspaceFolder,
+		accepted: ParsedGitFilePatch[],
+		pending: ParsedGitFilePatch[],
+		conflicts: Set<string>,
+		headOid: string,
+		maxFileBytes: number,
+	): Promise<FilePair[]> {
+		const byPath = new Map<string, { accepted?: ParsedGitFilePatch; pending?: ParsedGitFilePatch }>();
+		for (const file of accepted) {
+			byPath.set(file.relativePath, { ...byPath.get(file.relativePath), accepted: file });
+		}
+		for (const file of pending) {
+			byPath.set(file.relativePath, { ...byPath.get(file.relativePath), pending: file });
+		}
+		for (const conflict of conflicts) {
+			if (conflict) {
+				byPath.set(conflict, byPath.get(conflict) ?? {});
 			}
+		}
 
+		const entries = [...byPath].filter(([relativePath]) => relativePath && !shouldSkipReviewPath(relativePath)).map(([relativePath, layers]) => {
 			const uri = uriFromRelativePath(root.uri, relativePath);
-			const baseline = !untrackedPaths.has(relativePath)
-				? await this.readIndexText(root, relativePath)
-				: { exists: false, text: '' };
-			const current = await readCurrentText(uri);
+			assignFileOccurrences([...(layers.accepted?.hunks ?? []), ...(layers.pending?.hunks ?? [])]);
+			return {
+				relativePath,
+				layers,
+				uri,
+				headBlobOid: layers.accepted ? layers.accepted.oldOid : layers.pending?.oldOid,
+				indexBlobOid: layers.pending ? layers.pending.oldOid : layers.accepted?.newOid,
+				skippedReason: conflicts.has(relativePath)
+					? 'Unsupported Git change: merge conflict. Resolve it in Source Control.'
+					: layers.pending?.unsupportedReason ?? layers.accepted?.unsupportedReason,
+			};
+		});
+		const workingStates = await Promise.all(entries.map((entry) => readCurrentText(entry.uri, {
+			preferDisk: true,
+			maxFileBytes: entry.skippedReason ? 0 : maxFileBytes,
+		})));
+		for (const [index, working] of workingStates.entries()) {
+			if (working.tooLarge && !entries[index].skippedReason) {
+				entries[index].skippedReason = 'File exceeds cliDiff.maxFileBytes.';
+			}
+		}
+		const blobOids = entries.flatMap((entry) => entry.skippedReason
+			? []
+			: [entry.headBlobOid, entry.indexBlobOid].filter((oid): oid is string => Boolean(oid)));
+		const blobs = await this.readBlobs(root, blobOids);
+
+		const pairs: FilePair[] = [];
+		for (const [entryIndex, entry] of entries.entries()) {
+			const { relativePath, layers, uri, headBlobOid, indexBlobOid, skippedReason } = entry;
+			const working = workingStates[entryIndex];
+			const head = blobText(blobs.get(headBlobOid ?? ''));
+			const index = blobText(blobs.get(indexBlobOid ?? ''));
+			const pendingHunks = (layers.pending?.hunks ?? []).map((hunk) => ({ ...hunk, fileUri: uri.toString() }));
+			const acceptedHunks = (layers.accepted?.hunks ?? []).map((hunk) => reviewedHunkFromGit({ ...hunk, fileUri: uri.toString() }, 'accept'));
 			pairs.push({
 				uri,
 				relativePath,
-				oldText: baseline.text,
-				newText: current.text,
-				baselineExists: baseline.exists,
-				currentExists: current.exists,
+				oldText: head,
+				newText: working.text,
+				baselineExists: Boolean(headBlobOid),
+				currentExists: working.exists,
+				skippedReason,
+				gitSnapshot: {
+					headText: head,
+					indexText: index,
+					workingText: working.text,
+					headExists: Boolean(headBlobOid),
+					indexExists: Boolean(indexBlobOid),
+					workingExists: working.exists,
+				},
+				pendingHunks,
+				acceptedHunks,
+				headOid,
 			});
 		}
+		return pairs.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+	}
 
-		return pairs;
+	private async readBlobs(root: vscode.WorkspaceFolder, objectIds: string[]): Promise<Map<string, Buffer>> {
+		const unique = [...new Set(objectIds)];
+		if (unique.length === 0) {
+			return new Map();
+		}
+		const result = await this.runGit(root.uri.fsPath, ['cat-file', '--batch'], { input: `${unique.join('\n')}\n` });
+		return parseCatFileBatch(result.stdout);
 	}
 
 	public async createFilePairForUri(uri: vscode.Uri, root?: vscode.WorkspaceFolder, options: { preferDisk?: boolean } = {}): Promise<FilePair | undefined> {
@@ -80,27 +171,62 @@ export class GitService {
 		if (!rootPath) {
 			return undefined;
 		}
-
-		const relativePath = pathRelative(rootPath, uri.fsPath).replace(/\\/g, '/');
-		if (shouldSkipReviewPath(relativePath) || await isGitIgnoredReviewPath(rootPath, relativePath)) {
+		const folder: vscode.WorkspaceFolder = root ?? { uri: vscode.Uri.file(rootPath), name: rootPath.split('/').pop() ?? 'Git', index: 0 };
+		const relativePath = normalizeReviewPath(pathRelative(rootPath, uri.fsPath));
+		if (shouldSkipReviewPath(relativePath) || (!root && await isGitIgnoredReviewPath(rootPath, relativePath))) {
 			return undefined;
 		}
-
-		const baseline = await this.readIndexTextPath(rootPath, relativePath);
-		const current = await readCurrentText(uri, { preferDisk: options.preferDisk });
-
-		if (!baseline.exists && !current.exists) {
-			return undefined;
+		void options;
+		const projectId = uriKey(folder.uri);
+		const maxFileBytes = vscode.workspace.getConfiguration('cliDiff').get<number>('maxFileBytes', 2097152);
+		const pathDiffOptions = [...diffOptions.slice(0, -1), '--', relativePath];
+		const [acceptedBlocks, pendingBlocks, statusOutput, headOid] = await Promise.all([
+			this.gitPatchBlocks(folder, ['diff', '--cached', ...pathDiffOptions], maxFileBytes, [0, 1]),
+			this.gitPatchBlocks(folder, ['diff', ...pathDiffOptions], maxFileBytes, [0, 1]),
+			this.gitBuffer(folder, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=no', '--', relativePath]),
+			this.headOid(folder),
+		]);
+		const accepted = acceptedBlocks.flatMap((block) => parseGitPatch(block, projectId, 'accepted', maxFileBytes));
+		const pending = pendingBlocks.flatMap((block) => parseGitPatch(block, projectId, 'pending', maxFileBytes));
+		const status = parsePorcelainStatus(statusOutput);
+		if (status.untrackedPaths.map(normalizeReviewPath).includes(relativePath)) {
+			const blocks = await this.gitPatchBlocks(folder, [
+				'diff', '--no-index', '--full-index', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames', '--unified=3', '--relative', '--', '/dev/null', relativePath,
+			], maxFileBytes, [0, 1]);
+			pending.push(...blocks.flatMap((block) => parseGitPatch(block, projectId, 'pending', maxFileBytes)));
 		}
+		const pairs = await this.buildFilePairs(
+			folder,
+			accepted,
+			pending,
+			new Set(status.conflictPaths.map(normalizeReviewPath)),
+			headOid,
+			maxFileBytes,
+		);
+		return pairs.find((pair) => pair.relativePath === relativePath);
+	}
 
-		return {
-			uri,
-			relativePath,
-			oldText: baseline.text,
-			newText: current.text,
-			baselineExists: baseline.exists,
-			currentExists: current.exists,
-		};
+	public async applyPatch(root: vscode.WorkspaceFolder, patch: string, options: GitApplyOptions = {}): Promise<void> {
+		const args = ['apply', '--whitespace=nowarn', '--recount'];
+		if (options.cached) {
+			args.push('--cached');
+		}
+		if (options.reverse) {
+			args.push('--reverse');
+		}
+		if (options.check) {
+			args.push('--check');
+		}
+		args.push('-');
+		await this.git(root, args, { input: patch });
+	}
+
+	public combinePatches(hunks: GitReviewHunk[]): string {
+		return combineGitHunkPatches(hunks);
+	}
+
+	public async headOid(root: vscode.WorkspaceFolder): Promise<string> {
+		return this.headOidPath(root.uri.fsPath);
 	}
 
 	public async indexStateSignature(root: vscode.WorkspaceFolder): Promise<string> {
@@ -125,6 +251,22 @@ export class GitService {
 		await this.git(root, args);
 	}
 
+	private async reviewProjectIfRoot(rootUri: vscode.Uri, name: string): Promise<ReviewProject | undefined> {
+		try {
+			const output = await this.gitInPath(rootUri.fsPath, ['rev-parse', '--show-toplevel', 'HEAD']);
+			const [topLevel, headOid = ''] = output.trim().split(/\r?\n/);
+			if (canonicalPath(topLevel) !== canonicalPath(rootUri.fsPath)) {
+				return undefined;
+			}
+			return { id: uriKey(rootUri), name, rootUri, headOid };
+		} catch {
+			if (!await this.isGitRoot(rootUri)) {
+				return undefined;
+			}
+			return { id: uriKey(rootUri), name, rootUri, headOid: '' };
+		}
+	}
+
 	private async indexStateSignaturePath(rootPath: string): Promise<string> {
 		const head = await this.headOidPath(rootPath);
 		const index = await this.gitInPath(rootPath, ['ls-files', '-s']);
@@ -147,20 +289,23 @@ export class GitService {
 		}
 	}
 
-	private async readIndexText(root: vscode.WorkspaceFolder, relativePath: string): Promise<{ exists: boolean; text: string }> {
-		return this.readIndexTextPath(root.uri.fsPath, relativePath);
+	private async readHeadText(root: vscode.WorkspaceFolder, relativePath: string): Promise<{ exists: boolean; text: string }> {
+		try {
+			return { exists: true, text: await this.git(root, ['show', `HEAD:${relativePath}`]) };
+		} catch {
+			return { exists: false, text: '' };
+		}
 	}
 
-	private async readIndexTextPath(rootPath: string, relativePath: string): Promise<{ exists: boolean; text: string }> {
-		const entry = await this.readIndexEntryPath(rootPath, relativePath);
+	private async readIndexText(root: vscode.WorkspaceFolder, relativePath: string): Promise<{ exists: boolean; text: string }> {
+		const entry = await this.readIndexEntry(root, relativePath);
 		return { exists: entry.exists, text: entry.text };
 	}
 
 	private async readIndexEntryPath(rootPath: string, relativePath: string): Promise<GitIndexEntry> {
 		try {
 			const listing = (await this.gitInPath(rootPath, ['ls-files', '-s', '--', relativePath]))
-				.split(/\r?\n/g)
-				.find((line) => line.trim().length > 0);
+				.split(/\r?\n/g).find((line) => line.trim().length > 0);
 			if (!listing) {
 				return { exists: false, text: '', mode: '100644' };
 			}
@@ -171,34 +316,98 @@ export class GitService {
 		}
 	}
 
-	private async gitLines(root: vscode.WorkspaceFolder, args: string[]): Promise<string[]> {
-		const output = await this.git(root, args);
-		return output.split(/\r?\n/g).map((line) => line.trim()).filter(Boolean);
-	}
-
-	private git(root: vscode.WorkspaceFolder, args: string[], options: { input?: string } = {}): Promise<string> {
+	private git(root: vscode.WorkspaceFolder, args: string[], options: GitRunOptions = {}): Promise<string> {
 		return this.gitInPath(root.uri.fsPath, args, options);
 	}
 
-	private gitInPath(cwd: string, args: string[], options: { input?: string } = {}): Promise<string> {
+	private async gitBuffer(root: vscode.WorkspaceFolder, args: string[]): Promise<Buffer> {
+		return this.runGit(root.uri.fsPath, args, {}).then((result) => result.stdout);
+	}
+
+	private gitPatchBlocks(root: vscode.WorkspaceFolder, args: string[], maxFileBytes: number, allowedExitCodes = [0]): Promise<string[]> {
 		return new Promise((resolve, reject) => {
-			const child = execFile('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 }, (error, stdout, stderr) => {
-				if (error) {
-					reject(new Error(stderr || error.message));
+			const child = spawn('git', ['-C', root.uri.fsPath, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+			const blocks: string[] = [];
+			let block = '';
+			let blockBytes = 0;
+			let remainder = '';
+			const decoder = new StringDecoder('utf8');
+			const stderr: Buffer[] = [];
+			const limit = maxFileBytes + 1;
+			const appendLine = (line: string) => {
+				if (line.startsWith('diff --git ')) {
+					if (block) {
+						blocks.push(block);
+					}
+					block = '';
+					blockBytes = 0;
+				}
+				if (!block && !line.startsWith('diff --git ')) {
 					return;
 				}
-
-				resolve(stdout);
+				if (blockBytes >= limit) {
+					return;
+				}
+				const data = Buffer.from(line, 'utf8');
+				const slice = data.subarray(0, Math.max(0, limit - blockBytes));
+				block += slice.toString('utf8');
+				blockBytes += slice.length;
+			};
+			child.stdout.on('data', (chunk: Buffer) => {
+				remainder += decoder.write(chunk);
+				let newline: number;
+				while ((newline = remainder.indexOf('\n')) >= 0) {
+					appendLine(remainder.slice(0, newline + 1));
+					remainder = remainder.slice(newline + 1);
+				}
 			});
-			if (options.input !== undefined) {
-				child.stdin?.end(options.input);
-			}
+			child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+			child.on('error', reject);
+			child.on('close', (code) => {
+				remainder += decoder.end();
+				appendLine(remainder);
+				if (block) {
+					blocks.push(block);
+				}
+				if (code === null || !allowedExitCodes.includes(code)) {
+					reject(new Error(Buffer.concat(stderr).toString('utf8') || `Git exited with code ${code ?? 'unknown'}.`));
+					return;
+				}
+				resolve(blocks);
+			});
+		});
+	}
+
+	private async gitInPath(cwd: string, args: string[], options: GitRunOptions = {}): Promise<string> {
+		const result = await this.runGit(cwd, args, options);
+		return result.stdout.toString('utf8');
+	}
+
+	private runGit(cwd: string, args: string[], options: GitRunOptions): Promise<{ stdout: Buffer; stderr: Buffer }> {
+		return new Promise((resolve, reject) => {
+			const child = spawn('git', ['-C', cwd, ...args], { stdio: ['pipe', 'pipe', 'pipe'] });
+			const stdout: Buffer[] = [];
+			const stderr: Buffer[] = [];
+			child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
+			child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+			child.on('error', reject);
+			child.on('close', (code) => {
+				const allowed = options.allowedExitCodes ?? [0];
+				const result = { stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) };
+				if (code === null || !allowed.includes(code)) {
+					reject(new Error(result.stderr.toString('utf8') || `Git exited with code ${code ?? 'unknown'}.`));
+					return;
+				}
+				resolve(result);
+			});
+			child.stdin.end(options.input);
 		});
 	}
 }
 
-function reviewProject(rootUri: vscode.Uri, name: string): ReviewProject {
-	return { id: uriKey(rootUri), name, rootUri };
+interface GitRunOptions {
+	input?: string;
+	allowedExitCodes?: number[];
 }
 
 function canonicalPath(candidate: string): string {
@@ -209,18 +418,105 @@ function canonicalPath(candidate: string): string {
 	}
 }
 
-async function readCurrentText(uri: vscode.Uri, options: { preferDisk?: boolean } = {}): Promise<{ exists: boolean; text: string }> {
-	const openDocument = vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri.toString());
-	if (openDocument && (!options.preferDisk || openDocument.isDirty)) {
-		return { exists: true, text: openDocument.getText() };
-	}
+function splitNul(value: Buffer): string[] {
+	return value.toString('utf8').split('\0').filter(Boolean);
+}
 
+function parsePorcelainStatus(value: Buffer): { untrackedPaths: string[]; conflictPaths: string[] } {
+	const records = splitNul(value);
+	const untrackedPaths: string[] = [];
+	const conflictPaths: string[] = [];
+	const unmerged = new Set(['DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU']);
+	for (let index = 0; index < records.length; index += 1) {
+		const record = records[index];
+		const status = record.slice(0, 2);
+		const relativePath = record.slice(3);
+		if (status === '??') {
+			untrackedPaths.push(relativePath);
+		} else if (unmerged.has(status)) {
+			conflictPaths.push(relativePath);
+		}
+		if (status.includes('R') || status.includes('C')) {
+			index += 1;
+		}
+	}
+	return { untrackedPaths, conflictPaths };
+}
+
+export function parseCatFileBatch(output: Buffer): Map<string, Buffer> {
+	const blobs = new Map<string, Buffer>();
+	let offset = 0;
+	while (offset < output.length) {
+		const lineEnd = output.indexOf(0x0a, offset);
+		if (lineEnd < 0) {
+			break;
+		}
+		const header = output.subarray(offset, lineEnd).toString('ascii');
+		offset = lineEnd + 1;
+		const match = header.match(/^([0-9a-f]+) (\S+) (\d+)$/i);
+		if (!match) {
+			continue;
+		}
+		const size = Number(match[3]);
+		const end = offset + size;
+		if (!Number.isSafeInteger(size) || end > output.length) {
+			break;
+		}
+		if (match[2] === 'blob') {
+			blobs.set(match[1], output.subarray(offset, end));
+		}
+		offset = end + (output[end] === 0x0a ? 1 : 0);
+	}
+	return blobs;
+}
+
+function blobText(data: Buffer | undefined): string {
+	return data && !isProbablyBinary(data) ? decodeUtf8(data) : '';
+}
+
+async function mapWithConcurrency<T, R>(values: T[], concurrency: number, map: (value: T) => Promise<R>): Promise<R[]> {
+	const results = new Array<R>(values.length);
+	let next = 0;
+	const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+		while (next < values.length) {
+			const index = next++;
+			results[index] = await map(values[index]);
+		}
+	});
+	await Promise.all(workers);
+	return results;
+}
+
+function assignFileOccurrences(hunks: GitReviewHunk[]): void {
+	const occurrences = new Map<string, number>();
+	for (const hunk of [...hunks].sort((left, right) => left.newStart - right.newStart || left.oldStart - right.oldStart)) {
+		const occurrence = occurrences.get(hunk.fingerprint) ?? 0;
+		occurrences.set(hunk.fingerprint, occurrence + 1);
+		hunk.occurrence = occurrence;
+		hunk.id = `${hunk.fingerprint}-${occurrence}`;
+	}
+}
+
+async function readCurrentText(
+	uri: vscode.Uri,
+	options: { preferDisk?: boolean; maxFileBytes?: number } = {},
+): Promise<{ exists: boolean; text: string; tooLarge?: boolean }> {
+	const openDocument = vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri.toString());
+	if (openDocument && !options.preferDisk) {
+		const text = openDocument.getText();
+		return options.maxFileBytes !== undefined && Buffer.byteLength(text, 'utf8') > options.maxFileBytes
+			? { exists: true, text: '', tooLarge: true }
+			: { exists: true, text };
+	}
 	try {
+		const stat = await vscode.workspace.fs.stat(uri);
+		if (options.maxFileBytes !== undefined && stat.size > options.maxFileBytes) {
+			return { exists: true, text: '', tooLarge: true };
+		}
 		const data = await vscode.workspace.fs.readFile(uri);
 		if (isProbablyBinary(data)) {
 			return { exists: true, text: '' };
 		}
-
 		return { exists: true, text: decodeUtf8(data) };
 	} catch {
 		return { exists: false, text: '' };

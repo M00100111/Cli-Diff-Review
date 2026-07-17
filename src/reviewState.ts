@@ -1,14 +1,33 @@
 import { splitLines } from './text';
-import type { FilePair, ReviewFileState, ReviewHunk } from './types';
+import type { ReviewedHunk, ReviewFileState, ReviewHunk } from './types';
 
 export function isStaleRevision(currentRevision: number, expectedRevision?: number): boolean {
 	return typeof expectedRevision === 'number' && currentRevision !== expectedRevision;
 }
 
-export interface CurrentTextState {
-	text: string;
-	exists: boolean;
-	skippedReason?: string;
+export function gitReviewFileStateFingerprint(file: ReviewFileState): string {
+	const hunk = (item: ReviewHunk | ReviewedHunk) => ({
+		id: item.id,
+		fingerprint: item.fingerprint,
+		layer: item.layer,
+		oldStart: item.oldStart,
+		oldLines: item.oldLines,
+		newStart: item.newStart,
+		newLines: item.newLines,
+		oldText: item.oldText,
+		newText: item.newText,
+		operable: item.operable,
+	});
+	return JSON.stringify({
+		head: file.gitSnapshot?.headText,
+		index: file.gitSnapshot?.indexText,
+		working: file.gitSnapshot?.workingText,
+		exists: [file.gitSnapshot?.headExists, file.gitSnapshot?.indexExists, file.gitSnapshot?.workingExists],
+		skippedReason: file.skippedReason,
+		pending: file.hunks.map(hunk),
+		accepted: file.acceptedHunks.map(hunk),
+		rejected: file.rejectedHunks.map(hunk),
+	});
 }
 
 export interface LineEdit {
@@ -22,19 +41,10 @@ export interface LineBlockContext {
 	after: string[];
 }
 
-export interface GitManualBaseline {
-	oldText: string;
-	baselineExists: boolean;
-}
-
 export interface ReviewRevealPosition {
 	line: number;
 	column: number;
 	hunkId: string;
-}
-
-export function skippedCurrentFile(skippedReason: string): CurrentTextState {
-	return { text: '', exists: true, skippedReason };
 }
 
 export function firstReviewRevealPosition(file: Pick<ReviewFileState, 'hunks' | 'acceptedHunks' | 'rejectedHunks'>): ReviewRevealPosition | undefined {
@@ -64,60 +74,6 @@ export function reviewHunkIdentity(hunk: Pick<ReviewHunk, 'fileUri' | 'kind' | '
 		hunk.oldText,
 		hunk.newText,
 	]);
-}
-
-export function shouldDeleteRejectedCurrentFileOnRefresh(
-	baselineExists: boolean,
-	currentText: string,
-	acceptedHunkCount: number,
-	rejectedHunkCount: number,
-): boolean {
-	return !baselineExists && currentText.length === 0 && acceptedHunkCount === 0 && rejectedHunkCount > 0;
-}
-
-export function shouldMergeReviewedFileOnRefresh(
-	pendingHunkCount: number,
-	acceptedHunkCount: number,
-	rejectedHunkCount: number,
-	skippedReason?: string,
-): boolean {
-	return pendingHunkCount === 0
-		&& !skippedReason
-		&& acceptedHunkCount + rejectedHunkCount > 0;
-}
-
-export function manualGitBaselineFromReviewedFile(file: ReviewFileState): GitManualBaseline | undefined {
-	if (file.skippedReason || (!file.currentExists && file.acceptedHunks.length === 0)) {
-		return undefined;
-	}
-
-	if (shouldMergeReviewedFileOnRefresh(file.hunks.length, file.acceptedHunks.length, file.rejectedHunks.length)) {
-		return {
-			oldText: file.newText,
-			baselineExists: file.currentExists,
-		};
-	}
-
-	if (file.acceptedHunks.length === 0) {
-		return undefined;
-	}
-
-	return {
-		oldText: file.oldText,
-		baselineExists: file.baselineExists,
-	};
-}
-
-export function applyManualGitBaselineToPair(pair: FilePair, baseline: GitManualBaseline | undefined): FilePair {
-	if (!baseline || pair.skippedReason) {
-		return pair;
-	}
-
-	return {
-		...pair,
-		oldText: baseline.oldText,
-		baselineExists: baseline.baselineExists,
-	};
 }
 
 export function mapLineAfterLineEdits(line: number, edits: LineEdit[]): number {

@@ -17,6 +17,7 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 
 	private readonly disposables: vscode.Disposable[] = [];
 	private readonly beforeDocumentEmitter = new vscode.EventEmitter<vscode.Uri>();
+	private readonly codeLensEmitter = new vscode.EventEmitter<void>();
 	private readonly openFileKeys = new Set<string>();
 
 	public constructor(
@@ -25,6 +26,7 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 	) {
 		this.disposables.push(
 			this.beforeDocumentEmitter,
+			this.codeLensEmitter,
 			vscode.workspace.registerTextDocumentContentProvider(NativeReviewEditorManager.beforeDocumentScheme, {
 				onDidChange: this.beforeDocumentEmitter.event,
 				provideTextDocumentContent: (uri) => this.provideReviewDocumentContent(uri),
@@ -32,6 +34,10 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 			vscode.workspace.registerTextDocumentContentProvider(NativeReviewEditorManager.afterDocumentScheme, {
 				onDidChange: this.beforeDocumentEmitter.event,
 				provideTextDocumentContent: (uri) => this.provideReviewDocumentContent(uri),
+			}),
+			vscode.languages.registerCodeLensProvider({ scheme: NativeReviewEditorManager.afterDocumentScheme }, {
+				onDidChangeCodeLenses: this.codeLensEmitter.event,
+				provideCodeLenses: (document) => this.provideReviewCodeLenses(document),
 			}),
 			vscode.window.tabGroups.onDidChangeTabs((event) => {
 				for (const tab of event.opened) {
@@ -136,6 +142,7 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 		}
 
 		const openTabs = this.nativeDiffTabs(uri);
+		this.codeLensEmitter.fire();
 		for (const tab of openTabs) {
 			const input = this.textDiffInput(tab);
 			if (input) {
@@ -222,6 +229,46 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 		return payload.side === 'after' ? file.newText : file.oldText;
 	}
 
+	private provideReviewCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
+		const payload = this.reviewDocumentPayload(document.uri);
+		if (!payload || payload.side !== 'after') {
+			return [];
+		}
+		const file = this.getSession()?.files.get(uriKey(payload.fileUri));
+		if (!file) {
+			return [];
+		}
+		const rangeAt = (line: number) => {
+			const safeLine = Math.max(0, Math.min(line, Math.max(0, document.lineCount - 1)));
+			return new vscode.Range(safeLine, 0, safeLine, 0);
+		};
+		const lenses: vscode.CodeLens[] = [];
+		for (const hunk of file.hunks) {
+			const range = rangeAt(hunk.newStart);
+			lenses.push(new vscode.CodeLens(range, {
+				title: '$(check) Accept',
+				command: 'cli-diff.acceptChange',
+				arguments: [file.uri.toString(), hunk.id, file.revision],
+			}));
+			lenses.push(new vscode.CodeLens(range, {
+				title: '$(close) Reject',
+				command: 'cli-diff.rejectChange',
+				arguments: [file.uri.toString(), hunk.id, file.revision],
+			}));
+		}
+		for (const hunk of [...file.acceptedHunks, ...file.rejectedHunks]) {
+			if (hunk.operable === false) {
+				continue;
+			}
+			lenses.push(new vscode.CodeLens(rangeAt(hunk.displayStart), {
+				title: hunk.status === 'accepted' ? '$(discard) Undo Accepted' : '$(discard) Undo Rejected',
+				command: 'cli-diff.restoreChange',
+				arguments: [file.uri.toString(), hunk.id, file.revision],
+			}));
+		}
+		return lenses;
+	}
+
 	private reviewDocumentUri(file: ReviewFileState, side: NativeReviewSide): vscode.Uri {
 		return this.reviewDocumentUriForFileUri(file.uri, side);
 	}
@@ -263,6 +310,9 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 		const diffConfig = vscode.workspace.getConfiguration('diffEditor');
 		if (diffConfig.get<boolean>('renderSideBySide') !== false) {
 			await diffConfig.update('renderSideBySide', false, vscode.ConfigurationTarget.Workspace);
+		}
+		if (diffConfig.get<boolean>('codeLens') !== true) {
+			await diffConfig.update('codeLens', true, vscode.ConfigurationTarget.Workspace);
 		}
 	}
 

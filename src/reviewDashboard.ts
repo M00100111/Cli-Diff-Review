@@ -400,6 +400,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		button:hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground); }
 		button:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
 		button:disabled { opacity: .45; cursor: default; }
+		.icon-button.review-action-pending svg { animation: review-action-spin .75s linear infinite; }
+		@keyframes review-action-spin { to { transform: rotate(360deg); } }
 		.shell {
 			height: 100vh;
 			min-height: 0;
@@ -1553,6 +1555,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			}
 		});
 		const icons = {
+			pending: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5a5.5 5.5 0 1 1-4.7 2.64"/><path d="M3.3 2.8v2.5h2.5"/></svg>',
 			acceptFile: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5L6.5 11.5L12.5 4.5"/></svg>',
 			rejectFile: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 4.5L11.5 11.5"/><path d="M11.5 4.5L4.5 11.5"/></svg>',
 			undoFile: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5H3.5V3.5"/><path d="M3.8 5.4A5 5 0 1 1 4.9 12"/></svg>',
@@ -2079,7 +2082,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			main.className = 'wiki-run-main';
 			const title = document.createElement('span');
 			title.className = 'wiki-run-title';
-			const decisionLabel = chunk.reviewDecision || (chunk.reviewStatus === 'reviewed' ? 'reviewed' : '');
+			const decisionLabel = chunk.reviewDecision === 'accepted'
+				? 'Accepted · Staged'
+				: chunk.reviewDecision === 'rejected' ? 'Rejected' : chunk.reviewStatus === 'pending' ? 'Pending' : '';
 			title.textContent = (decisionLabel ? decisionLabel + ' · ' : '') + chunk.kind + ' ' + chunk.oldLines + '->' + chunk.newLines + ' lines';
 			const meta = document.createElement('span');
 			meta.className = 'wiki-run-meta';
@@ -2632,6 +2637,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			button.disabled = Boolean(disabled);
 			button.addEventListener('click', (event) => {
 				event.stopPropagation();
+				markReviewActionPending(button);
 				vscode.postMessage({ type, uri, revision });
 			});
 			return button;
@@ -2651,9 +2657,17 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				if (button.disabled) {
 					return;
 				}
+				markReviewActionPending(button);
 				vscode.postMessage({ type, uri, hunkId, revision });
 			});
 			return button;
+		}
+
+		function markReviewActionPending(button) {
+			button.disabled = true;
+			button.classList.add('review-action-pending');
+			button.title = 'Applying Git change…';
+			button.innerHTML = icons.pending;
 		}
 
 		function setExpanded(nextExpanded) {
@@ -2991,7 +3005,16 @@ function dashboardExtension(relativePath: string): string {
 
 function dashboardStatus(file: ReviewFileState): { label: string; kind: ReviewDashboardFile['statusKind'] } {
 	if (file.skippedReason) {
-		return { label: 'S', kind: 'skipped' };
+		return { label: 'Unsupported Git change', kind: 'skipped' };
+	}
+	if (file.hunks.length > 0) {
+		return { label: 'Pending', kind: file.baselineExists ? 'modified' : 'untracked' };
+	}
+	if (file.rejectedHunks.length > 0) {
+		return { label: 'Rejected', kind: file.currentExists ? 'modified' : 'deleted' };
+	}
+	if (file.acceptedHunks.length > 0) {
+		return { label: 'Accepted · Staged', kind: file.currentExists ? 'modified' : 'deleted' };
 	}
 	if (!file.currentExists) {
 		return { label: 'D', kind: 'deleted' };

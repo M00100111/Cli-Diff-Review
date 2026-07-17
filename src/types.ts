@@ -1,12 +1,14 @@
 import * as vscode from 'vscode';
 
-export type ReviewMode = 'git' | 'snapshot';
+export type ReviewMode = 'git';
 
 export type ChangeKind = 'add' | 'delete' | 'modify';
 
 export type ReviewSource = 'accept' | 'reject';
 
 export type ReviewDecisionStatus = 'accepted' | 'rejected';
+
+export type GitReviewLayer = 'pending' | 'accepted' | 'rejected';
 
 export interface ReviewHunk {
 	id: string;
@@ -23,6 +25,30 @@ export interface ReviewHunk {
 	newContextBefore: string[];
 	newContextAfter: string[];
 	zoneAfterLineNumber: number;
+	layer?: GitReviewLayer;
+	patch?: string;
+	patchHeader?: string;
+	rawHunk?: string;
+	fingerprint?: string;
+	projectId?: string;
+	occurrence?: number;
+	operable?: boolean;
+}
+
+export interface GitReviewHunk extends ReviewHunk {
+	layer: GitReviewLayer;
+	patch: string;
+	fingerprint: string;
+	projectId: string;
+}
+
+export interface GitFileSnapshot {
+	headText: string;
+	indexText: string;
+	workingText: string;
+	headExists: boolean;
+	indexExists: boolean;
+	workingExists: boolean;
 }
 
 export interface ReviewedHunk extends ReviewHunk {
@@ -66,12 +92,15 @@ export interface ReviewFileState {
 	currentExists: boolean;
 	revision: number;
 	skippedReason?: string;
+	gitSnapshot?: GitFileSnapshot;
+	headOid?: string;
 }
 
 export interface ReviewProject {
 	id: string;
 	name: string;
 	rootUri: vscode.Uri;
+	headOid?: string;
 }
 
 export type ReviewTrackingTarget =
@@ -105,6 +134,10 @@ export interface FilePair {
 	baselineExists: boolean;
 	currentExists: boolean;
 	skippedReason?: string;
+	gitSnapshot?: GitFileSnapshot;
+	pendingHunks?: GitReviewHunk[];
+	acceptedHunks?: ReviewedHunk[];
+	headOid?: string;
 }
 
 export function uriKey(uri: vscode.Uri): string {

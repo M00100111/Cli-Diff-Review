@@ -24,14 +24,16 @@ export class ReviewTreeProvider implements vscode.TreeDataProvider<ReviewTreeNod
 		}
 		const item = new vscode.TreeItem(element.relativePath, vscode.TreeItemCollapsibleState.None);
 		const pending = element.hunks.length;
-		const reviewed = element.acceptedHunks.length + element.rejectedHunks.length;
+		const accepted = element.acceptedHunks.length;
+		const rejected = element.rejectedHunks.length;
+		const reviewed = accepted + rejected;
 		item.resourceUri = element.uri;
 		if (element.skippedReason) {
-			item.description = 'skipped';
+			item.description = 'Unsupported Git change';
 			item.tooltip = `${element.relativePath}\n${element.skippedReason}`;
 			item.contextValue = 'cliDiffFileSkipped';
 		} else {
-			item.description = fileDescription(pending, reviewed, fileAiReviewCounts(element, this.getAiReview()));
+			item.description = fileDescription(pending, accepted, rejected, fileAiReviewCounts(element, this.getAiReview()));
 			item.contextValue = pending > 0 && reviewed > 0
 			? 'cliDiffFilePendingReviewed'
 			: pending > 0 ? 'cliDiffFilePending' : reviewed > 0 ? 'cliDiffFileReviewed' : 'cliDiffFile';
@@ -72,12 +74,15 @@ export class ReviewTreeProvider implements vscode.TreeDataProvider<ReviewTreeNod
 	private projectTreeItem(element: ReviewProjectTreeNode): vscode.TreeItem {
 		const files = [...(this.getSession()?.files.values() ?? [])].filter((file) => file.projectId === element.project.id);
 		const pending = files.reduce((total, file) => total + file.hunks.length, 0);
-		const reviewed = files.reduce((total, file) => total + file.acceptedHunks.length + file.rejectedHunks.length, 0);
+		const accepted = files.reduce((total, file) => total + file.acceptedHunks.length, 0);
+		const rejected = files.reduce((total, file) => total + file.rejectedHunks.length, 0);
 		const item = new vscode.TreeItem(element.project.name, vscode.TreeItemCollapsibleState.Expanded);
 		item.contextValue = 'cliDiffProject';
-		item.description = pending > 0 && reviewed > 0
-			? `${pending} pending, ${reviewed} reviewed`
-			: pending > 0 ? `${pending} pending` : `${reviewed} reviewed`;
+		item.description = [
+			pending > 0 ? `${pending} Pending` : undefined,
+			accepted > 0 ? `${accepted} Accepted · Staged` : undefined,
+			rejected > 0 ? `${rejected} Rejected` : undefined,
+		].filter(Boolean).join(', ') || '0 Reviewed';
 		item.tooltip = element.project.rootUri.fsPath;
 		return item;
 	}
@@ -89,15 +94,22 @@ function isProjectNode(element: ReviewTreeNode): element is ReviewProjectTreeNod
 
 function fileDescription(
 	pending: number,
-	reviewed: number,
+	accepted: number,
+	rejected: number,
 	aiCounts: { findings: number; suggestions: number },
 ): string {
 	const parts: string[] = [];
 	if (pending > 0) {
-		parts.push(`${pending} pending`);
+		parts.push(`${pending} Pending`);
 	}
-	if (reviewed > 0 || parts.length === 0) {
-		parts.push(`${reviewed} reviewed`);
+	if (accepted > 0) {
+		parts.push(`${accepted} Accepted · Staged`);
+	}
+	if (rejected > 0) {
+		parts.push(`${rejected} Rejected`);
+	}
+	if (parts.length === 0) {
+		parts.push('0 Reviewed');
 	}
 	if (aiCounts.findings > 0) {
 		parts.push(`${aiCounts.findings} ${aiCounts.findings === 1 ? 'finding' : 'findings'}`);

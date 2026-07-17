@@ -880,7 +880,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 			add: 'Add',
 			delete: 'Delete',
 			modify: 'modify',
-			accepted: 'Accepted',
+			accepted: 'Accepted · Staged',
 			rejected: 'Rejected',
 			noData: '0 pending \\u00b7 0 reviewed',
 			goToDefinition: 'Go to Definition',
@@ -1260,7 +1260,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 				return;
 			}
 			if (state.skippedReason) {
-				statusNode.textContent = 'Skipped: ' + state.skippedReason;
+				statusNode.textContent = 'Unsupported Git change: ' + state.skippedReason;
 				return;
 			}
 			const reviewedCount = state.acceptedHunks.length + state.rejectedHunks.length;

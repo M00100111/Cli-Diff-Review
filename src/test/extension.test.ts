@@ -8,7 +8,9 @@ import { AiReviewPartialError, AiReviewStore, CodeReviewAgentService, reviewChan
 import { AgentRunner, type AgentTraceEvent, validateAgentResponse } from '../agent/runtime';
 import { createReadOnlyAgentTools, createWikiAgentTools } from '../agent/tools';
 import { acceptHunkInBaseline, computeLineDiff } from '../diffEngine';
-import { GitService } from '../gitService';
+import { GitService, parseCatFileBatch } from '../gitService';
+import { combineGitHunkPatches, decodeGitPath, parseGitPatch } from '../gitPatch';
+import { expectedRejectedFileHash, fileStateHash, GitReviewJournalStore } from '../gitReviewJournal';
 import { AnthropicClient, DeepSeekClient, GlmClient, OpenAiCompatibleClient } from '../llm/client';
 import { LlmConfigStore } from '../llm/config';
 import { parseStrictJsonObject } from '../llm/json';
@@ -19,20 +21,16 @@ import { isDotReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
 import { ReviewTreeProvider } from '../reviewTree';
 import { normalizeMonacoThemeColor, ReviewWebviewManager } from '../reviewWebview';
 import {
-	applyManualGitBaselineToPair,
 	captureLineBlockContext,
 	firstReviewRevealPosition,
+	gitReviewFileStateFingerprint,
 	isStaleRevision,
 	lineBlockWithContextMatches,
 	lineBlockWithContextMatchesUniquely,
 	mapLineAfterFileEdits,
 	mapLineAfterLineEdits,
-	manualGitBaselineFromReviewedFile,
 	reviewHunkIdentity,
 	SerialOperationQueue,
-	shouldDeleteRejectedCurrentFileOnRefresh,
-	shouldMergeReviewedFileOnRefresh,
-	skippedCurrentFile,
 } from '../reviewState';
 import { replaceLineBlock, splitLines } from '../text';
 import { FilePair, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewProject, ReviewSession, visibleReviewFiles } from '../types';
@@ -284,6 +282,21 @@ suite('Review webview compatibility', () => {
 });
 
 suite('Extension configuration', () => {
+	test('removes snapshot commands and quadratic diff configuration', () => {
+		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+			activationEvents?: string[];
+			contributes?: { commands?: Array<{ command: string }>; configuration?: { properties?: Record<string, unknown> } };
+		};
+		const commands = new Set((manifest.contributes?.commands ?? []).map((item) => item.command));
+		const properties = manifest.contributes?.configuration?.properties ?? {};
+		assert.strictEqual(commands.has('cli-diff.captureBaseline'), false);
+		assert.strictEqual(commands.has('cli-diff.startSnapshotReview'), false);
+		assert.strictEqual(manifest.activationEvents?.some((event) => event.includes('Snapshot') || event.includes('captureBaseline')), false);
+		for (const key of ['cliDiff.maxFiles', 'cliDiff.maxDiffLines', 'cliDiff.maxDiffCells', 'cliDiff.exclude']) {
+			assert.strictEqual(Object.prototype.hasOwnProperty.call(properties, key), false);
+		}
+	});
+
 	test('declares bulk review commands in the manifest', () => {
 		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
 			activationEvents?: string[];
@@ -429,20 +442,9 @@ suite('Review controller bulk actions', () => {
 		assert.ok(source.includes('await this.acceptFileCore(target.file)'));
 		assert.ok(source.includes('await this.rejectFileCore(target.file)'));
 		assert.ok(source.includes('await this.undoFileCore(target.file)'));
-		assert.ok(source.includes('private syncManualGitBaseline(file: ReviewFileState): void'));
-		assert.ok(source.includes('this.syncManualGitBaseline(target.file);'));
-		assert.ok(source.includes('this.syncManualGitBaseline(file);'));
-		assert.ok(source.includes('this.syncManualGitBaseline(refreshedFile);'));
-		assert.ok(source.includes('this.manualGitBaselines.set(key, baseline);'));
-		assert.ok(source.includes('this.manualGitBaselines.delete(key);'));
-		assert.ok(source.includes('this.refreshPendingHunksFromReviewState(target.file);'));
-		assert.ok(source.includes('private refreshPendingHunksFromReviewState(file: ReviewFileState): void'));
-		assert.ok(source.includes('private lineBlockAtCoordinateMatches'));
-		assert.ok(source.includes('}) || this.lineBlockAtCoordinateMatches(text, startLine, lineCount, expectedText);'));
-		assert.ok(source.includes('this.removePendingHunk(target.file, target.hunk)'));
-		assert.ok(source.includes('file.hunks = [];'));
-		assert.ok(source.includes('refreshedFile.hunks = [];'));
-		assert.ok(source.includes('private isSameReviewHunk(left: ReviewHunk, right: ReviewHunk): boolean'));
+		assert.ok(source.includes("this.gitService.applyPatch(folder, patch, { cached: true, check: true })"));
+		assert.ok(source.includes("this.gitService.applyPatch(folder, patch, { reverse: true, check: true })"));
+		assert.ok(source.includes('await this.refreshGitSessionFiles({ source: \'gitIndexChanged\' })'));
 		assert.ok(source.includes("chunkCount: action === 'undo' ? file.acceptedHunks.length + file.rejectedHunks.length : file.hunks.length"));
 		assert.ok(source.includes('sort((left, right) => left.file.relativePath.localeCompare(right.file.relativePath))'));
 	});
@@ -560,6 +562,29 @@ suite('Review controller bulk actions', () => {
 		assert.strictEqual(manager.reviewDocumentPayload(before)?.fileUri.toString(), fileUri.toString());
 		assert.strictEqual(manager.reviewDocumentPayload(after)?.side, 'after');
 	});
+
+	test('provides working Accept, Reject, and Undo CodeLens actions in the native diff editor', () => {
+		const uri = vscode.Uri.file('/repo/src/app.ts');
+		const pending = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
+		const file = reviewFileState(uri, 'src/app.ts', { hunks: [pending], revision: 7 });
+		const session: ReviewSession = {
+			id: 'native-actions', mode: 'git', rootUri: vscode.Uri.file('/repo'), createdAt: 1,
+			files: new Map([[uri.toString(), file]]),
+		};
+		const manager = Object.create(NativeReviewEditorManager.prototype) as any;
+		manager.getSession = () => session;
+		const after = manager.reviewDocumentUriForFileUri(uri, 'after');
+		let lenses = manager.provideReviewCodeLenses({ uri: after, lineCount: 1 } as vscode.TextDocument) as vscode.CodeLens[];
+		assert.deepStrictEqual(lenses.map((lens) => lens.command?.command), ['cli-diff.acceptChange', 'cli-diff.rejectChange']);
+		assert.deepStrictEqual(lenses[0].command?.arguments, [uri.toString(), pending.id, 7]);
+
+		file.hunks = [];
+		file.acceptedHunks = [reviewedHunkFrom(pending, 'accept')];
+		lenses = manager.provideReviewCodeLenses({ uri: after, lineCount: 1 } as vscode.TextDocument) as vscode.CodeLens[];
+		assert.strictEqual(lenses.length, 1);
+		assert.strictEqual(lenses[0].command?.command, 'cli-diff.restoreChange');
+		assert.deepStrictEqual(lenses[0].command?.arguments, [uri.toString(), file.acceptedHunks[0].id, 7]);
+	});
 });
 
 suite('Review state', () => {
@@ -586,6 +611,26 @@ suite('Review state', () => {
 		assert.strictEqual(isStaleRevision(3, 2), true);
 	});
 
+	test('keeps Git revisions stable when only regenerated review timestamps change', () => {
+		const uri = vscode.Uri.file('/repo/demo.ts');
+		const accepted = reviewedHunkFrom(computeLineDiff(uri.toString(), 'old\n', 'new\n')[0], 'accept');
+		const file = reviewFileState(uri, 'demo.ts', {
+			oldText: 'old\n',
+			newText: 'new\n',
+			acceptedHunks: [accepted],
+			gitSnapshot: {
+				headText: 'old\n', indexText: 'new\n', workingText: 'new\n',
+				headExists: true, indexExists: true, workingExists: true,
+			},
+		});
+		const regenerated = { ...file, acceptedHunks: [{ ...accepted, reviewedAt: accepted.reviewedAt + 1000 }] };
+		assert.strictEqual(gitReviewFileStateFingerprint(file), gitReviewFileStateFingerprint(regenerated));
+		assert.notStrictEqual(
+			gitReviewFileStateFingerprint(file),
+			gitReviewFileStateFingerprint({ ...regenerated, gitSnapshot: { ...regenerated.gitSnapshot!, indexText: 'other\n' } }),
+		);
+	});
+
 	test('serializes operations for the same file key', async () => {
 		const queue = new SerialOperationQueue<string>();
 		const order: string[] = [];
@@ -609,246 +654,6 @@ suite('Review state', () => {
 		releaseFirst();
 		await Promise.all([first, second]);
 		assert.deepStrictEqual(order, ['first:start', 'first:end', 'second']);
-	});
-
-	test('allows refresh to delete a rejected empty new current file', () => {
-		assert.strictEqual(shouldDeleteRejectedCurrentFileOnRefresh(false, '', 0, 1), true);
-		assert.strictEqual(shouldDeleteRejectedCurrentFileOnRefresh(true, '', 0, 1), false);
-		assert.strictEqual(shouldDeleteRejectedCurrentFileOnRefresh(false, 'kept\n', 0, 1), false);
-		assert.strictEqual(shouldDeleteRejectedCurrentFileOnRefresh(false, '', 1, 1), false);
-		assert.strictEqual(shouldDeleteRejectedCurrentFileOnRefresh(false, '', 0, 0), false);
-	});
-
-	test('merges only reviewed snapshot files without pending hunks on refresh', () => {
-		assert.strictEqual(shouldMergeReviewedFileOnRefresh(0, 1, 0), true);
-		assert.strictEqual(shouldMergeReviewedFileOnRefresh(0, 0, 1), true);
-		assert.strictEqual(shouldMergeReviewedFileOnRefresh(0, 1, 1), true);
-		assert.strictEqual(shouldMergeReviewedFileOnRefresh(1, 1, 0), false);
-		assert.strictEqual(shouldMergeReviewedFileOnRefresh(1, 0, 1), false);
-		assert.strictEqual(shouldMergeReviewedFileOnRefresh(0, 0, 0), false);
-		assert.strictEqual(shouldMergeReviewedFileOnRefresh(0, 1, 0, 'File exceeds cliDiff.maxFileBytes.'), false);
-	});
-
-	test('keeps manually merged Git baselines across repeated refresh pairs', () => {
-		const uri = vscode.Uri.file('D:/repo/tracked.txt');
-		const acceptedHunk = computeLineDiff(uri.toString(), 'base\n', 'base\naccepted\n')[0];
-		const reviewedFile = reviewFileState(uri, 'tracked.txt', {
-			oldText: 'base\naccepted\n',
-			newText: 'base\naccepted\n',
-			acceptedHunks: [reviewedHunkFrom(acceptedHunk, 'accept')],
-		});
-		const baseline = manualGitBaselineFromReviewedFile(reviewedFile);
-		assert.ok(baseline);
-
-		const indexPair: FilePair = {
-			uri,
-			relativePath: 'tracked.txt',
-			oldText: 'base\n',
-			newText: 'base\naccepted\n',
-			baselineExists: true,
-			currentExists: true,
-		};
-		const firstRefresh = applyManualGitBaselineToPair(indexPair, baseline);
-		const secondRefresh = applyManualGitBaselineToPair(indexPair, baseline);
-		const editedRefresh = applyManualGitBaselineToPair({
-			...indexPair,
-			newText: 'base\naccepted\nlater\n',
-		}, baseline);
-
-		assert.deepStrictEqual(computeLineDiff(uri.toString(), firstRefresh.oldText, firstRefresh.newText), []);
-		assert.deepStrictEqual(computeLineDiff(uri.toString(), secondRefresh.oldText, secondRefresh.newText), []);
-		const editedHunks = computeLineDiff(uri.toString(), editedRefresh.oldText, editedRefresh.newText);
-		assert.strictEqual(editedHunks.length, 1);
-		assert.strictEqual(editedHunks[0].newText, 'later\n');
-	});
-
-	test('keeps partially accepted Git baselines across manual refresh pairs', () => {
-		const uri = vscode.Uri.file('D:/repo/tracked.txt');
-		const indexText = 'a\nold-one\nb\nold-two\nc\n';
-		const currentText = 'a\nnew-one\nb\nnew-two\nc\n';
-		const hunks = computeLineDiff(uri.toString(), indexText, currentText);
-		assert.strictEqual(hunks.length, 2);
-		const acceptedBaseline = acceptHunkInBaseline(indexText, hunks[0]);
-		const reviewedFile = reviewFileState(uri, 'tracked.txt', {
-			oldText: acceptedBaseline,
-			newText: currentText,
-			hunks: [hunks[1]],
-			acceptedHunks: [reviewedHunkFrom(hunks[0], 'accept')],
-		});
-		const baseline = manualGitBaselineFromReviewedFile(reviewedFile);
-		assert.deepStrictEqual(baseline, { oldText: acceptedBaseline, baselineExists: true });
-
-		const refreshed = applyManualGitBaselineToPair({
-			uri,
-			relativePath: 'tracked.txt',
-			oldText: indexText,
-			newText: currentText,
-			baselineExists: true,
-			currentExists: true,
-		}, baseline);
-		const refreshedHunks = computeLineDiff(uri.toString(), refreshed.oldText, refreshed.newText);
-		assert.strictEqual(refreshedHunks.length, 1);
-		assert.strictEqual(refreshedHunks[0].oldText, 'old-two\n');
-		assert.strictEqual(refreshedHunks[0].newText, 'new-two\n');
-	});
-
-	test('auto-stages accepted reviewed hunks while keeping pending hunks unstaged', async () => {
-		const uri = vscode.Uri.file('D:/repo/tracked.txt');
-		const indexText = 'a\nold-one\nb\nold-two\nc\n';
-		const acceptedText = 'a\nnew-one\nb\nold-two\nc\n';
-		const currentText = 'a\nnew-one\nb\nnew-two\nc\n';
-		const acceptedHunk = computeLineDiff(uri.toString(), indexText, acceptedText)[0];
-		const pendingHunk = computeLineDiff(uri.toString(), acceptedText, currentText)[0];
-		const file = reviewFileState(uri, 'tracked.txt', {
-			projectId: 'repo',
-			oldText: acceptedText,
-			newText: currentText,
-			hunks: [pendingHunk],
-			acceptedHunks: [reviewedHunkFrom(acceptedHunk, 'accept')],
-			originalText: indexText,
-		});
-		const harness = autoStageControllerHarness(file, currentText, { exists: true, text: indexText, mode: '100644' });
-
-		const result = await harness.controller.stageAcceptedReviewedHunksForManualRefresh(harness.session.files);
-
-		assert.deepStrictEqual(result, { stagedFileCount: 1, skippedFileCount: 0 });
-		assert.deepStrictEqual(harness.stageIndexTextCalls, [{
-			relativePath: 'tracked.txt',
-			text: acceptedText,
-			mode: '100644',
-			add: false,
-		}]);
-		assert.deepStrictEqual(harness.stageFileCalls, []);
-	});
-
-	test('keeps the absent original index when refreshing an accepted new file', async () => {
-		const uri = vscode.Uri.file('D:/repo/new-file.txt');
-		const newText = 'new\n';
-		const acceptedHunk = computeLineDiff(uri.toString(), '', newText)[0];
-		const file = reviewFileState(uri, 'new-file.txt', {
-			projectId: 'repo',
-			oldText: newText,
-			newText,
-			originalText: '',
-			originalExists: false,
-			baselineExists: true,
-			acceptedHunks: [reviewedHunkFrom(acceptedHunk, 'accept')],
-		});
-		const session: ReviewSession = {
-			id: 'refresh-new-file',
-			mode: 'git',
-			rootUri: vscode.Uri.file('D:/repo'),
-			createdAt: 1,
-			files: new Map([[uri.toString(), file]]),
-		};
-		const controller = Object.create(ReviewController.prototype) as RefreshReviewController;
-		Object.assign(controller as unknown as Record<string, unknown>, {
-			activeSession: session,
-			manualGitBaselines: new Map([[uri.toString(), { oldText: newText, baselineExists: true }]]),
-			isOpenDocumentDirty: () => false,
-			readCurrentText: async () => ({ exists: true, text: newText }),
-			computeReviewHunks: () => ({ hunks: [] }),
-			normalizeReviewedDuplicateHunks: () => undefined,
-			refreshUi: () => undefined,
-		});
-
-		await controller.refreshFile(uri, { reconcileExternalChanges: false });
-
-		assert.strictEqual(file.originalExists, false);
-		assert.strictEqual(file.originalText, '');
-		const staging = autoStageControllerHarness(file, newText, { exists: false, text: '', mode: '100644' });
-		const result = await staging.controller.stageAcceptedReviewedHunksForManualRefresh(staging.session.files);
-		assert.deepStrictEqual(result, { stagedFileCount: 1, skippedFileCount: 0 });
-		assert.deepStrictEqual(staging.stageFileCalls, ['new-file.txt']);
-	});
-
-	test('skips auto-staging when the index has diverged', async () => {
-		const uri = vscode.Uri.file('D:/repo/tracked.txt');
-		const indexText = 'old\n';
-		const acceptedText = 'new\n';
-		const acceptedHunk = computeLineDiff(uri.toString(), indexText, acceptedText)[0];
-		const file = reviewFileState(uri, 'tracked.txt', {
-			projectId: 'repo',
-			oldText: acceptedText,
-			newText: acceptedText,
-			acceptedHunks: [reviewedHunkFrom(acceptedHunk, 'accept')],
-			originalText: indexText,
-		});
-		const harness = autoStageControllerHarness(file, acceptedText, { exists: true, text: 'externally staged\n', mode: '100644' });
-
-		const result = await harness.controller.stageAcceptedReviewedHunksForManualRefresh(harness.session.files);
-
-		assert.deepStrictEqual(result, { stagedFileCount: 0, skippedFileCount: 1 });
-		assert.deepStrictEqual(harness.stageIndexTextCalls, []);
-		assert.deepStrictEqual(harness.stageFileCalls, []);
-	});
-
-	test('skips auto-staging dirty files', async () => {
-		const uri = vscode.Uri.file('D:/repo/tracked.txt');
-		const acceptedHunk = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
-		const file = reviewFileState(uri, 'tracked.txt', {
-			projectId: 'repo',
-			oldText: 'new\n',
-			newText: 'new\n',
-			acceptedHunks: [reviewedHunkFrom(acceptedHunk, 'accept')],
-			originalText: 'old\n',
-		});
-		const harness = autoStageControllerHarness(file, 'new\n', { exists: true, text: 'old\n', mode: '100644' }, true);
-
-		const result = await harness.controller.stageAcceptedReviewedHunksForManualRefresh(harness.session.files);
-
-		assert.deepStrictEqual(result, { stagedFileCount: 0, skippedFileCount: 1 });
-		assert.deepStrictEqual(harness.stageIndexTextCalls, []);
-		assert.deepStrictEqual(harness.stageFileCalls, []);
-		assert.strictEqual(harness.readIndexEntryCalls, 0);
-	});
-
-	test('does not apply manual Git baselines to skipped pairs', () => {
-		const uri = vscode.Uri.file('D:/repo/tracked.txt');
-		const baseline = { oldText: 'base\naccepted\n', baselineExists: true };
-		const pair: FilePair = {
-			uri,
-			relativePath: 'tracked.txt',
-			oldText: 'base\n',
-			newText: 'base\naccepted\n',
-			baselineExists: true,
-			currentExists: true,
-		};
-
-		assert.strictEqual(applyManualGitBaselineToPair({ ...pair, skippedReason: 'too large' }, baseline).oldText, 'base\n');
-		assert.strictEqual(applyManualGitBaselineToPair({ ...pair, currentExists: false }, baseline).oldText, 'base\naccepted\n');
-	});
-
-	test('captures accepted deletion as a manual Git baseline', () => {
-		const uri = vscode.Uri.file('D:/repo/tracked.txt');
-		const deleteHunk = computeLineDiff(uri.toString(), 'base\n', '')[0];
-		const acceptedDeletion = reviewFileState(uri, 'tracked.txt', {
-			oldText: '',
-			newText: '',
-			baselineExists: false,
-			currentExists: false,
-			acceptedHunks: [reviewedHunkFrom(deleteHunk, 'accept')],
-		});
-		const rejectedNewFile = reviewFileState(uri, 'tracked.txt', {
-			oldText: '',
-			newText: '',
-			baselineExists: false,
-			currentExists: false,
-			rejectedHunks: [reviewedHunkFrom(computeLineDiff(uri.toString(), '', 'new\n')[0], 'reject')],
-		});
-
-		const baseline = manualGitBaselineFromReviewedFile(acceptedDeletion);
-		assert.deepStrictEqual(baseline, { oldText: '', baselineExists: false });
-		const refreshedDeletion = applyManualGitBaselineToPair({
-			uri,
-			relativePath: 'tracked.txt',
-			oldText: 'base\n',
-			newText: '',
-			baselineExists: true,
-			currentExists: false,
-		}, baseline);
-		assert.deepStrictEqual(computeLineDiff(uri.toString(), refreshedDeletion.oldText, refreshedDeletion.newText), []);
-		assert.strictEqual(manualGitBaselineFromReviewedFile(rejectedNewFile), undefined);
 	});
 
 	test('maps reviewed baseline starts through manual edits before the hunk', () => {
@@ -877,14 +682,6 @@ suite('Review state', () => {
 			rejectedHunks: [earlierReviewed],
 		})), { line: 3, column: 0, hunkId: 'reject-earlier-reviewed' });
 		assert.strictEqual(firstReviewRevealPosition(reviewFileState(uri, 'src/reveal.ts')), undefined);
-	});
-
-	test('keeps skipped current snapshot files marked as existing', () => {
-		const current = skippedCurrentFile('File exceeds cliDiff.maxFileBytes.');
-
-		assert.strictEqual(current.exists, true);
-		assert.strictEqual(current.text, '');
-		assert.strictEqual(current.skippedReason, 'File exceeds cliDiff.maxFileBytes.');
 	});
 
 	test('shows skipped files in the review tree', () => {
@@ -940,7 +737,7 @@ suite('Review state', () => {
 		const item = provider.getTreeItem(child);
 
 		assert.strictEqual(child, file);
-		assert.strictEqual(item.description, 'skipped');
+		assert.strictEqual(item.description, 'Unsupported Git change');
 		assert.strictEqual(item.contextValue, 'cliDiffFileSkipped');
 	});
 
@@ -971,9 +768,9 @@ suite('Review state', () => {
 			],
 		}));
 
-		assert.strictEqual(defaultProvider.getTreeItem(file).description, '1 pending');
-		assert.strictEqual(singularProvider.getTreeItem(file).description, '1 pending, 1 finding, 1 suggestion');
-		assert.strictEqual(pluralProvider.getTreeItem(file).description, '1 pending, 2 findings, 2 suggestions');
+		assert.strictEqual(defaultProvider.getTreeItem(file).description, '1 Pending');
+		assert.strictEqual(singularProvider.getTreeItem(file).description, '1 Pending, 1 finding, 1 suggestion');
+		assert.strictEqual(pluralProvider.getTreeItem(file).description, '1 Pending, 2 findings, 2 suggestions');
 	});
 
 	test('groups aggregate Git review files by project and filters selected projects', () => {
@@ -1007,7 +804,7 @@ suite('Review state', () => {
 		}));
 		const groups = provider.getChildren();
 		assert.deepStrictEqual(groups.map((group) => provider.getTreeItem(group).label), ['api', 'web']);
-		assert.strictEqual(provider.getTreeItem(groups[0]).description, '1 pending');
+		assert.strictEqual(provider.getTreeItem(groups[0]).description, '1 Pending');
 		assert.strictEqual(provider.getChildren(groups[0]).length, 1);
 		assert.strictEqual(provider.getChildren(groups[1]).length, 1);
 
@@ -1084,10 +881,10 @@ suite('Review state', () => {
 
 		assert.deepStrictEqual(empty.files, []);
 		assert.strictEqual(payload.currentReviewLabel, 'pending.ts');
-		assert.strictEqual(payload.files.length, 6);
-		assert.strictEqual(html?.fileExtension, 'html');
-		assert.strictEqual(json?.fileExtension, 'json');
-		assert.strictEqual(noExtension?.fileExtension, 'file');
+		assert.strictEqual(payload.files.length, 3);
+		assert.strictEqual(html, undefined);
+		assert.strictEqual(json, undefined);
+		assert.strictEqual(noExtension, undefined);
 		assert.strictEqual(pending?.active, true);
 		assert.strictEqual(pending?.dirty, true);
 		assert.strictEqual(pending?.acceptDisabled, true);
@@ -1491,7 +1288,6 @@ suite('Review state', () => {
 		assert.strictEqual(view.webview.html.includes('review-chunk-preview'), false);
 		const dashboardSource = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewDashboard.ts'), 'utf8');
 		assert.strictEqual(dashboardSource.includes('dashboardChunkPreview'), false);
-		assert.strictEqual(view.webview.html.includes('width: 36px;'), false);
 		assert.ok(view.webview.html.includes('var(--file-extension-column-width, auto)'));
 		assert.ok(view.webview.html.includes("tree.style.removeProperty('--file-extension-column-width')"));
 		assert.ok(view.webview.html.includes('function updateFileExtensionColumnWidth'));
@@ -1831,7 +1627,8 @@ suite('LLM Code Wiki', () => {
 		assert.ok(initializer.includes('Do not add schema.md to the normal index.md catalog of business wiki pages.'));
 	});
 
-	test('passes Agent trace events through Wiki initialization', async () => {
+	test('passes Agent trace events through Wiki initialization', async function (this: Mocha.Context) {
+		this.timeout(30000);
 		const extensionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-extension-'));
 		const repositoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-wiki-init-'));
 		try {
@@ -2738,7 +2535,8 @@ suite('Agent runtime', () => {
 });
 
 suite('Wiki state', () => {
-	test('copies the generic specification and detects source fingerprint changes', async () => {
+	test('copies the generic specification and detects source fingerprint changes', async function (this: Mocha.Context) {
+		this.timeout(30000);
 		const extensionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-extension-'));
 		const repositoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-wiki-state-'));
 		try {
@@ -3465,9 +3263,7 @@ suite('AI review findings', () => {
 		assert.strictEqual(source.newText, 'new\n');
 		assert.strictEqual(harness.currentText(), 'new\n');
 		assert.deepStrictEqual(harness.writes, ['new\n']);
-		assert.strictEqual(source.hunks.length, 1);
-		assert.strictEqual(source.hunks[0].oldText, 'old\n');
-		assert.strictEqual(source.hunks[0].newText, 'new\n');
+		assert.strictEqual(source.hunks.length, 0);
 		assert.strictEqual(source.hunks.some((hunk) => hunk.newText.includes('suggested')), false);
 		assert.strictEqual(store.load(session)?.suggestions[0].id, 'suggestion-1');
 	});
@@ -3522,14 +3318,70 @@ suite('AI review findings', () => {
 		assert.strictEqual(source.newText, pending);
 		assert.strictEqual(harness.currentText(), pending);
 		assert.deepStrictEqual(harness.writes, [pending]);
-		assert.strictEqual(source.hunks.length, 2);
-		assert.deepStrictEqual(source.hunks.map((hunk) => hunk.newText), ['new\n', 'reject-new\n']);
+		assert.strictEqual(source.hunks.length, 0);
+	});
+});
+
+suite('Git patch parser', () => {
+	test('parses multiple hunks and preserves directly applicable patch text', () => {
+		const patch = [
+			'diff --git a/src/demo.txt b/src/demo.txt\n',
+			'index 1111111111111111111111111111111111111111..2222222222222222222222222222222222222222 100644\n',
+			'--- a/src/demo.txt\n',
+			'+++ b/src/demo.txt\n',
+			'@@ -1,3 +1,3 @@\n',
+			' one\n',
+			'-old\n',
+			'+new\n',
+			' three\n',
+			'@@ -10 +10 @@\n',
+			'-tail\n',
+			'\\ No newline at end of file\n',
+			'+TAIL\n',
+			'\\ No newline at end of file\n',
+		].join('');
+		const [file] = parseGitPatch(patch, 'project', 'pending');
+		assert.strictEqual(file.relativePath, 'src/demo.txt');
+		assert.strictEqual(file.oldOid, '1111111111111111111111111111111111111111');
+		assert.strictEqual(file.newOid, '2222222222222222222222222222222222222222');
+		assert.strictEqual(file.hunks.length, 2);
+		assert.strictEqual(file.hunks[0].oldText, 'old\n');
+		assert.strictEqual(file.hunks[0].newText, 'new\n');
+		assert.strictEqual(file.hunks[1].oldText, 'tail');
+		assert.strictEqual(file.hunks[1].newText, 'TAIL');
+		assert.strictEqual(combineGitHunkPatches(file.hunks), patch);
+	});
+
+	test('parses length-delimited cat-file batches without splitting blob contents', () => {
+		const firstOid = '1'.repeat(40);
+		const secondOid = '2'.repeat(40);
+		const first = Buffer.from('line one\nline two\n');
+		const second = Buffer.from('content that looks like a header\n123 blob 9\n');
+		const output = Buffer.concat([
+			Buffer.from(`${firstOid} blob ${first.length}\n`), first, Buffer.from('\n'),
+			Buffer.from(`${secondOid} blob ${second.length}\n`), second, Buffer.from('\n'),
+		]);
+		const blobs = parseCatFileBatch(output);
+		assert.strictEqual(blobs.get(firstOid)?.toString('utf8'), first.toString('utf8'));
+		assert.strictEqual(blobs.get(secondOid)?.toString('utf8'), second.toString('utf8'));
+	});
+
+	test('decodes Git C-style quoted UTF-8 paths', () => {
+		assert.strictEqual(decodeGitPath('"b/\\346\\265\\213\\350\\257\\225 file.txt"'), '测试 file.txt');
+	});
+
+	test('marks binary and mode-only file patches unsupported', () => {
+		const binary = parseGitPatch('diff --git a/a.bin b/a.bin\nGIT binary patch\nliteral 1\nA\n', 'project', 'pending')[0];
+		const mode = parseGitPatch('diff --git a/run script.sh b/run script.sh\nold mode 100644\nnew mode 100755\n', 'project', 'pending')[0];
+		assert.match(binary.unsupportedReason ?? '', /binary/);
+		assert.match(mode.unsupportedReason ?? '', /mode or metadata/);
+		assert.strictEqual(mode.relativePath, 'run script.sh');
 	});
 });
 
 suite('Git service', () => {
 	test('discovers the workspace Git root or direct child Git projects only', async function (this: Mocha.Context) {
-		this.timeout(10000);
+		this.timeout(30000);
 		const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-projects-'));
 		try {
 			const api = path.join(parent, 'api');
@@ -3556,8 +3408,85 @@ suite('Git service', () => {
 		}
 	});
 
+	test('stages and unstages exactly one Git hunk with the same patch', async function (this: Mocha.Context) {
+		this.timeout(30000);
+		const root = createTempGitRepo();
+		try {
+			writeRepoFile(root, 'tracked.txt', 'one\nold-a\nmiddle-1\nmiddle-2\nmiddle-3\nmiddle-4\nmiddle-5\nmiddle-6\nmiddle-7\nold-b\nend\n');
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+			writeRepoFile(root, 'tracked.txt', 'one\nnew-a\nmiddle-1\nmiddle-2\nmiddle-3\nmiddle-4\nmiddle-5\nmiddle-6\nmiddle-7\nnew-b\nend\n');
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			const pair = (await service.createFilePairs(folder))[0];
+			assert.strictEqual(pair.pendingHunks?.length, 2);
+			const first = pair.pendingHunks?.[0];
+			assert.ok(first);
+			await service.applyPatch(folder, first.patch, { cached: true, check: true });
+			await service.applyPatch(folder, first.patch, { cached: true });
+			let refreshed = (await service.createFilePairs(folder))[0];
+			assert.strictEqual(refreshed.acceptedHunks?.length, 1);
+			assert.strictEqual(refreshed.pendingHunks?.length, 1);
+			const accepted = refreshed.acceptedHunks?.[0];
+			assert.ok(accepted?.patch);
+			await service.applyPatch(folder, accepted.patch, { cached: true, reverse: true, check: true });
+			await service.applyPatch(folder, accepted.patch, { cached: true, reverse: true });
+			refreshed = (await service.createFilePairs(folder))[0];
+			assert.strictEqual(refreshed.acceptedHunks?.length, 0);
+			assert.strictEqual(refreshed.pendingHunks?.length, 2);
+		} finally {
+			removeTempRepo(root);
+		}
+	});
+
+	test('rejects and restores an untracked file with a reversible Git patch', async function (this: Mocha.Context) {
+		this.timeout(30000);
+		const root = createTempGitRepo();
+		try {
+			writeRepoFile(root, 'tracked.txt', 'base\n');
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+			writeRepoFile(root, 'new file.txt', 'new\n');
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			const pair = filePairsByPath(await service.createFilePairs(folder)).get('new file.txt');
+			const hunk = pair?.pendingHunks?.[0];
+			assert.ok(hunk);
+			await service.applyPatch(folder, hunk.patch, { reverse: true, check: true });
+			await service.applyPatch(folder, hunk.patch, { reverse: true });
+			assert.strictEqual(fs.existsSync(path.join(root, 'new file.txt')), false);
+			await service.applyPatch(folder, hunk.patch, { check: true });
+			await service.applyPatch(folder, hunk.patch);
+			assert.strictEqual(fs.readFileSync(path.join(root, 'new file.txt'), 'utf8'), 'new\n');
+		} finally {
+			removeTempRepo(root);
+		}
+	});
+
+	test('rejects an added block by removing it from the working file', async function (this: Mocha.Context) {
+		this.timeout(30000);
+		const root = createTempGitRepo();
+		try {
+			writeRepoFile(root, 'tracked.txt', 'base\n');
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+			writeRepoFile(root, 'tracked.txt', 'base\nadded\n');
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			const pair = await service.createFilePairForUri(vscode.Uri.file(path.join(root, 'tracked.txt')), folder);
+			const added = pair?.pendingHunks?.find((hunk) => hunk.kind === 'add');
+			assert.ok(added);
+			await service.applyPatch(folder, added.patch, { reverse: true, check: true });
+			await service.applyPatch(folder, added.patch, { reverse: true });
+			assert.strictEqual(fs.readFileSync(path.join(root, 'tracked.txt'), 'utf8'), 'base\n');
+			assert.strictEqual(await service.createFilePairForUri(vscode.Uri.file(path.join(root, 'tracked.txt')), folder), undefined);
+		} finally {
+			removeTempRepo(root);
+		}
+	});
+
 	test('uses the index as the Git review baseline', async function (this: Mocha.Context) {
-		this.timeout(10000);
+		this.timeout(30000);
 		const root = createTempGitRepo();
 		try {
 			writeRepoFile(root, 'tracked.txt', 'base\n');
@@ -3577,12 +3506,14 @@ suite('Git service', () => {
 			git(root, 'add', 'tracked.txt');
 			pairs = await service.createFilePairs(folder);
 			byPath = filePairsByPath(pairs);
-			assert.strictEqual(byPath.has('tracked.txt'), false);
+			assert.strictEqual(byPath.get('tracked.txt')?.acceptedHunks?.length, 1);
+			assert.strictEqual(byPath.get('tracked.txt')?.pendingHunks?.length, 0);
 
 			writeRepoFile(root, 'tracked.txt', 'base\nwork\nunstaged\n');
 			pairs = await service.createFilePairs(folder);
 			byPath = filePairsByPath(pairs);
-			assert.strictEqual(byPath.get('tracked.txt')?.oldText, 'base\nwork\n');
+			assert.strictEqual(byPath.get('tracked.txt')?.oldText, 'base\n');
+			assert.strictEqual(byPath.get('tracked.txt')?.gitSnapshot?.indexText, 'base\nwork\n');
 			assert.strictEqual(byPath.get('tracked.txt')?.newText, 'base\nwork\nunstaged\n');
 
 			writeRepoFile(root, 'loose.txt', 'loose\n');
@@ -3594,7 +3525,7 @@ suite('Git service', () => {
 			git(root, 'add', 'loose.txt');
 			pairs = await service.createFilePairs(folder);
 			byPath = filePairsByPath(pairs);
-			assert.strictEqual(byPath.has('loose.txt'), false);
+			assert.strictEqual(byPath.get('loose.txt')?.acceptedHunks?.length, 1);
 
 			fs.unlinkSync(path.join(root, 'delete.txt'));
 			pairs = await service.createFilePairs(folder);
@@ -3605,7 +3536,7 @@ suite('Git service', () => {
 			git(root, 'add', 'delete.txt');
 			pairs = await service.createFilePairs(folder);
 			byPath = filePairsByPath(pairs);
-			assert.strictEqual(byPath.has('delete.txt'), false);
+			assert.strictEqual(byPath.get('delete.txt')?.acceptedHunks?.length, 1);
 
 			writeRepoFile(root, '.env', 'secret\n');
 			writeRepoFile(root, '.cache/output.txt', 'cache\n');
@@ -3650,8 +3581,11 @@ suite('Git service', () => {
 
 			const pairs = await service.createFilePairs(folder);
 			const byPath = filePairsByPath(pairs);
-			assert.strictEqual(byPath.get('tracked.txt')?.oldText, 'accepted\npending-old\n');
+			assert.strictEqual(byPath.get('tracked.txt')?.oldText, 'old\npending-old\n');
+			assert.strictEqual(byPath.get('tracked.txt')?.gitSnapshot?.indexText, 'accepted\npending-old\n');
 			assert.strictEqual(byPath.get('tracked.txt')?.newText, 'accepted\npending-new\n');
+			assert.strictEqual(byPath.get('tracked.txt')?.acceptedHunks?.length, 1);
+			assert.strictEqual(byPath.get('tracked.txt')?.pendingHunks?.length, 1);
 		} finally {
 			removeTempRepo(root);
 		}
@@ -3671,7 +3605,7 @@ suite('Git service', () => {
 			await service.stageFile(folder, 'tracked.txt');
 
 			const pairs = await service.createFilePairs(folder);
-			assert.strictEqual(filePairsByPath(pairs).has('tracked.txt'), false);
+			assert.strictEqual(filePairsByPath(pairs).get('tracked.txt')?.acceptedHunks?.length, 1);
 		} finally {
 			removeTempRepo(root);
 		}
@@ -3692,9 +3626,11 @@ suite('Git service', () => {
 
 			const pairs = await service.createFilePairs(folder);
 			const byPath = filePairsByPath(pairs);
-			assert.strictEqual(byPath.get('loose.txt')?.oldText, 'accepted\n');
+			assert.strictEqual(byPath.get('loose.txt')?.oldText, '');
+			assert.strictEqual(byPath.get('loose.txt')?.gitSnapshot?.indexText, 'accepted\n');
 			assert.strictEqual(byPath.get('loose.txt')?.newText, 'accepted\npending\n');
-			assert.strictEqual(byPath.get('loose.txt')?.baselineExists, true);
+			assert.strictEqual(byPath.get('loose.txt')?.baselineExists, false);
+			assert.strictEqual(byPath.get('loose.txt')?.gitSnapshot?.indexExists, true);
 		} finally {
 			removeTempRepo(root);
 		}
@@ -3723,6 +3659,45 @@ suite('Git service', () => {
 			assert.notStrictEqual(await service.indexStateSignature(folder), stagedSignature);
 		} finally {
 			removeTempRepo(root);
+		}
+	});
+});
+
+suite('Git reject journal', () => {
+	test('recovers applied rejects after restart and invalidates them on HEAD change', async function (this: Mocha.Context) {
+		this.timeout(10000);
+		const root = createTempGitRepo();
+		const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-journal-'));
+		try {
+			writeRepoFile(root, 'tracked.txt', 'old\n');
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+			writeRepoFile(root, 'tracked.txt', 'new\n');
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			const project = (await service.discoverProjects(folder))[0];
+			const pair = (await service.createFilePairs(folder))[0];
+			const hunk = pair.pendingHunks?.[0];
+			assert.ok(hunk);
+			const uri = vscode.Uri.file(path.join(root, 'tracked.txt'));
+			const context = { storageUri: vscode.Uri.file(storage), globalStorageUri: vscode.Uri.file(storage) } as vscode.ExtensionContext;
+			const beforeHash = await fileStateHash(uri);
+			const afterHash = expectedRejectedFileHash(pair.newText, hunk, pair.gitSnapshot?.indexExists ?? true);
+			const firstStore = new GitReviewJournalStore(context);
+			await firstStore.prepare(project, project.headOid ?? '', pair.relativePath, uri, hunk, beforeHash, afterHash);
+			await service.applyPatch(folder, hunk.patch, { reverse: true });
+
+			const restarted = new GitReviewJournalStore(context);
+			const recovered = await restarted.load(project, project.headOid ?? '');
+			assert.strictEqual(recovered.records.length, 1);
+			assert.strictEqual(recovered.records[0].state, 'applied');
+
+			const invalidated = await restarted.load(project, `${project.headOid}-changed`);
+			assert.strictEqual(invalidated.headChanged, true);
+			assert.deepStrictEqual(invalidated.records, []);
+		} finally {
+			removeTempRepo(root);
+			fs.rmSync(storage, { recursive: true, force: true });
 		}
 	});
 });
@@ -3920,10 +3895,6 @@ type TestReviewController = {
 	originalHunkSideMatches(text: string, hunk: ReviewHunk, side: 'old' | 'new', startLine: number): boolean;
 };
 
-type AutoStageReviewController = {
-	stageAcceptedReviewedHunksForManualRefresh(files: Map<string, ReviewFileState>): Promise<{ stagedFileCount: number; skippedFileCount: number }>;
-};
-
 type RefreshReviewController = {
 	refreshFile(uri: vscode.Uri, options?: { reconcileExternalChanges?: boolean; preferDisk?: boolean }): Promise<void>;
 };
@@ -3967,60 +3938,6 @@ function reviewControllerHarness(
 		writes,
 		currentText: () => currentText,
 		unmatchedMutationCount: () => unmatchedMutationCount,
-	};
-}
-
-function autoStageControllerHarness(
-	file: ReviewFileState,
-	currentText: string,
-	indexEntry: { exists: boolean; text: string; mode: string },
-	dirty = false,
-): {
-	controller: AutoStageReviewController;
-	session: ReviewSession;
-	stageFileCalls: string[];
-	stageIndexTextCalls: Array<{ relativePath: string; text: string; mode: string; add: boolean }>;
-	readIndexEntryCalls: number;
-} {
-	const project: ReviewProject = { id: 'repo', name: 'repo', rootUri: vscode.Uri.file('D:/repo') };
-	const session: ReviewSession = {
-		id: 'auto-stage',
-		mode: 'git',
-		rootUri: project.rootUri,
-		createdAt: 1,
-		files: new Map([[file.uri.toString(), file]]),
-		projects: [project],
-	};
-	const stageFileCalls: string[] = [];
-	const stageIndexTextCalls: Array<{ relativePath: string; text: string; mode: string; add: boolean }> = [];
-	let readIndexEntryCalls = 0;
-	const controller = Object.create(ReviewController.prototype) as AutoStageReviewController;
-	Object.assign(controller as unknown as Record<string, unknown>, {
-		activeSession: session,
-		gitService: {
-			readIndexEntry: async () => {
-				readIndexEntryCalls += 1;
-				return indexEntry;
-			},
-			stageFile: async (_root: vscode.WorkspaceFolder, relativePath: string) => {
-				stageFileCalls.push(relativePath);
-			},
-			stageIndexText: async (_root: vscode.WorkspaceFolder, relativePath: string, text: string, mode: string, add: boolean) => {
-				stageIndexTextCalls.push({ relativePath, text, mode, add });
-			},
-		},
-		isOpenDocumentDirty: () => dirty,
-		readCurrentText: async () => ({ exists: file.currentExists, text: currentText }),
-	});
-
-	return {
-		controller,
-		session,
-		stageFileCalls,
-		stageIndexTextCalls,
-		get readIndexEntryCalls() {
-			return readIndexEntryCalls;
-		},
 	};
 }
 

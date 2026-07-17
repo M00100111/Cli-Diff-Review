@@ -2,8 +2,8 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { AiReviewLanguage, AiReviewPartialError, AiReviewStore, AiReviewStrategy, CodeReviewAgentService, CodeReviewTraceContext, normalizeAiSuggestionReplacementText, reviewChangeSignature, StoredAiReview, sortFindings, sourcePendingFiles } from './agent/codeReview';
 import type { AgentTraceEvent } from './agent/runtime';
-import { acceptHunkInBaseline, computeLineDiff } from './diffEngine';
 import { GitService } from './gitService';
+import { contentStateHash, expectedRejectedFileHash, fileStateHash, GitReviewJournalStore } from './gitReviewJournal';
 import { createLlmClient, LlmClient } from './llm/client';
 import { LlmConfigInput, LlmConfigStore, LlmSavedConfig, LlmRuntimeConfig } from './llm/config';
 import { NativeReviewEditorManager, NativeReviewRevealPosition } from './nativeReviewEditor';
@@ -17,30 +17,24 @@ import {
 	ReviewNavigationTargetPayload,
 	ReviewWebviewManager,
 } from './reviewWebview';
-import { gitIgnoredReviewPaths, shouldSkipReviewPath } from './reviewFileFilter';
+import { isGitIgnoredReviewPath, shouldSkipReviewPath } from './reviewFileFilter';
 import {
-	applyManualGitBaselineToPair,
 	captureLineBlockContext,
-	CurrentTextState,
 	firstReviewRevealPosition,
-	GitManualBaseline,
+	gitReviewFileStateFingerprint,
 	isStaleRevision,
 	lineBlockWithContextMatches,
 	mapLineAfterFileEdits,
 	mapLineAfterLineEdits,
-	manualGitBaselineFromReviewedFile,
 	reviewHunkIdentity,
 	SerialOperationQueue,
-	shouldDeleteRejectedCurrentFileOnRefresh,
-	shouldMergeReviewedFileOnRefresh,
-	skippedCurrentFile,
 } from './reviewState';
-import { SnapshotStore } from './snapshotStore';
 import { decodeUtf8, encodeUtf8, isProbablyBinary, lineRange, relativePath, replaceLineBlock, splitLines } from './text';
 import {
 	AppliedAiSuggestion,
 	currentReviewProject,
 	FilePair,
+	GitReviewHunk,
 	hasAggregateReviewTarget,
 	projectReviewSession,
 	ReviewedHunk,
@@ -64,11 +58,6 @@ type GitSessionRefreshRequest =
 	| { source: 'manual' }
 	| { source: 'gitIndexChanged' };
 
-interface AutoStageAcceptedReviewedResult {
-	stagedFileCount: number;
-	skippedFileCount: number;
-}
-
 interface ReviewNavigationTarget extends vscode.QuickPickItem {
 	uri: vscode.Uri;
 	range: vscode.Range;
@@ -88,8 +77,8 @@ interface WikiInitializationTask {
 }
 
 export class ReviewController implements vscode.Disposable {
-	private readonly snapshotStore: SnapshotStore;
 	private readonly gitService = new GitService();
+	private readonly gitReviewJournal: GitReviewJournalStore;
 	private readonly llmConfigStore: LlmConfigStore;
 	private readonly wikiInitializationService: WikiInitializationService;
 	private readonly codeReviewAgentService = new CodeReviewAgentService();
@@ -105,9 +94,11 @@ export class ReviewController implements vscode.Disposable {
 	private readonly internalWriteDepth = new Map<string, number>();
 	private readonly writeGraceUntil = new Map<string, { source: InternalWriteSource; until: number }>();
 	private readonly fileOperationQueue = new SerialOperationQueue<string>();
-	private readonly manualGitBaselines = new Map<string, GitManualBaseline>();
 	private gitRefreshTimer: NodeJS.Timeout | undefined;
-	private readonly gitIndexStateSignatures = new Map<string, string>();
+	private llmDashboardRefreshTimer: NodeJS.Timeout | undefined;
+	private gitRefreshRequested = false;
+	private gitRefreshInFlight: Promise<void> | undefined;
+	private gitMutationDepth = 0;
 	private currentReviewUri: vscode.Uri | undefined;
 	private activeSession: ReviewSession | undefined;
 	private wikiRunLog: LlmWikiRunLogEntry[] = [];
@@ -129,10 +120,11 @@ export class ReviewController implements vscode.Disposable {
 	private wikiRootUri: vscode.Uri | undefined;
 
 	public constructor(private readonly context: vscode.ExtensionContext) {
-		this.snapshotStore = new SnapshotStore(context);
+		this.gitReviewJournal = new GitReviewJournalStore(context);
 		this.llmConfigStore = new LlmConfigStore(context);
 		this.wikiInitializationService = new WikiInitializationService(context.extensionUri);
 		this.aiReviewStore = new AiReviewStore(context.workspaceState);
+		void this.migrateLegacyReviewStorage();
 		this.treeProvider = new ReviewTreeProvider(() => this.activeSession, () => this.dashboardStoredAiReview());
 		this.dashboardProvider = new ReviewDashboardProvider(() => buildReviewDashboardPayload(
 			this.activeSession,
@@ -182,6 +174,7 @@ export class ReviewController implements vscode.Disposable {
 				} else if (event.affectsConfiguration('cliDiff.aiReviewFindingOrder')
 					|| event.affectsConfiguration('cliDiff.aiReviewLanguage')
 					|| event.affectsConfiguration('cliDiff.aiReviewMaxRounds')
+					|| event.affectsConfiguration('cliDiff.aiReviewFileConcurrency')
 					|| event.affectsConfiguration('cliDiff.aiReviewStrategy')) {
 					void this.refreshLlmWikiDashboardState();
 				}
@@ -189,8 +182,6 @@ export class ReviewController implements vscode.Disposable {
 			this.createFileWatcher(),
 			this.createGitMetadataWatcher(),
 			this.createGitExtensionStateWatcher(),
-			this.registerCommand('cli-diff.captureBaseline', () => this.captureBaseline()),
-			this.registerCommand('cli-diff.startSnapshotReview', () => this.startSnapshotReview()),
 			this.registerCommand('cli-diff.startGitReview', () => this.startGitReview()),
 			this.registerCommand('cli-diff.acceptChange', (uri?: string, hunkId?: string, revision?: number) => this.acceptChange(uri, hunkId, revision)),
 			this.registerCommand('cli-diff.rejectChange', (uri?: string, hunkId?: string, revision?: number) => this.rejectChange(uri, hunkId, revision)),
@@ -221,9 +212,11 @@ export class ReviewController implements vscode.Disposable {
 			this.registerCommand('cli-diff.cancelAgent', () => this.cancelCurrentAgent()),
 		);
 		void vscode.commands.executeCommand('setContext', 'cliDiff:hasSession', false);
-		void this.refreshLlmWikiDashboardState();
-		void this.startAutomaticGitReview();
-		void this.ensureVisibleEditorsReviewed();
+		if (context.extensionMode !== vscode.ExtensionMode.Test) {
+			void this.refreshLlmWikiDashboardState();
+			void this.startAutomaticGitReview();
+			void this.ensureVisibleEditorsReviewed();
+		}
 	}
 
 	public dispose(): void {
@@ -231,6 +224,10 @@ export class ReviewController implements vscode.Disposable {
 		if (this.gitRefreshTimer) {
 			clearTimeout(this.gitRefreshTimer);
 			this.gitRefreshTimer = undefined;
+		}
+		if (this.llmDashboardRefreshTimer) {
+			clearTimeout(this.llmDashboardRefreshTimer);
+			this.llmDashboardRefreshTimer = undefined;
 		}
 		for (const timer of this.refreshTimers.values()) {
 			clearTimeout(timer);
@@ -297,58 +294,6 @@ export class ReviewController implements vscode.Disposable {
 		this.scheduleRefresh(document.uri, { preferDisk: true });
 	}
 
-	private async captureBaseline(): Promise<void> {
-		try {
-			const count = await vscode.window.withProgress({
-				location: vscode.ProgressLocation.Notification,
-				title: 'Cli Diff Review: capturing baseline',
-				cancellable: false,
-			}, () => this.snapshotStore.captureWorkspaceBaseline());
-			vscode.window.showInformationMessage(`Cli Diff Review baseline captured (${count} files).`);
-		} catch (error) {
-			this.showError(error);
-		}
-	}
-
-	private async startSnapshotReview(): Promise<void> {
-		try {
-			const baselineFiles = await this.snapshotStore.loadBaselineFiles();
-			const currentByUri = await this.readCurrentWorkspaceFiles();
-			const pairs = new Map<string, FilePair>();
-
-			for (const file of baselineFiles) {
-				const current = currentByUri.get(uriKey(file.uri));
-				pairs.set(uriKey(file.uri), {
-					uri: file.uri,
-					relativePath: file.relativePath,
-					oldText: file.text,
-					newText: current?.text ?? '',
-					baselineExists: file.exists,
-					currentExists: current?.exists ?? false,
-					skippedReason: current?.skippedReason,
-				});
-			}
-
-			for (const current of currentByUri.values()) {
-				if (!pairs.has(uriKey(current.uri))) {
-					pairs.set(uriKey(current.uri), {
-						uri: current.uri,
-						relativePath: current.relativePath,
-						oldText: '',
-						newText: current.text,
-						baselineExists: false,
-						currentExists: true,
-						skippedReason: current.skippedReason,
-					});
-				}
-			}
-
-			await this.startSession('snapshot', [...pairs.values()]);
-		} catch (error) {
-			this.showError(error);
-		}
-	}
-
 	private async startGitReview(): Promise<void> {
 		try {
 			const folder = await this.pickWorkspaceFolder();
@@ -364,6 +309,23 @@ export class ReviewController implements vscode.Disposable {
 		} catch (error) {
 			this.showError(error);
 		}
+	}
+
+	private async migrateLegacyReviewStorage(): Promise<void> {
+		const migrationKey = 'cliDiff.gitPatchReviewMigration.v1';
+		if (this.context.workspaceState.get<boolean>(migrationKey)) {
+			return;
+		}
+		const storageRoot = this.context.storageUri ?? this.context.globalStorageUri;
+		try {
+			await vscode.workspace.fs.delete(vscode.Uri.joinPath(storageRoot, 'snapshot'), { recursive: true });
+		} catch {
+			// The old snapshot directory is optional.
+		}
+		for (const folder of vscode.workspace.workspaceFolders ?? []) {
+			await this.aiReviewStore.clear(folder.uri);
+		}
+		await this.context.workspaceState.update(migrationKey, true);
 	}
 
 	private async startAutomaticGitReview(): Promise<void> {
@@ -388,7 +350,7 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private async startSession(
-		mode: 'git' | 'snapshot',
+		mode: 'git',
 		pairs: FilePair[],
 		rootUri?: vscode.Uri,
 		notify = true,
@@ -399,13 +361,15 @@ export class ReviewController implements vscode.Disposable {
 			throw new Error('Open a workspace folder before starting a review.');
 		}
 
-		this.manualGitBaselines.clear();
 		const files = new Map<string, ReviewFileState>();
 		for (const pair of pairs) {
 			const file = this.createFileState(pair);
-			if (file.hunks.length > 0 || file.skippedReason) {
+			if (file.hunks.length > 0 || file.acceptedHunks.length > 0 || file.skippedReason) {
 				files.set(uriKey(file.uri), file);
 			}
+		}
+		if (mode === 'git') {
+			await this.attachRejectedJournals(files, projects ?? []);
 		}
 
 		this.activeSession = {
@@ -417,12 +381,6 @@ export class ReviewController implements vscode.Disposable {
 			projects,
 			trackingTarget: mode === 'git' ? await this.restoredTrackingTarget(workspaceRoot, projects ?? []) : undefined,
 		};
-		if (mode === 'git') {
-			await this.updateGitIndexStateSignatures();
-		} else {
-			this.gitIndexStateSignatures.clear();
-		}
-
 		await vscode.commands.executeCommand('setContext', 'cliDiff:hasSession', true);
 		this.refreshUi();
 		const hunkCount = [...files.values()].reduce((total, file) => total + file.hunks.length, 0);
@@ -440,16 +398,68 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private async createProjectFilePairs(projects: ReviewProject[]): Promise<FilePair[]> {
-		const pairs: FilePair[] = [];
-		for (const [index, project] of projects.entries()) {
+		const projectPairs = await Promise.all(projects.map(async (project, index) => {
 			const projectPairs = await this.gitService.createFilePairs(reviewProjectFolder(project, index));
-			pairs.push(...projectPairs.map((pair) => ({
+			return projectPairs.map((pair) => ({
 				...pair,
 				projectId: project.id,
 				projectName: project.name,
-			})));
+			}));
+		}));
+		return projectPairs.flat();
+	}
+
+	private async attachRejectedJournals(
+		files: Map<string, ReviewFileState>,
+		projects: ReviewProject[],
+		onlyUri?: vscode.Uri,
+	): Promise<void> {
+		let headChanged = false;
+		for (const project of projects) {
+			const headOid = project.headOid ?? await this.gitService.headOid(reviewProjectFolder(project));
+			project.headOid = headOid;
+			const loaded = await this.gitReviewJournal.load(project, headOid);
+			headChanged ||= loaded.headChanged;
+			if (loaded.headChanged) {
+				await this.aiReviewStore.clear(project.rootUri);
+				if (this.activeSession && uriKey(this.activeSession.rootUri) !== uriKey(project.rootUri)) {
+					await this.aiReviewStore.clear(this.activeSession.rootUri);
+				}
+			}
+			for (const record of loaded.records) {
+				const uri = vscode.Uri.parse(record.fileUri);
+				if (onlyUri && uriKey(uri) !== uriKey(onlyUri)) {
+					continue;
+				}
+				const key = uriKey(uri);
+				let file = files.get(key);
+				if (!file) {
+					const current = await this.readCurrentText(uri, { preferDisk: true });
+					file = this.createManualBaselineFileState(uri, current.text);
+					file.relativePath = record.relativePath;
+					file.projectId = project.id;
+					file.projectName = project.name;
+					file.currentExists = current.exists;
+					file.headOid = headOid;
+					file.gitSnapshot = {
+						headText: current.text,
+						indexText: current.text,
+						workingText: current.text,
+						headExists: current.exists,
+						indexExists: current.exists,
+						workingExists: current.exists,
+					};
+					files.set(key, file);
+				}
+				file.rejectedHunks.push(this.gitReviewJournal.toReviewedHunk(record));
+				if (record.state === 'stale') {
+					file.skippedReason = 'Rejected change is stale because the working file no longer matches its journal.';
+				}
+			}
 		}
-		return pairs;
+		if (headChanged) {
+			void vscode.window.showInformationMessage('Git history changed. Cli Diff Review rebuilt the affected review session.');
+		}
 	}
 
 	private async restoredTrackingTarget(rootUri: vscode.Uri, projects: ReviewProject[]): Promise<ReviewSession['trackingTarget']> {
@@ -523,6 +533,34 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private createFileState(pair: FilePair): ReviewFileState {
+		if (pair.gitSnapshot) {
+			const pendingHunks = pair.pendingHunks ?? [];
+			const pendingEdits = pendingHunks.map((hunk) => ({ oldStart: hunk.oldStart, oldLines: hunk.oldLines, newLines: hunk.newLines }));
+			const acceptedHunks = (pair.acceptedHunks ?? []).map((hunk) => {
+				const displayStart = mapLineAfterLineEdits(hunk.newStart, pendingEdits);
+				return { ...hunk, displayStart, currentStart: displayStart, zoneAfterLineNumber: displayStart };
+			});
+			return {
+				uri: pair.uri,
+				relativePath: pair.relativePath,
+				projectId: pair.projectId,
+				projectName: pair.projectName,
+				oldText: pair.gitSnapshot.headText,
+				newText: pair.gitSnapshot.workingText,
+				hunks: pendingHunks,
+				acceptedHunks,
+				rejectedHunks: [],
+				appliedAiSuggestions: [],
+				originalText: pair.gitSnapshot.headText,
+				originalExists: pair.gitSnapshot.headExists,
+				baselineExists: pair.gitSnapshot.headExists,
+				currentExists: pair.gitSnapshot.workingExists,
+				revision: 0,
+				skippedReason: pair.skippedReason,
+				gitSnapshot: pair.gitSnapshot,
+				headOid: pair.headOid,
+			};
+		}
 		if (pair.skippedReason) {
 			return {
 				uri: pair.uri,
@@ -544,7 +582,7 @@ export class ReviewController implements vscode.Disposable {
 			};
 		}
 
-		const diff = this.computeReviewHunks(pair.uri, pair.oldText, pair.newText);
+		const diff: { hunks: ReviewHunk[]; skippedReason?: string } = { hunks: [] };
 		if (diff.skippedReason) {
 			return {
 				uri: pair.uri,
@@ -624,15 +662,6 @@ export class ReviewController implements vscode.Disposable {
 
 	private async acceptChangeCore(uriString?: string, hunkId?: string, expectedRevision?: number): Promise<void> {
 		try {
-			const preflightFile = this.resolveFile(uriString);
-			if (preflightFile && this.isStaleMutation(preflightFile, expectedRevision)) {
-				await this.refreshFile(preflightFile.uri, { reconcileExternalChanges: false });
-				return;
-			}
-			if (preflightFile && typeof expectedRevision !== 'number') {
-				await this.refreshFile(preflightFile.uri);
-			}
-
 			const target = this.resolveHunk(uriString, hunkId);
 			if (!target) {
 				vscode.window.showInformationMessage('No Cli Diff Review change selected.');
@@ -646,27 +675,14 @@ export class ReviewController implements vscode.Disposable {
 			if (!this.ensureFileCleanForReviewMutation(target.file)) {
 				return;
 			}
-			if (!this.originalHunkSideMatches(target.file.oldText, target.hunk, 'old', target.hunk.oldStart)) {
-				await this.refreshUnmatchedMutation(target.file);
-				return;
-			}
-
-			target.file.oldText = acceptHunkInBaseline(target.file.oldText, target.hunk);
-			this.mapDecisionBaselineStarts(target.file, [{
-				oldStart: target.hunk.oldStart,
-				oldLines: target.hunk.oldLines,
-				newLines: target.hunk.newLines,
-			}]);
-			this.recordDecisionHunk(target.file, target.hunk, 'accept', target.hunk.newStart, target.hunk.newLines, target.hunk.oldStart, target.hunk.newStart);
-			this.removePendingHunk(target.file, target.hunk);
-			this.normalizeReviewedDuplicateHunks(target.file);
-			this.syncBaselineExistsAfterAccept(target.file);
-			this.touchFileRevision(target.file);
-			this.syncManualGitBaseline(target.file);
-			if (this.activeSession?.mode === 'snapshot') {
-				await this.updateSnapshotBaselineFile(target.file);
-			}
-			await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
+			const hunk = this.requireGitHunk(target.hunk);
+			const folder = this.requireGitFolder(target.file);
+			await Promise.all([
+				this.ensureGitHeadUnchanged(target.file, folder),
+				this.gitService.applyPatch(folder, hunk.patch, { cached: true, check: true }),
+			]);
+			await this.gitService.applyPatch(folder, hunk.patch, { cached: true });
+			await this.refreshGitReviewFile(target.file.uri);
 			await this.syncNativeReviewAfterMutation(target.file.uri, { line: target.hunk.newStart, column: 0 });
 		} catch (error) {
 			this.showError(error);
@@ -679,15 +695,6 @@ export class ReviewController implements vscode.Disposable {
 
 	private async rejectChangeCore(uriString?: string, hunkId?: string, expectedRevision?: number): Promise<void> {
 		try {
-			const preflightFile = this.resolveFile(uriString);
-			if (preflightFile && this.isStaleMutation(preflightFile, expectedRevision)) {
-				await this.refreshFile(preflightFile.uri, { reconcileExternalChanges: false });
-				return;
-			}
-			if (preflightFile && typeof expectedRevision !== 'number') {
-				await this.refreshFile(preflightFile.uri);
-			}
-
 			const target = this.resolveHunk(uriString, hunkId);
 			if (!target) {
 				vscode.window.showInformationMessage('No Cli Diff Review change selected.');
@@ -701,58 +708,33 @@ export class ReviewController implements vscode.Disposable {
 			if (!this.ensureFileCleanForReviewMutation(target.file)) {
 				return;
 			}
-			if (!target.file.currentExists) {
-				await this.withInternalWrite(target.file.uri, 'plugin', () => this.writeFileText(target.file.uri, target.file.oldText));
-				target.file.newText = target.file.oldText;
-				target.file.currentExists = true;
-				this.mapDecisionCurrentStarts(target.file, [{
-					oldStart: target.hunk.newStart,
-					oldLines: target.hunk.newLines,
-					newLines: target.hunk.oldLines,
-				}]);
-				this.recordDecisionHunk(target.file, target.hunk, 'reject', target.hunk.oldStart, target.hunk.oldLines, target.hunk.oldStart, target.hunk.oldStart);
-				this.removePendingHunk(target.file, target.hunk);
-				this.normalizeReviewedDuplicateHunks(target.file);
-				this.touchFileRevision(target.file);
-				this.syncManualGitBaseline(target.file);
-				await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
-				await this.syncNativeReviewAfterMutation(target.file.uri, { line: target.hunk.oldStart, column: 0 });
-				return;
-			}
-
-			const document = await vscode.workspace.openTextDocument(target.file.uri);
-			if (!this.originalHunkSideMatches(document.getText(), target.hunk, 'new', target.hunk.newStart)) {
-				await this.refreshUnmatchedMutation(target.file);
-				return;
-			}
-
-			const rejectedText = replaceLineBlock(document.getText(), target.hunk.newStart, target.hunk.newLines, target.hunk.oldText);
-			const wasDirty = document.isDirty;
-			await this.withInternalWrite(target.file.uri, 'plugin', async () => {
-				const edit = new vscode.WorkspaceEdit();
-				edit.replace(target.file.uri, lineRange(document, target.hunk.newStart, target.hunk.newLines), target.hunk.oldText);
-				const applied = await vscode.workspace.applyEdit(edit);
+			const hunk = this.requireGitHunk(target.hunk);
+			const folder = this.requireGitFolder(target.file);
+			const project = this.requireGitProject(target.file);
+			const [headOid, beforeHash] = await Promise.all([
+				this.ensureGitHeadUnchanged(target.file, folder),
+				fileStateHash(target.file.uri),
+			]);
+			const afterHash = expectedRejectedFileHash(
+				target.file.newText,
+				hunk,
+				target.file.gitSnapshot?.indexExists ?? target.file.baselineExists,
+			);
+			const record = await this.gitReviewJournal.prepare(project, headOid, target.file.relativePath, target.file.uri, hunk, beforeHash, afterHash);
+			let applied = false;
+			try {
+				await this.gitService.applyPatch(folder, hunk.patch, { reverse: true, check: true });
+				await this.withInternalWrite(target.file.uri, 'plugin', () => this.gitService.applyPatch(folder, hunk.patch, { reverse: true }));
+				applied = true;
+				await this.synchronizeOpenDocumentAfterGitMutation(target.file.uri);
+				await this.gitReviewJournal.setState(project, headOid, record.id, 'applied');
+			} catch (error) {
 				if (!applied) {
-					throw new Error('VS Code rejected the workspace edit.');
+					await this.gitReviewJournal.remove(project, headOid, record.id);
 				}
-
-				if (!wasDirty) {
-					await document.save();
-				}
-			});
-			target.file.newText = rejectedText;
-			target.file.currentExists = true;
-			this.mapDecisionCurrentStarts(target.file, [{
-				oldStart: target.hunk.newStart,
-				oldLines: target.hunk.newLines,
-				newLines: target.hunk.oldLines,
-			}]);
-			this.recordDecisionHunk(target.file, target.hunk, 'reject', target.hunk.newStart, target.hunk.oldLines, target.hunk.oldStart, target.hunk.newStart);
-			this.removePendingHunk(target.file, target.hunk);
-			this.normalizeReviewedDuplicateHunks(target.file);
-			this.touchFileRevision(target.file);
-			this.syncManualGitBaseline(target.file);
-			await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
+				throw error;
+			}
+			await this.refreshGitReviewFile(target.file.uri);
 			await this.syncNativeReviewAfterMutation(target.file.uri, { line: target.hunk.newStart, column: 0 });
 		} catch (error) {
 			this.showError(error);
@@ -781,6 +763,41 @@ export class ReviewController implements vscode.Disposable {
 				return;
 			}
 			if (!this.ensureFileCleanForReviewMutation(target.file)) {
+				return;
+			}
+			if (target.hunk.patch) {
+				const hunk = this.requireGitHunk(target.hunk);
+				const folder = this.requireGitFolder(target.file);
+				if (target.list === 'accepted') {
+					await Promise.all([
+						this.ensureGitHeadUnchanged(target.file, folder),
+						this.gitService.applyPatch(folder, hunk.patch, { cached: true, reverse: true, check: true }),
+					]);
+					await this.gitService.applyPatch(folder, hunk.patch, { cached: true, reverse: true });
+				} else {
+					await this.ensureGitHeadUnchanged(target.file, folder);
+					if (target.hunk.operable === false) {
+						throw new Error('This rejected change is stale and cannot be safely undone.');
+					}
+					const project = this.requireGitProject(target.file);
+					const headOid = project.headOid ?? await this.gitService.headOid(folder);
+					await this.gitReviewJournal.setState(project, headOid, target.hunk.id, 'undoing');
+					let applied = false;
+					try {
+						await this.gitService.applyPatch(folder, hunk.patch, { check: true });
+						await this.withInternalWrite(target.file.uri, 'plugin', () => this.gitService.applyPatch(folder, hunk.patch));
+						applied = true;
+						await this.synchronizeOpenDocumentAfterGitMutation(target.file.uri);
+						await this.gitReviewJournal.remove(project, headOid, target.hunk.id);
+					} catch (error) {
+						if (!applied) {
+							await this.gitReviewJournal.setState(project, headOid, target.hunk.id, 'applied');
+						}
+						throw error;
+					}
+				}
+				await this.refreshGitReviewFile(target.file.uri);
+				await this.syncNativeReviewAfterMutation(target.file.uri, { line: target.hunk.displayStart, column: 0 });
 				return;
 			}
 
@@ -823,9 +840,6 @@ export class ReviewController implements vscode.Disposable {
 					}]);
 				}
 				this.syncBaselineExistsForPending(target.file);
-				if (this.activeSession?.mode === 'snapshot') {
-					await this.updateSnapshotBaselineFile(target.file);
-				}
 			} else {
 				const current = await this.readCurrentText(target.file.uri);
 				const currentStart = target.hunk.currentStart;
@@ -847,7 +861,6 @@ export class ReviewController implements vscode.Disposable {
 
 			this.refreshPendingHunksFromReviewState(target.file);
 			this.touchFileRevision(target.file);
-			this.syncManualGitBaseline(target.file);
 			await this.saveAiReviewWithCurrentSignature(aiReviewToResign, aiReviewSession);
 			await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
 			await this.syncNativeReviewAfterMutation(target.file.uri, { line: target.hunk.displayStart, column: 0 });
@@ -874,6 +887,22 @@ export class ReviewController implements vscode.Disposable {
 			if (!this.ensureFileCleanForReviewMutation(file)) {
 				return;
 			}
+			if (file.gitSnapshot) {
+				const hunks = file.hunks.map((hunk) => this.requireGitHunk(hunk));
+				if (hunks.length === 0) {
+					return;
+				}
+				const folder = this.requireGitFolder(file);
+				const patch = this.gitService.combinePatches(hunks);
+				await Promise.all([
+					this.ensureGitHeadUnchanged(file, folder),
+					this.gitService.applyPatch(folder, patch, { cached: true, check: true }),
+				]);
+				await this.gitService.applyPatch(folder, patch, { cached: true });
+				await this.refreshGitReviewFile(file.uri);
+				await this.syncNativeReviewAfterMutation(file.uri);
+				return;
+			}
 
 			const current = await this.readCurrentText(file.uri);
 			file.newText = current.text;
@@ -897,10 +926,6 @@ export class ReviewController implements vscode.Disposable {
 			file.hunks = [];
 			file.appliedAiSuggestions = [];
 			this.touchFileRevision(file);
-			this.syncManualGitBaseline(file);
-			if (this.activeSession?.mode === 'snapshot') {
-				await this.updateSnapshotBaselineFile(file);
-			}
 			await this.refreshFile(file.uri, { reconcileExternalChanges: false });
 			await this.syncNativeReviewAfterMutation(file.uri);
 		} catch (error) {
@@ -924,6 +949,48 @@ export class ReviewController implements vscode.Disposable {
 				return;
 			}
 			if (!this.ensureFileCleanForReviewMutation(file)) {
+				return;
+			}
+			if (file.gitSnapshot) {
+				const hunks = file.hunks.map((hunk) => this.requireGitHunk(hunk));
+				if (hunks.length === 0) {
+					return;
+				}
+				const folder = this.requireGitFolder(file);
+				const project = this.requireGitProject(file);
+				const [headOid, beforeHash] = await Promise.all([
+					this.ensureGitHeadUnchanged(file, folder),
+					fileStateHash(file.uri),
+				]);
+				let rejectedText = file.newText;
+				for (const hunk of [...hunks].sort((left, right) => right.newStart - left.newStart)) {
+					rejectedText = replaceLineBlock(rejectedText, hunk.newStart, hunk.newLines, hunk.oldText);
+				}
+				const afterHash = contentStateHash(rejectedText, file.gitSnapshot.indexExists);
+				const records = [];
+				for (const hunk of hunks) {
+					records.push(await this.gitReviewJournal.prepare(project, headOid, file.relativePath, file.uri, hunk, beforeHash, afterHash));
+				}
+				const patch = this.gitService.combinePatches(hunks);
+				let applied = false;
+				try {
+					await this.gitService.applyPatch(folder, patch, { reverse: true, check: true });
+					await this.withInternalWrite(file.uri, 'plugin', () => this.gitService.applyPatch(folder, patch, { reverse: true }));
+					applied = true;
+					await this.synchronizeOpenDocumentAfterGitMutation(file.uri);
+					for (const record of records) {
+						await this.gitReviewJournal.setState(project, headOid, record.id, 'applied');
+					}
+				} catch (error) {
+					if (!applied) {
+						for (const record of records) {
+							await this.gitReviewJournal.remove(project, headOid, record.id);
+						}
+					}
+					throw error;
+				}
+				await this.refreshGitReviewFile(file.uri);
+				await this.syncNativeReviewAfterMutation(file.uri);
 				return;
 			}
 
@@ -957,7 +1024,6 @@ export class ReviewController implements vscode.Disposable {
 			refreshedFile.hunks = [];
 			refreshedFile.appliedAiSuggestions = [];
 			this.touchFileRevision(refreshedFile);
-			this.syncManualGitBaseline(refreshedFile);
 
 			await this.writeCurrentFileText(refreshedFile.uri, currentText);
 			await this.refreshFile(refreshedFile.uri, { reconcileExternalChanges: false });
@@ -985,6 +1051,61 @@ export class ReviewController implements vscode.Disposable {
 			if (!this.ensureFileCleanForReviewMutation(file)) {
 				return;
 			}
+			if (file.gitSnapshot) {
+				const accepted = file.acceptedHunks.map((hunk) => this.requireGitHunk(hunk));
+				const rejected = file.rejectedHunks.filter((hunk) => hunk.operable !== false).map((hunk) => this.requireGitHunk(hunk));
+				if (accepted.length === 0 && rejected.length === 0) {
+					return;
+				}
+				const folder = this.requireGitFolder(file);
+				const acceptedPatch = accepted.length > 0 ? this.gitService.combinePatches(accepted) : undefined;
+				const rejectedPatch = rejected.length > 0 ? this.gitService.combinePatches(rejected) : undefined;
+				await Promise.all([
+					this.ensureGitHeadUnchanged(file, folder),
+					acceptedPatch
+						? this.gitService.applyPatch(folder, acceptedPatch, { cached: true, reverse: true, check: true })
+						: Promise.resolve(),
+					rejectedPatch
+						? this.gitService.applyPatch(folder, rejectedPatch, { check: true })
+						: Promise.resolve(),
+				]);
+				const rejectedProject = rejected.length > 0 ? this.requireGitProject(file) : undefined;
+				const rejectedHeadOid = rejectedProject ? rejectedProject.headOid ?? await this.gitService.headOid(folder) : undefined;
+				if (rejectedProject && rejectedHeadOid !== undefined) {
+					for (const hunk of file.rejectedHunks.filter((candidate) => candidate.operable !== false)) {
+						await this.gitReviewJournal.setState(rejectedProject, rejectedHeadOid, hunk.id, 'undoing');
+					}
+				}
+				let acceptedApplied = false;
+				try {
+					if (acceptedPatch) {
+						await this.gitService.applyPatch(folder, acceptedPatch, { cached: true, reverse: true });
+						acceptedApplied = true;
+					}
+					if (rejectedPatch) {
+						await this.withInternalWrite(file.uri, 'plugin', () => this.gitService.applyPatch(folder, rejectedPatch));
+						await this.synchronizeOpenDocumentAfterGitMutation(file.uri);
+					}
+				} catch (error) {
+					if (acceptedPatch && acceptedApplied) {
+						await this.gitService.applyPatch(folder, acceptedPatch, { cached: true });
+					}
+					if (rejectedProject && rejectedHeadOid !== undefined) {
+						for (const hunk of file.rejectedHunks.filter((candidate) => candidate.operable !== false)) {
+							await this.gitReviewJournal.setState(rejectedProject, rejectedHeadOid, hunk.id, 'applied');
+						}
+					}
+					throw error;
+				}
+				if (rejectedProject && rejectedHeadOid !== undefined) {
+					for (const hunk of file.rejectedHunks.filter((candidate) => candidate.operable !== false)) {
+						await this.gitReviewJournal.remove(rejectedProject, rejectedHeadOid, hunk.id);
+					}
+				}
+				await this.refreshGitReviewFile(file.uri);
+				await this.syncNativeReviewAfterMutation(file.uri);
+				return;
+			}
 
 			const aiReviewSession = file.acceptedHunks.some((hunk) => hunk.appliedAiSuggestion)
 				? this.sessionForFile(file)
@@ -992,11 +1113,7 @@ export class ReviewController implements vscode.Disposable {
 			const aiReviewToResign = aiReviewSession ? this.aiReviewStore.load(aiReviewSession) : undefined;
 			await this.restoreDecisionsToPending(file);
 			this.refreshPendingHunksFromReviewState(file);
-			if (this.activeSession?.mode === 'snapshot') {
-				await this.updateSnapshotBaselineFile(file);
-			}
 			this.touchFileRevision(file);
-			this.syncManualGitBaseline(file);
 			await this.saveAiReviewWithCurrentSignature(aiReviewToResign, aiReviewSession);
 			await this.refreshFile(file.uri, { reconcileExternalChanges: false });
 			await this.syncNativeReviewAfterMutation(file.uri);
@@ -1045,6 +1162,27 @@ export class ReviewController implements vscode.Disposable {
 		if (confirmed !== confirmationLabel) {
 			return;
 		}
+		if (targets.every((target) => Boolean(target.file.gitSnapshot))) {
+			const byProject = new Map<string, ReviewFileState[]>();
+			for (const target of targets) {
+				const project = this.requireGitProject(target.file);
+				byProject.set(project.id, [...(byProject.get(project.id) ?? []), target.file]);
+			}
+			const failures: string[] = [];
+			for (const files of byProject.values()) {
+				const project = this.requireGitProject(files[0]);
+				try {
+					await this.fileOperationQueue.enqueue(uriKey(project.rootUri), () => this.applyGitProjectBulkOperation(action, project, files));
+				} catch (error) {
+					failures.push(`${project.name}: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			}
+			await this.refreshGitSessionFiles({ source: 'gitIndexChanged' });
+			if (failures.length > 0) {
+				void vscode.window.showWarningMessage(`Some Git review operations failed:\n${failures.join('\n')}`);
+			}
+			return;
+		}
 
 		for (const target of targets) {
 			await this.enqueueFileOperation(target.file.uri, async () => {
@@ -1056,6 +1194,91 @@ export class ReviewController implements vscode.Disposable {
 					await this.undoFileCore(target.file);
 				}
 			});
+		}
+	}
+
+	private async applyGitProjectBulkOperation(action: 'accept' | 'reject' | 'undo', project: ReviewProject, files: ReviewFileState[]): Promise<void> {
+		const folder = reviewProjectFolder(project);
+		await this.ensureGitHeadUnchanged(files[0], folder);
+		if (action === 'accept') {
+			const hunks = files.flatMap((file) => file.hunks.map((hunk) => this.requireGitHunk(hunk)));
+			const patch = this.gitService.combinePatches(hunks);
+			await this.gitService.applyPatch(folder, patch, { cached: true, check: true });
+			await this.gitService.applyPatch(folder, patch, { cached: true });
+			return;
+		}
+		if (action === 'reject') {
+			const headOid = project.headOid ?? await this.gitService.headOid(folder);
+			const records: Array<{ id: string }> = [];
+			const hunks: GitReviewHunk[] = [];
+			for (const file of files) {
+				const fileHunks = file.hunks.map((hunk) => this.requireGitHunk(hunk));
+				hunks.push(...fileHunks);
+				let rejectedText = file.newText;
+				for (const hunk of [...fileHunks].sort((left, right) => right.newStart - left.newStart)) {
+					rejectedText = replaceLineBlock(rejectedText, hunk.newStart, hunk.newLines, hunk.oldText);
+				}
+				const beforeHash = await fileStateHash(file.uri);
+				const afterHash = contentStateHash(rejectedText, file.gitSnapshot?.indexExists ?? file.baselineExists);
+				for (const hunk of fileHunks) {
+					records.push(await this.gitReviewJournal.prepare(project, headOid, file.relativePath, file.uri, hunk, beforeHash, afterHash));
+				}
+			}
+			const patch = this.gitService.combinePatches(hunks);
+			let applied = false;
+			try {
+				await this.gitService.applyPatch(folder, patch, { reverse: true, check: true });
+				await this.withInternalWrites(files.map((file) => file.uri), () => this.gitService.applyPatch(folder, patch, { reverse: true }));
+				applied = true;
+				for (const record of records) {
+					await this.gitReviewJournal.setState(project, headOid, record.id, 'applied');
+				}
+			} catch (error) {
+				if (!applied) {
+					for (const record of records) {
+						await this.gitReviewJournal.remove(project, headOid, record.id);
+					}
+				}
+				throw error;
+			}
+			return;
+		}
+
+		const accepted = files.flatMap((file) => file.acceptedHunks.map((hunk) => this.requireGitHunk(hunk)));
+		const rejectedHunks = files.flatMap((file) => file.rejectedHunks.filter((hunk) => hunk.operable !== false));
+		const rejected = rejectedHunks.map((hunk) => this.requireGitHunk(hunk));
+		const acceptedPatch = accepted.length > 0 ? this.gitService.combinePatches(accepted) : undefined;
+		const rejectedPatch = rejected.length > 0 ? this.gitService.combinePatches(rejected) : undefined;
+		if (acceptedPatch) {
+			await this.gitService.applyPatch(folder, acceptedPatch, { cached: true, reverse: true, check: true });
+		}
+		if (rejectedPatch) {
+			await this.gitService.applyPatch(folder, rejectedPatch, { check: true });
+		}
+		const headOid = project.headOid ?? await this.gitService.headOid(folder);
+		for (const hunk of rejectedHunks) {
+			await this.gitReviewJournal.setState(project, headOid, hunk.id, 'undoing');
+		}
+		let acceptedApplied = false;
+		try {
+			if (acceptedPatch) {
+				await this.gitService.applyPatch(folder, acceptedPatch, { cached: true, reverse: true });
+				acceptedApplied = true;
+			}
+			if (rejectedPatch) {
+				await this.withInternalWrites(files.map((file) => file.uri), () => this.gitService.applyPatch(folder, rejectedPatch));
+			}
+		} catch (error) {
+			if (acceptedPatch && acceptedApplied) {
+				await this.gitService.applyPatch(folder, acceptedPatch, { cached: true });
+			}
+			for (const hunk of rejectedHunks) {
+				await this.gitReviewJournal.setState(project, headOid, hunk.id, 'applied');
+			}
+			throw error;
+		}
+		for (const hunk of rejectedHunks) {
+			await this.gitReviewJournal.remove(project, headOid, hunk.id);
 		}
 	}
 
@@ -1104,16 +1327,8 @@ export class ReviewController implements vscode.Disposable {
 				return;
 			}
 
-			this.applyManualEditsToBaseline(file, editedText, editedRanges);
-			this.touchFileRevision(file);
-			this.syncManualGitBaseline(file);
 			await this.writeCurrentFileText(uri, editedText, 'human');
-
-			if (this.activeSession?.mode === 'snapshot') {
-				await this.updateSnapshotBaselineFile(file);
-			}
-
-			await this.refreshFile(file.uri, { reconcileExternalChanges: false });
+			await this.refreshFile(file.uri, { reconcileExternalChanges: false, preferDisk: true });
 		} catch (error) {
 			this.showError(error);
 		}
@@ -1127,50 +1342,23 @@ export class ReviewController implements vscode.Disposable {
 			this.humanSaveIntents.delete(key);
 
 			await this.ensureManualReviewSession(document.uri);
+			if (this.activeSession?.mode === 'git') {
+				await this.refreshGitSessionFiles({ source: 'gitIndexChanged' });
+				return;
+			}
 			let file = this.resolveFile(document.uri.toString());
 			if (!file) {
 				file = this.createManualBaselineFileState(document.uri, document.getText());
 				this.activeSession?.files.set(key, file);
-				if (this.activeSession?.mode === 'snapshot') {
-					await this.updateSnapshotBaselineFile(file);
-				}
 				this.refreshUi();
 				return;
 			}
 
-			this.applyManualEditsToBaseline(file, document.getText(), editedRanges);
-			this.touchFileRevision(file);
-			this.syncManualGitBaseline(file);
-			if (this.activeSession?.mode === 'snapshot') {
-				await this.updateSnapshotBaselineFile(file);
-			}
-			await this.refreshFile(file.uri, { reconcileExternalChanges: false });
+			void editedRanges;
+			await this.refreshFile(file.uri, { reconcileExternalChanges: false, preferDisk: true });
 		} catch (error) {
 			this.showError(error);
 		}
-	}
-
-	private applyManualEditsToBaseline(file: ReviewFileState, editedText: string, editedRanges: EditedRange[]): void {
-		const previousCurrent = file.newText;
-		const pendingBefore = [...file.hunks];
-		const manualHunks = computeLineDiff(file.uri.toString(), previousCurrent, editedText);
-		const baselineManualHunks: ReviewHunk[] = [];
-		let baselineText = file.oldText;
-
-		for (const manualHunk of [...manualHunks].sort((left, right) => right.oldStart - left.oldStart)) {
-			if (this.manualHunkTouchesPending(manualHunk, pendingBefore, editedRanges)) {
-				continue;
-			}
-
-			const baselineStart = this.mapCurrentLineToBaseline(manualHunk.oldStart, pendingBefore);
-			baselineManualHunks.push({ ...manualHunk, oldStart: baselineStart, newStart: baselineStart });
-			baselineText = replaceLineBlock(baselineText, baselineStart, manualHunk.oldLines, manualHunk.newText);
-		}
-
-		this.syncDecisionHunksAfterEdit(file, manualHunks, editedText, baselineManualHunks, baselineText);
-		file.oldText = baselineText;
-		file.newText = editedText;
-		file.currentExists = true;
 	}
 
 	private async navigateChange(direction: 1 | -1, uriString?: string, hunkId?: string): Promise<void> {
@@ -1494,10 +1682,6 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private async openResolvedLocation(uri: vscode.Uri, range: vscode.Range): Promise<void> {
-		if (this.activeSession?.mode === 'git') {
-			await this.refreshFile(uri, { preferDisk: true });
-		}
-
 		const file = this.activeSession?.files.get(uriKey(uri));
 		if (this.isReviewableFile(file)) {
 			await this.openReviewPresentation(uri, { line: range.start.line, column: range.start.character });
@@ -1545,29 +1729,7 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 
-		const files = [...this.activeSession.files.values()];
-		if (this.activeSession.mode === 'git') {
-			for (const file of files) {
-				await this.deleteRejectedCurrentFileOnRefresh(file);
-			}
-			await this.refreshGitSessionFiles({ source: 'manual' });
-			this.closeCompletedReviewEditorsAfterManualRefresh();
-			return;
-		}
-
-		for (const file of files) {
-			await this.deleteRejectedCurrentFileOnRefresh(file);
-			await this.refreshFile(file.uri, { preferDisk: true });
-			const refreshedFile = this.activeSession?.files.get(uriKey(file.uri));
-			if (refreshedFile && shouldMergeReviewedFileOnRefresh(
-				refreshedFile.hunks.length,
-				refreshedFile.acceptedHunks.length,
-				refreshedFile.rejectedHunks.length,
-				refreshedFile.skippedReason,
-			)) {
-				await this.mergeReviewedSnapshotFileOnRefresh(refreshedFile);
-			}
-		}
+		await this.refreshGitSessionFiles({ source: 'manual' });
 		this.closeCompletedReviewEditorsAfterManualRefresh();
 	}
 
@@ -2192,7 +2354,6 @@ export class ReviewController implements vscode.Disposable {
 				appliedAt: Date.now(),
 			});
 			this.touchFileRevision(file);
-			this.syncManualGitBaseline(file);
 			await this.saveAiReviewWithCurrentSignature(storedReview, reviewSession);
 			this.refreshReviewPresentation(file.uri);
 			await this.refreshLlmWikiDashboardState();
@@ -2240,7 +2401,6 @@ export class ReviewController implements vscode.Disposable {
 			this.replacePendingHunkWithAppliedSuggestion(file, hunk, restoredHunk, undefined);
 			file.appliedAiSuggestions = file.appliedAiSuggestions.filter((item) => item.suggestionId !== suggestionId);
 			this.touchFileRevision(file);
-			this.syncManualGitBaseline(file);
 			await this.saveAiReviewWithCurrentSignature(storedReview, reviewSession);
 			this.refreshReviewPresentation(file.uri);
 			await this.refreshLlmWikiDashboardState();
@@ -2401,106 +2561,6 @@ export class ReviewController implements vscode.Disposable {
 		return visibleReviewFiles(this.activeSession).some((file) => file.hunks.length > 0);
 	}
 
-	private async mergeReviewedSnapshotFileOnRefresh(file: ReviewFileState): Promise<void> {
-		file.acceptedHunks = [];
-		file.rejectedHunks = [];
-		this.touchFileRevision(file);
-		await this.updateSnapshotBaselineFile(file);
-		await this.refreshFile(file.uri, { reconcileExternalChanges: false, preferDisk: true });
-	}
-
-	private async deleteRejectedCurrentFileOnRefresh(file: ReviewFileState): Promise<void> {
-		if (this.isOpenDocumentDirty(file.uri)) {
-			return;
-		}
-
-		const current = await this.readCurrentText(file.uri, { preferDisk: true });
-		if (!current.exists || !shouldDeleteRejectedCurrentFileOnRefresh(file.baselineExists, current.text, file.acceptedHunks.length, file.rejectedHunks.length)) {
-			return;
-		}
-
-		await this.deleteCurrentFile(file.uri);
-		file.newText = '';
-		file.currentExists = false;
-	}
-
-	private async stageAcceptedReviewedHunksForManualRefresh(files: Map<string, ReviewFileState>): Promise<AutoStageAcceptedReviewedResult> {
-		const result: AutoStageAcceptedReviewedResult = { stagedFileCount: 0, skippedFileCount: 0 };
-		for (const file of files.values()) {
-			if (file.skippedReason || file.acceptedHunks.length === 0) {
-				continue;
-			}
-
-			try {
-				if (await this.stageAcceptedReviewedHunksForFile(file)) {
-					result.stagedFileCount += 1;
-				} else {
-					result.skippedFileCount += 1;
-				}
-			} catch (error) {
-				console.warn(`[Cli Diff Review] Skipped auto-staging accepted reviewed chunks for ${file.relativePath}: Git staging failed.`, error);
-				result.skippedFileCount += 1;
-			}
-		}
-		return result;
-	}
-
-	private async stageAcceptedReviewedHunksForFile(file: ReviewFileState): Promise<boolean> {
-		if (this.isOpenDocumentDirty(file.uri)) {
-			console.warn(`[Cli Diff Review] Skipped auto-staging accepted reviewed chunks for ${file.relativePath}: the open document has unsaved changes.`);
-			return false;
-		}
-
-		const folder = this.gitWorkspaceFolderForReviewFile(file);
-		if (!folder) {
-			console.warn(`[Cli Diff Review] Skipped auto-staging accepted reviewed chunks for ${file.relativePath}: no Git workspace folder was found.`);
-			return false;
-		}
-
-		const current = await this.readCurrentText(file.uri, { preferDisk: true });
-		if (current.exists !== file.currentExists || current.text !== file.newText) {
-			console.warn(`[Cli Diff Review] Skipped auto-staging accepted reviewed chunks for ${file.relativePath}: the file changed on disk since it was reviewed.`);
-			return false;
-		}
-
-		const originalIndexText = this.originalIndexTextBeforeAcceptedHunks(file);
-		if (originalIndexText === undefined) {
-			console.warn(`[Cli Diff Review] Skipped auto-staging accepted reviewed chunks for ${file.relativePath}: the accepted hunks no longer match the review baseline.`);
-			return false;
-		}
-
-		const indexEntry = await this.gitService.readIndexEntry(folder, file.relativePath);
-		const indexText = indexEntry.exists ? indexEntry.text : '';
-		const targetIndexExists = file.currentExists || file.oldText.length > 0;
-		const indexMatchesOriginal = indexEntry.exists === file.originalExists && indexText === originalIndexText;
-		const indexAlreadyStaged = indexEntry.exists === targetIndexExists && indexText === file.oldText;
-		if (!indexMatchesOriginal && !indexAlreadyStaged) {
-			console.warn(`[Cli Diff Review] Skipped auto-staging accepted reviewed chunks for ${file.relativePath}: the Git index changed since the review started.`);
-			return false;
-		}
-		if (indexAlreadyStaged) {
-			return true;
-		}
-
-		if (file.hunks.length === 0) {
-			await this.gitService.stageFile(folder, file.relativePath);
-		} else {
-			await this.gitService.stageIndexText(folder, file.relativePath, file.oldText, indexEntry.mode, !indexEntry.exists);
-		}
-		return true;
-	}
-
-	private originalIndexTextBeforeAcceptedHunks(file: ReviewFileState): string | undefined {
-		let text = file.oldText;
-		for (const hunk of [...file.acceptedHunks].sort((left, right) => right.baselineStart - left.baselineStart)) {
-			if (!this.reviewedBaselineSideMatches(text, hunk, hunk.baselineStart, hunk.newLines, hunk.newText)) {
-				return undefined;
-			}
-			text = replaceLineBlock(text, hunk.baselineStart, hunk.newLines, hunk.oldText);
-		}
-		return text;
-	}
-
 	private gitWorkspaceFolderForReviewFile(file: ReviewFileState): vscode.WorkspaceFolder | undefined {
 		const project = file.projectId
 			? this.activeSession?.projects?.find((candidate) => candidate.id === file.projectId)
@@ -2511,16 +2571,68 @@ export class ReviewController implements vscode.Disposable {
 		return this.activeGitWorkspaceFolder();
 	}
 
-	private showAutoStageAcceptedReviewedWarning(result: AutoStageAcceptedReviewedResult): void {
-		if (result.skippedFileCount === 0) {
-			return;
+	private requireGitFolder(file: ReviewFileState): vscode.WorkspaceFolder {
+		const folder = this.gitWorkspaceFolderForReviewFile(file);
+		if (!folder) {
+			throw new Error(`No Git repository found for ${file.relativePath}.`);
 		}
+		return folder;
+	}
 
-		const fileLabel = result.skippedFileCount === 1 ? 'file' : 'files';
-		void vscode.window.showWarningMessage(`Cli Diff Review skipped auto-staging accepted reviewed chunks in ${result.skippedFileCount} ${fileLabel}. Save files or resolve staged changes, then refresh again.`);
+	private requireGitProject(file: ReviewFileState): ReviewProject {
+		const project = this.activeSession?.projects?.find((candidate) => candidate.id === file.projectId)
+			?? this.gitProjectForUri(file.uri);
+		if (!project) {
+			throw new Error(`No Git project found for ${file.relativePath}.`);
+		}
+		return project;
+	}
+
+	private async ensureGitHeadUnchanged(file: ReviewFileState, folder: vscode.WorkspaceFolder): Promise<string> {
+		const project = this.requireGitProject(file);
+		const currentHead = await this.gitService.headOid(folder);
+		const expectedHead = file.headOid ?? project.headOid;
+		if (expectedHead !== undefined && expectedHead !== currentHead) {
+			await this.refreshGitSessionFiles({ source: 'gitIndexChanged' });
+			throw new Error('Git history changed. The review session was rebuilt; select the change again.');
+		}
+		project.headOid = currentHead;
+		return currentHead;
+	}
+
+	private requireGitHunk(hunk: ReviewHunk): GitReviewHunk {
+		if (!hunk.patch || !hunk.fingerprint || !hunk.projectId) {
+			throw new Error('The selected change is no longer backed by a current Git patch. Refresh and try again.');
+		}
+		return hunk as GitReviewHunk;
 	}
 
 	private async refreshGitSessionFiles(request: GitSessionRefreshRequest): Promise<void> {
+		void request;
+		this.gitRefreshRequested = true;
+		while (this.gitRefreshRequested || this.gitRefreshInFlight) {
+			if (!this.gitRefreshInFlight) {
+				this.gitRefreshInFlight = this.runGitRefreshLoop();
+			}
+			const activeRefresh = this.gitRefreshInFlight;
+			try {
+				await activeRefresh;
+			} finally {
+				if (this.gitRefreshInFlight === activeRefresh) {
+					this.gitRefreshInFlight = undefined;
+				}
+			}
+		}
+	}
+
+	private async runGitRefreshLoop(): Promise<void> {
+		while (this.gitRefreshRequested) {
+			this.gitRefreshRequested = false;
+			await this.refreshGitSessionFilesOnce();
+		}
+	}
+
+	private async refreshGitSessionFilesOnce(): Promise<void> {
 		if (!this.activeSession || this.activeSession.mode !== 'git') {
 			return;
 		}
@@ -2531,92 +2643,79 @@ export class ReviewController implements vscode.Disposable {
 		}
 
 		const previousFiles = this.activeSession.files;
-		if (request.source === 'manual') {
-			const autoStageResult = await this.stageAcceptedReviewedHunksForManualRefresh(previousFiles);
-			this.showAutoStageAcceptedReviewedWarning(autoStageResult);
-			this.captureManualGitBaselines(previousFiles);
-		} else {
-			this.manualGitBaselines.clear();
-		}
 		const projects = await this.gitService.discoverProjects(workspaceRoot);
 		const pairs = await this.createProjectFilePairs(projects);
 		const nextFiles = new Map<string, ReviewFileState>();
-		const seenKeys = new Set<string>();
 		for (const pair of pairs) {
 			const key = uriKey(pair.uri);
-			seenKeys.add(key);
-			const manualBaseline = request.source === 'manual'
-				? this.manualGitBaselineForPair(pair)
-				: undefined;
-			const file = this.createFileState(applyManualGitBaselineToPair(pair, manualBaseline));
-			if (file.hunks.length > 0 || file.skippedReason) {
+			const file = this.createFileState(pair);
+			if (file.hunks.length > 0 || file.acceptedHunks.length > 0 || file.skippedReason) {
 				const previous = previousFiles.get(key);
 				if (previous) {
-					file.revision = previous.revision + 1;
-				}
-				nextFiles.set(key, file);
-			} else if (manualBaseline) {
-				const previous = previousFiles.get(key);
-				if (previous) {
-					file.revision = previous.revision + 1;
+					file.revision = previous.revision;
+					file.appliedAiSuggestions = previous.appliedAiSuggestions.filter((suggestion) => (
+						file.hunks.some((hunk) => hunk.fingerprint === suggestion.appliedHunk.fingerprint)
+					));
 				}
 				nextFiles.set(key, file);
 			}
 		}
-		if (request.source === 'manual') {
-			this.pruneManualGitBaselines(seenKeys);
+		await this.attachRejectedJournals(nextFiles, projects);
+		for (const [key, file] of nextFiles) {
+			const previous = previousFiles.get(key);
+			if (previous && gitReviewFileStateFingerprint(previous) !== gitReviewFileStateFingerprint(file)) {
+				file.revision = previous.revision + 1;
+			}
 		}
 		this.activeSession.files = nextFiles;
 		this.activeSession.projects = projects;
 		await this.ensureTrackingTargetAvailable();
-		await this.updateGitIndexStateSignatures();
 		this.refreshUi();
 	}
 
-	private captureManualGitBaselines(files: Map<string, ReviewFileState>): void {
-		for (const [key, file] of files) {
-			const baseline = manualGitBaselineFromReviewedFile(file);
-			if (baseline) {
-				this.manualGitBaselines.set(key, baseline);
-			}
-		}
-	}
-
-	private syncManualGitBaseline(file: ReviewFileState): void {
-		if (this.activeSession?.mode !== 'git') {
+	private async refreshGitReviewFile(uri: vscode.Uri): Promise<void> {
+		const session = this.activeSession;
+		if (!session || session.mode !== 'git' || this.isOpenDocumentDirty(uri)) {
 			return;
 		}
-
-		const key = uriKey(file.uri);
-		const baseline = manualGitBaselineFromReviewedFile(file);
-		if (baseline) {
-			this.manualGitBaselines.set(key, baseline);
-		} else {
-			this.manualGitBaselines.delete(key);
+		const project = this.gitProjectForUri(uri);
+		if (!project) {
+			return;
 		}
-	}
-
-	private manualGitBaselineForPair(pair: FilePair): GitManualBaseline | undefined {
-		const key = uriKey(pair.uri);
-		const baseline = this.manualGitBaselines.get(key);
-		if (!baseline) {
-			return undefined;
-		}
-
-		if (pair.skippedReason) {
-			this.manualGitBaselines.delete(key);
-			return undefined;
-		}
-
-		return baseline;
-	}
-
-	private pruneManualGitBaselines(seenKeys: Set<string>): void {
-		for (const key of this.manualGitBaselines.keys()) {
-			if (!seenKeys.has(key)) {
-				this.manualGitBaselines.delete(key);
+		const key = uriKey(uri);
+		const previous = session.files.get(key);
+		if (!previous) {
+			const relative = relativePath(project.rootUri, uri);
+			if (shouldSkipReviewPath(relative) || await isGitIgnoredReviewPath(project.rootUri.fsPath, relative)) {
+				return;
 			}
 		}
+		const pair = await this.createGitFilePair(uri, { preferDisk: true });
+		const refreshed = new Map<string, ReviewFileState>();
+		if (pair) {
+			project.headOid = pair.headOid ?? project.headOid;
+			const file = this.createFileState(pair);
+			if (file.hunks.length > 0 || file.acceptedHunks.length > 0 || file.skippedReason) {
+				refreshed.set(key, file);
+			}
+		}
+		await this.attachRejectedJournals(refreshed, [project], uri);
+		const file = refreshed.get(key);
+		if (!file) {
+			session.files.delete(key);
+		} else {
+			if (previous) {
+				file.revision = previous.revision;
+				file.appliedAiSuggestions = previous.appliedAiSuggestions.filter((suggestion) => (
+					file.hunks.some((hunk) => hunk.fingerprint === suggestion.appliedHunk.fingerprint)
+				));
+				if (gitReviewFileStateFingerprint(previous) !== gitReviewFileStateFingerprint(file)) {
+					file.revision += 1;
+				}
+			}
+			session.files.set(key, file);
+		}
+		this.refreshUi();
 	}
 
 	private async refreshFile(uri: vscode.Uri, options: { reconcileExternalChanges?: boolean; preferDisk?: boolean } = {}): Promise<void> {
@@ -2628,6 +2727,12 @@ export class ReviewController implements vscode.Disposable {
 			await this.ensureGitReviewForUri(uri, { preferDisk: options.preferDisk });
 			return;
 		}
+		if (this.activeSession.mode === 'git') {
+			if (!this.isOpenDocumentDirty(uri)) {
+				await this.refreshGitReviewFile(uri);
+			}
+			return;
+		}
 
 		const key = uriKey(uri);
 		if (options.reconcileExternalChanges !== false && this.isOpenDocumentDirty(uri)) {
@@ -2636,43 +2741,18 @@ export class ReviewController implements vscode.Disposable {
 
 		let file = this.activeSession.files.get(key);
 		if (!file) {
-			if (this.activeSession.mode !== 'git') {
-				return;
-			}
-
-			const pair = await this.createGitFilePair(uri, { preferDisk: options.preferDisk });
-			if (!pair) {
-				return;
-			}
-
-			file = this.createFileState(pair);
-			if (file.hunks.length === 0 && !file.skippedReason && !this.manualGitBaselines.has(key)) {
-				return;
-			}
-			this.activeSession.files.set(key, file);
-			this.refreshUi();
 			return;
 		}
 
 		const previousState = this.fileStateFingerprint(file);
 		const current = await this.readCurrentText(uri, { preferDisk: options.preferDisk });
 		if (options.reconcileExternalChanges !== false && current.text !== file.newText && this.decisionHunks(file).length > 0) {
-			const externalHunks = computeLineDiff(file.uri.toString(), file.newText, current.text);
+			const externalHunks: ReviewHunk[] = [];
 			this.reconcileDecisionHunksForExternalChanges(file, externalHunks);
-		}
-		const manualBaseline = this.activeSession.mode === 'git'
-			? this.manualGitBaselines.get(key)
-			: undefined;
-		if (manualBaseline && !file.skippedReason) {
-			file.oldText = manualBaseline.oldText;
-			file.baselineExists = manualBaseline.baselineExists;
 		}
 		file.newText = current.text;
 		file.currentExists = current.exists;
-		const diff = this.computeReviewHunks(file.uri, file.oldText, file.newText);
-		if (this.activeSession.mode === 'git' && diff.skippedReason) {
-			this.manualGitBaselines.delete(key);
-		}
+		const diff: { hunks: ReviewHunk[]; skippedReason?: string } = { hunks: [] };
 		file.hunks = diff.hunks;
 		this.normalizeReviewedDuplicateHunks(file);
 		file.appliedAiSuggestions = file.appliedAiSuggestions.filter((suggestion) => file.hunks.some((hunk) => (
@@ -2680,36 +2760,13 @@ export class ReviewController implements vscode.Disposable {
 			&& hunk.newText === suggestion.appliedHunk.newText
 		)));
 		file.skippedReason = diff.skippedReason;
-		if (file.hunks.length === 0 && this.decisionHunks(file).length === 0 && !file.skippedReason && !this.manualGitBaselines.has(key)) {
+		if (file.hunks.length === 0 && this.decisionHunks(file).length === 0 && !file.skippedReason) {
 			this.activeSession.files.delete(key);
 		}
 		if (previousState !== this.fileStateFingerprint(file)) {
 			this.touchFileRevision(file);
-			this.syncManualGitBaseline(file);
 		}
 		this.refreshUi();
-	}
-
-	private computeReviewHunks(uri: vscode.Uri, oldText: string, newText: string): { hunks: ReviewHunk[]; skippedReason?: string } {
-		const config = vscode.workspace.getConfiguration('cliDiff');
-		const maxFileBytes = config.get<number>('maxFileBytes', 2097152);
-		const maxDiffLines = config.get<number>('maxDiffLines', 12000);
-		const maxDiffCells = config.get<number>('maxDiffCells', 16000000);
-		if (Buffer.byteLength(oldText, 'utf8') > maxFileBytes || Buffer.byteLength(newText, 'utf8') > maxFileBytes) {
-			return { hunks: [], skippedReason: 'File exceeds cliDiff.maxFileBytes.' };
-		}
-
-		const oldLineCount = splitLines(oldText).length;
-		const newLineCount = splitLines(newText).length;
-		const lineCount = oldLineCount + newLineCount;
-		if (lineCount > maxDiffLines) {
-			return { hunks: [], skippedReason: 'File exceeds cliDiff.maxDiffLines.' };
-		}
-		if ((oldLineCount + 1) * (newLineCount + 1) > maxDiffCells) {
-			return { hunks: [], skippedReason: 'File diff exceeds cliDiff.maxDiffCells.' };
-		}
-
-		return { hunks: computeLineDiff(uri.toString(), oldText, newText) };
 	}
 
 	private isReviewableFile(file: ReviewFileState | undefined): file is ReviewFileState {
@@ -2725,7 +2782,17 @@ export class ReviewController implements vscode.Disposable {
 		this.treeProvider.refresh();
 		this.refreshReviewPresentation();
 		this.dashboardProvider.refresh();
-		void this.refreshLlmWikiDashboardState();
+		this.scheduleLlmWikiDashboardRefresh();
+	}
+
+	private scheduleLlmWikiDashboardRefresh(): void {
+		if (this.llmDashboardRefreshTimer) {
+			clearTimeout(this.llmDashboardRefreshTimer);
+		}
+		this.llmDashboardRefreshTimer = setTimeout(() => {
+			this.llmDashboardRefreshTimer = undefined;
+			void this.refreshLlmWikiDashboardState();
+		}, 500);
 	}
 
 	private refreshReviewPresentation(uri?: vscode.Uri): void {
@@ -2844,9 +2911,9 @@ export class ReviewController implements vscode.Disposable {
 				findingOrder,
 			)
 			: [];
-		let wikiNeedsUpdate = Boolean(root && wikiState?.status === 'ready' && !hasPending && !this.currentWikiTask
+		let wikiNeedsUpdate = Boolean(this.llmConfigState.configured && root && wikiState?.status === 'ready' && !hasPending && !this.currentWikiTask
 			&& await this.wikiInitializationService.needsUpdate(root));
-		if (!root && !this.currentWikiTask) {
+		if (this.llmConfigState.configured && !root && !this.currentWikiTask) {
 			for (const item of aggregateWikiStates) {
 				if (item.state?.status === 'ready'
 					&& sourcePendingFiles(this.projectSession(item.project)).length === 0
@@ -2951,7 +3018,7 @@ export class ReviewController implements vscode.Disposable {
 		}
 		this.currentReviewUri = uri;
 		this.dashboardProvider.refresh();
-		void this.refreshLlmWikiDashboardState();
+		this.scheduleLlmWikiDashboardRefresh();
 	}
 
 	private activeGitWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
@@ -2967,29 +3034,8 @@ export class ReviewController implements vscode.Disposable {
 		return this.activeSession?.projects?.find((project) => uriIsInside(project.rootUri, uri));
 	}
 
-	private async updateGitIndexStateSignatures(): Promise<void> {
-		const projects = this.activeSession?.projects ?? [];
-		if (projects.length === 0) {
-			this.gitIndexStateSignatures.clear();
-			return;
-		}
-
-		const next = new Map<string, string>();
-		for (const [index, project] of projects.entries()) {
-			try {
-				next.set(project.id, await this.gitService.indexStateSignature(reviewProjectFolder(project, index)));
-			} catch {
-				// A repository may disappear while the workspace is refreshing.
-			}
-		}
-		this.gitIndexStateSignatures.clear();
-		for (const [projectId, signature] of next) {
-			this.gitIndexStateSignatures.set(projectId, signature);
-		}
-	}
-
 	private scheduleGitSessionRefresh(): void {
-		if (!this.activeSession || this.activeSession.mode !== 'git') {
+		if (!this.activeSession || this.activeSession.mode !== 'git' || this.gitMutationDepth > 0) {
 			return;
 		}
 
@@ -2999,40 +3045,8 @@ export class ReviewController implements vscode.Disposable {
 
 		this.gitRefreshTimer = setTimeout(() => {
 			this.gitRefreshTimer = undefined;
-			void this.refreshGitSessionIfIndexChanged();
+			void this.refreshGitSessionFiles({ source: 'gitIndexChanged' });
 		}, 250);
-	}
-
-	private async refreshGitSessionIfIndexChanged(): Promise<void> {
-		if (!this.activeSession || this.activeSession.mode !== 'git') {
-			return;
-		}
-
-		const workspaceRoot = this.activeGitWorkspaceFolder();
-		if (!workspaceRoot) {
-			return;
-		}
-		const projects = this.activeSession.projects ?? [];
-
-		try {
-			const discoveredProjects = await this.gitService.discoverProjects(workspaceRoot);
-			let changed = discoveredProjects.length !== projects.length
-				|| discoveredProjects.some((project) => !projects.some((current) => current.id === project.id));
-			for (const [index, project] of projects.entries()) {
-				const signature = await this.gitService.indexStateSignature(reviewProjectFolder(project, index));
-				if (signature !== this.gitIndexStateSignatures.get(project.id)) {
-					changed = true;
-					break;
-				}
-			}
-			if (!changed) {
-				return;
-			}
-
-			await this.refreshGitSessionFiles({ source: 'gitIndexChanged' });
-		} catch {
-			// Git may be unavailable briefly while the repository is changing.
-		}
 	}
 
 	private touchFileRevision(file: ReviewFileState): void {
@@ -3123,7 +3137,11 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private isStaleMutation(file: ReviewFileState, expectedRevision?: number): boolean {
-		return isStaleRevision(file.revision, expectedRevision);
+		const stale = isStaleRevision(file.revision, expectedRevision);
+		if (stale) {
+			void vscode.window.showInformationMessage('The Git change changed before the action ran. Cli Diff Review refreshed it; try the action again.');
+		}
+		return stale;
 	}
 
 	private syncBaselineExistsAfterAccept(file: ReviewFileState): void {
@@ -3132,10 +3150,6 @@ export class ReviewController implements vscode.Disposable {
 
 	private syncBaselineExistsForPending(file: ReviewFileState): void {
 		file.baselineExists = file.originalExists || file.oldText.length > 0;
-	}
-
-	private async updateSnapshotBaselineFile(file: ReviewFileState): Promise<void> {
-		await this.snapshotStore.updateBaselineFile(file.uri, file.oldText, file.baselineExists);
 	}
 
 	private fileStateFingerprint(file: ReviewFileState): string {
@@ -3221,6 +3235,14 @@ export class ReviewController implements vscode.Disposable {
 		}
 	}
 
+	private async withInternalWrites<T>(uris: vscode.Uri[], callback: () => Promise<T>): Promise<T> {
+		const unique = [...new Map(uris.map((uri) => [uriKey(uri), uri])).values()];
+		const run = async (index: number): Promise<T> => index >= unique.length
+			? callback()
+			: this.withInternalWrite(unique[index], 'plugin', () => run(index + 1));
+		return run(0);
+	}
+
 	private countInsertedLines(text: string): number {
 		if (!text) {
 			return 0;
@@ -3266,12 +3288,7 @@ export class ReviewController implements vscode.Disposable {
 		if (uri.scheme !== 'file') {
 			return;
 		}
-
 		const key = uriKey(uri);
-		if (this.activeSession && !this.activeSession.files.has(key) && this.activeSession.mode !== 'git') {
-			return;
-		}
-
 		const existing = this.refreshTimers.get(key);
 		if (existing) {
 			clearTimeout(existing);
@@ -3304,24 +3321,19 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 
-		await this.refreshFile(uri, { preferDisk: options.preferDisk });
+		// Opening or focusing an editor does not change Git state. File and Git
+		// watchers keep an existing session synchronized without a full scan here.
+		void options;
 	}
 
 	private async createGitFilePair(uri: vscode.Uri, options: { preferDisk?: boolean } = {}): Promise<FilePair | undefined> {
 		const project = this.gitProjectForUri(uri);
 		const folder = project ? reviewProjectFolder(project) : vscode.workspace.getWorkspaceFolder(uri);
-
-		try {
-			const pair = await this.gitService.createFilePairForUri(uri, folder, { preferDisk: options.preferDisk });
-			if (!pair) {
-				this.manualGitBaselines.delete(uriKey(uri));
-				return undefined;
-			}
-			const projectPair = project ? { ...pair, projectId: project.id, projectName: project.name } : pair;
-			return applyManualGitBaselineToPair(projectPair, this.manualGitBaselineForPair(projectPair));
-		} catch {
+		const pair = await this.gitService.createFilePairForUri(uri, folder, { preferDisk: options.preferDisk });
+		if (!pair) {
 			return undefined;
 		}
+		return project ? { ...pair, projectId: project.id, projectName: project.name } : pair;
 	}
 
 	private resolveHunk(uriString?: string, hunkId?: string): { file: ReviewFileState; hunk: ReviewHunk } | undefined {
@@ -3393,7 +3405,25 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 
-		await this.fileOperationQueue.enqueue(uriKey(uri), operation);
+		const file = this.activeSession?.files.get(uriKey(uri));
+		const project = file?.projectId
+			? this.activeSession?.projects?.find((candidate) => candidate.id === file.projectId)
+			: this.gitProjectForUri(uri);
+		await this.fileOperationQueue.enqueue(project ? uriKey(project.rootUri) : uriKey(uri), async () => {
+			if (project && this.gitRefreshInFlight) {
+				await this.gitRefreshInFlight;
+			}
+			if (project && this.gitRefreshTimer) {
+				clearTimeout(this.gitRefreshTimer);
+				this.gitRefreshTimer = undefined;
+			}
+			this.gitMutationDepth += 1;
+			try {
+				await operation();
+			} finally {
+				this.gitMutationDepth = Math.max(0, this.gitMutationDepth - 1);
+			}
+		});
 	}
 
 	private flattenHunks(): Array<{ file: ReviewFileState; hunk: ReviewHunk }> {
@@ -3444,14 +3474,13 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private refreshPendingHunksFromReviewState(file: ReviewFileState): void {
-		const diff = this.computeReviewHunks(file.uri, file.oldText, file.newText);
-		file.hunks = diff.hunks;
+		file.hunks = [];
 		this.normalizeReviewedDuplicateHunks(file);
 		file.appliedAiSuggestions = file.appliedAiSuggestions.filter((suggestion) => file.hunks.some((hunk) => (
 			hunk.id === suggestion.hunkId
 			&& hunk.newText === suggestion.appliedHunk.newText
 		)));
-		file.skippedReason = diff.skippedReason;
+		file.skippedReason = undefined;
 	}
 
 	private isSameReviewHunk(left: ReviewHunk, right: ReviewHunk): boolean {
@@ -3857,51 +3886,6 @@ export class ReviewController implements vscode.Disposable {
 		return Math.max(0, baselineLine);
 	}
 
-	private async readCurrentWorkspaceFiles(): Promise<Map<string, CurrentTextState & { uri: vscode.Uri; relativePath: string }>> {
-		const folders = vscode.workspace.workspaceFolders ?? [];
-		const maxFileBytes = vscode.workspace.getConfiguration('cliDiff').get<number>('maxFileBytes', 2097152);
-		const maxFiles = vscode.workspace.getConfiguration('cliDiff').get<number>('maxFiles', 2000);
-		const exclude = vscode.workspace.getConfiguration('cliDiff').get<string>('exclude', '**/{.git,node_modules,dist,out,.vscode-test}/**');
-		const files = new Map<string, CurrentTextState & { uri: vscode.Uri; relativePath: string }>();
-
-		for (const folder of folders) {
-			const uris = await vscode.workspace.findFiles(new vscode.RelativePattern(folder, '**/*'), exclude, maxFiles);
-			const relativePaths = new Map(uris.map((uri) => [uri.toString(), relativePath(folder.uri, uri)]));
-			const ignoredPaths = await gitIgnoredReviewPaths(folder, [...relativePaths.values()]);
-			for (const uri of uris) {
-				const currentRelativePath = relativePaths.get(uri.toString()) ?? relativePath(folder.uri, uri);
-				if (shouldSkipReviewPath(currentRelativePath) || ignoredPaths.has(currentRelativePath)) {
-					continue;
-				}
-				const data = await vscode.workspace.fs.readFile(uri);
-				if (data.length > maxFileBytes) {
-					files.set(uriKey(uri), {
-						uri,
-						relativePath: currentRelativePath,
-						...skippedCurrentFile('File exceeds cliDiff.maxFileBytes.'),
-					});
-					continue;
-				}
-				if (isProbablyBinary(data)) {
-					files.set(uriKey(uri), {
-						uri,
-						relativePath: currentRelativePath,
-						...skippedCurrentFile('File appears to be binary.'),
-					});
-					continue;
-				}
-				files.set(uriKey(uri), {
-					uri,
-					relativePath: currentRelativePath,
-					text: decodeUtf8(data),
-					exists: true,
-				});
-			}
-		}
-
-		return files;
-	}
-
 	private async readCurrentText(uri: vscode.Uri, options: { preferDisk?: boolean } = {}): Promise<{ exists: boolean; text: string }> {
 		const openDocument = vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri.toString());
 		if (openDocument && (!options.preferDisk || openDocument.isDirty)) {
@@ -3936,6 +3920,36 @@ export class ReviewController implements vscode.Disposable {
 				throw new Error('VS Code rejected the workspace edit.');
 			}
 			await openDocument.save();
+		});
+	}
+
+	private async synchronizeOpenDocumentAfterGitMutation(uri: vscode.Uri): Promise<void> {
+		const document = vscode.workspace.textDocuments.find((candidate) => uriKey(candidate.uri) === uriKey(uri));
+		if (!document || document.isDirty) {
+			return;
+		}
+		const disk = await this.readCurrentText(uri, { preferDisk: true });
+		if (!disk.exists) {
+			const tabs = vscode.window.tabGroups.all.flatMap((group) => group.tabs).filter((tab) => {
+				const input = tab.input;
+				return input instanceof vscode.TabInputText && uriKey(input.uri) === uriKey(uri);
+			});
+			if (tabs.length > 0) {
+				await vscode.window.tabGroups.close(tabs, true);
+			}
+			return;
+		}
+		if (document.getText() === disk.text) {
+			return;
+		}
+		await this.withInternalWrite(uri, 'plugin', async () => {
+			const edit = new vscode.WorkspaceEdit();
+			const fullRange = new vscode.Range(new vscode.Position(0, 0), document.positionAt(document.getText().length));
+			edit.replace(uri, fullRange, disk.text);
+			if (!await vscode.workspace.applyEdit(edit)) {
+				throw new Error('VS Code could not synchronize the open editor after the Git change.');
+			}
+			await document.save();
 		});
 	}
 
@@ -4015,7 +4029,15 @@ export class ReviewController implements vscode.Disposable {
 
 			const onDidChange = repository?.state?.onDidChange;
 			if (typeof onDidChange === 'function') {
-				disposables.push(onDidChange(() => this.scheduleGitSessionRefresh()));
+				let signature = gitExtensionStateSignature(repository?.state);
+				disposables.push(onDidChange(() => {
+					const next = gitExtensionStateSignature(repository?.state);
+					if (next === signature) {
+						return;
+					}
+					signature = next;
+					this.scheduleGitSessionRefresh();
+				}));
 			}
 		};
 
@@ -4065,4 +4087,20 @@ function trackingTargetStorageKey(rootUri: vscode.Uri): string {
 function uriIsInside(rootUri: vscode.Uri, uri: vscode.Uri): boolean {
 	const relative = path.relative(rootUri.fsPath, uri.fsPath);
 	return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function gitExtensionStateSignature(state: any): string {
+	const changes = (items: any[] | undefined) => (items ?? []).map((item) => [
+		item?.uri?.toString?.() ?? '',
+		item?.originalUri?.toString?.() ?? '',
+		item?.renameUri?.toString?.() ?? '',
+		item?.status ?? '',
+	]);
+	return JSON.stringify({
+		head: state?.HEAD?.commit ?? state?.HEAD?.name ?? '',
+		index: changes(state?.indexChanges),
+		working: changes(state?.workingTreeChanges),
+		merge: changes(state?.mergeChanges),
+		untracked: changes(state?.untrackedChanges),
+	});
 }
