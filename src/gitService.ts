@@ -3,7 +3,7 @@ import { realpathSync } from 'fs';
 import { dirname as pathDirname, relative as pathRelative, resolve as pathResolve } from 'path';
 import { StringDecoder } from 'string_decoder';
 import * as vscode from 'vscode';
-import { combineGitHunkPatches, parseGitPatch, ParsedGitFilePatch, reviewedHunkFromGit } from './gitPatch';
+import { combineGitHunkPatches, parseGitPatch, ParsedGitFilePatch } from './gitPatch';
 import { isGitIgnoredReviewPath, normalizeReviewPath, shouldSkipReviewPath } from './reviewFileFilter';
 import { FilePair, GitReviewHunk, ReviewProject, uriKey } from './types';
 import { decodeUtf8, isProbablyBinary, uriFromRelativePath } from './text';
@@ -51,13 +51,11 @@ export class GitService {
 	public async createFilePairs(root: vscode.WorkspaceFolder): Promise<FilePair[]> {
 		const projectId = uriKey(root.uri);
 		const maxFileBytes = vscode.workspace.getConfiguration('cliDiff').get<number>('maxFileBytes', 2097152);
-		const [acceptedBlocks, pendingBlocks, statusOutput, headOid] = await Promise.all([
-			this.gitPatchBlocks(root, ['diff', '--cached', ...diffOptions], maxFileBytes, [0, 1]),
+		const [pendingBlocks, statusOutput, headOid] = await Promise.all([
 			this.gitPatchBlocks(root, ['diff', ...diffOptions], maxFileBytes, [0, 1]),
 			this.gitBuffer(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=no']),
 			this.headOid(root),
 		]);
-		const accepted = acceptedBlocks.flatMap((block) => parseGitPatch(block, projectId, 'accepted', maxFileBytes));
 		const pending = pendingBlocks.flatMap((block) => parseGitPatch(block, projectId, 'pending', maxFileBytes));
 		const status = parsePorcelainStatus(statusOutput);
 		const untrackedPaths = status.untrackedPaths.map(normalizeReviewPath).filter(Boolean);
@@ -73,21 +71,17 @@ export class GitService {
 		);
 		pending.push(...untrackedPatches.flat());
 
-		return this.buildFilePairs(root, accepted, pending, new Set(status.conflictPaths.map(normalizeReviewPath)), headOid, maxFileBytes);
+		return this.buildFilePairs(root, pending, new Set(status.conflictPaths.map(normalizeReviewPath)), headOid, maxFileBytes);
 	}
 
 	private async buildFilePairs(
 		root: vscode.WorkspaceFolder,
-		accepted: ParsedGitFilePatch[],
 		pending: ParsedGitFilePatch[],
 		conflicts: Set<string>,
 		headOid: string,
 		maxFileBytes: number,
 	): Promise<FilePair[]> {
-		const byPath = new Map<string, { accepted?: ParsedGitFilePatch; pending?: ParsedGitFilePatch }>();
-		for (const file of accepted) {
-			byPath.set(file.relativePath, { ...byPath.get(file.relativePath), accepted: file });
-		}
+		const byPath = new Map<string, { pending?: ParsedGitFilePatch }>();
 		for (const file of pending) {
 			byPath.set(file.relativePath, { ...byPath.get(file.relativePath), pending: file });
 		}
@@ -99,16 +93,15 @@ export class GitService {
 
 		const entries = [...byPath].filter(([relativePath]) => relativePath && !shouldSkipReviewPath(relativePath)).map(([relativePath, layers]) => {
 			const uri = uriFromRelativePath(root.uri, relativePath);
-			assignFileOccurrences([...(layers.accepted?.hunks ?? []), ...(layers.pending?.hunks ?? [])]);
+			assignFileOccurrences(layers.pending?.hunks ?? []);
 			return {
 				relativePath,
 				layers,
 				uri,
-				headBlobOid: layers.accepted ? layers.accepted.oldOid : layers.pending?.oldOid,
-				indexBlobOid: layers.pending ? layers.pending.oldOid : layers.accepted?.newOid,
+				indexBlobOid: layers.pending?.oldOid,
 				skippedReason: conflicts.has(relativePath)
 					? 'Unsupported Git change: merge conflict. Resolve it in Source Control.'
-					: layers.pending?.unsupportedReason ?? layers.accepted?.unsupportedReason,
+					: layers.pending?.unsupportedReason,
 			};
 		});
 		const workingStates = await Promise.all(entries.map((entry) => readCurrentText(entry.uri, {
@@ -122,35 +115,33 @@ export class GitService {
 		}
 		const blobOids = entries.flatMap((entry) => entry.skippedReason
 			? []
-			: [entry.headBlobOid, entry.indexBlobOid].filter((oid): oid is string => Boolean(oid)));
+			: [entry.indexBlobOid].filter((oid): oid is string => Boolean(oid)));
 		const blobs = await this.readBlobs(root, blobOids);
 
 		const pairs: FilePair[] = [];
 		for (const [entryIndex, entry] of entries.entries()) {
-			const { relativePath, layers, uri, headBlobOid, indexBlobOid, skippedReason } = entry;
+			const { relativePath, layers, uri, indexBlobOid, skippedReason } = entry;
 			const working = workingStates[entryIndex];
-			const head = blobText(blobs.get(headBlobOid ?? ''));
 			const index = blobText(blobs.get(indexBlobOid ?? ''));
 			const pendingHunks = (layers.pending?.hunks ?? []).map((hunk) => ({ ...hunk, fileUri: uri.toString() }));
-			const acceptedHunks = (layers.accepted?.hunks ?? []).map((hunk) => reviewedHunkFromGit({ ...hunk, fileUri: uri.toString() }, 'accept'));
 			pairs.push({
 				uri,
 				relativePath,
-				oldText: head,
+				oldText: index,
 				newText: working.text,
-				baselineExists: Boolean(headBlobOid),
+				baselineExists: Boolean(indexBlobOid),
 				currentExists: working.exists,
 				skippedReason,
 				gitSnapshot: {
-					headText: head,
+					headText: index,
 					indexText: index,
 					workingText: working.text,
-					headExists: Boolean(headBlobOid),
+					headExists: Boolean(indexBlobOid),
 					indexExists: Boolean(indexBlobOid),
 					workingExists: working.exists,
+					indexBlobOid,
 				},
 				pendingHunks,
-				acceptedHunks,
 				headOid,
 			});
 		}
@@ -180,13 +171,11 @@ export class GitService {
 		const projectId = uriKey(folder.uri);
 		const maxFileBytes = vscode.workspace.getConfiguration('cliDiff').get<number>('maxFileBytes', 2097152);
 		const pathDiffOptions = [...diffOptions.slice(0, -1), '--', relativePath];
-		const [acceptedBlocks, pendingBlocks, statusOutput, headOid] = await Promise.all([
-			this.gitPatchBlocks(folder, ['diff', '--cached', ...pathDiffOptions], maxFileBytes, [0, 1]),
+		const [pendingBlocks, statusOutput, headOid] = await Promise.all([
 			this.gitPatchBlocks(folder, ['diff', ...pathDiffOptions], maxFileBytes, [0, 1]),
 			this.gitBuffer(folder, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=no', '--', relativePath]),
 			this.headOid(folder),
 		]);
-		const accepted = acceptedBlocks.flatMap((block) => parseGitPatch(block, projectId, 'accepted', maxFileBytes));
 		const pending = pendingBlocks.flatMap((block) => parseGitPatch(block, projectId, 'pending', maxFileBytes));
 		const status = parsePorcelainStatus(statusOutput);
 		if (status.untrackedPaths.map(normalizeReviewPath).includes(relativePath)) {
@@ -197,7 +186,6 @@ export class GitService {
 		}
 		const pairs = await this.buildFilePairs(
 			folder,
-			accepted,
 			pending,
 			new Set(status.conflictPaths.map(normalizeReviewPath)),
 			headOid,

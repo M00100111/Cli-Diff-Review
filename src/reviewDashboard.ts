@@ -400,8 +400,6 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		button:hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground); }
 		button:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
 		button:disabled { opacity: .45; cursor: default; }
-		.icon-button.review-action-pending svg { animation: review-action-spin .75s linear infinite; }
-		@keyframes review-action-spin { to { transform: rotate(360deg); } }
 		.shell {
 			height: 100vh;
 			min-height: 0;
@@ -1406,7 +1404,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					<button class="refresh-button bulk-action-button" id="undoAll" type="button" title="Undo all reviewed changes" aria-label="Undo all reviewed changes">
 						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5H3.5V3.5"/><path d="M3.8 5.4A5 5 0 1 1 4.9 12"/></svg>
 					</button>
-					<button class="refresh-button" id="refresh" type="button" title="Refresh" aria-label="Refresh">
+					<button class="refresh-button" id="refresh" type="button" title="Refresh and stage reviewed changes" aria-label="Refresh and stage reviewed changes">
 						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8A5 5 0 1 1 11.5 4.5"/><path d="M11.5 2.5V4.5H13.5"/></svg>
 					</button>
 				</div>
@@ -1555,7 +1553,6 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			}
 		});
 		const icons = {
-			pending: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5a5.5 5.5 0 1 1-4.7 2.64"/><path d="M3.3 2.8v2.5h2.5"/></svg>',
 			acceptFile: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8.5L6.5 11.5L12.5 4.5"/></svg>',
 			rejectFile: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 4.5L11.5 11.5"/><path d="M11.5 4.5L4.5 11.5"/></svg>',
 			undoFile: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5H3.5V3.5"/><path d="M3.8 5.4A5 5 0 1 1 4.9 12"/></svg>',
@@ -1764,7 +1761,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				return 'Regenerate AI review';
 			}
 			if (wiki.aiReviewStatus === 'partial') {
-				return wiki.aiReviewError ? 'Retry AI review' : 'Continue AI review';
+				return 'Continue AI review';
 			}
 			return 'Generate AI review';
 		}
@@ -2083,7 +2080,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const title = document.createElement('span');
 			title.className = 'wiki-run-title';
 			const decisionLabel = chunk.reviewDecision === 'accepted'
-				? 'Accepted · Staged'
+				? 'Accepted'
 				: chunk.reviewDecision === 'rejected' ? 'Rejected' : chunk.reviewStatus === 'pending' ? 'Pending' : '';
 			title.textContent = (decisionLabel ? decisionLabel + ' · ' : '') + chunk.kind + ' ' + chunk.oldLines + '->' + chunk.newLines + ' lines';
 			const meta = document.createElement('span');
@@ -2145,6 +2142,24 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					event.stopPropagation();
 					vscode.postMessage({
 						type: 'applyAiSuggestion',
+						uri: file.uri,
+						hunkId: chunk.hunkId,
+						suggestionId: suggestion.id,
+					});
+				});
+				header.appendChild(action);
+			} else if (applied && chunk.reviewStatus === 'pending') {
+				const action = document.createElement('button');
+				action.type = 'button';
+				action.className = 'review-suggestion-action';
+				action.textContent = 'Undo';
+				action.title = 'Undo AI suggestion';
+				action.setAttribute('aria-label', 'Undo AI suggestion');
+				action.addEventListener('click', (event) => {
+					event.preventDefault();
+					event.stopPropagation();
+					vscode.postMessage({
+						type: 'undoAiSuggestion',
 						uri: file.uri,
 						hunkId: chunk.hunkId,
 						suggestionId: suggestion.id,
@@ -2665,9 +2680,6 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 
 		function markReviewActionPending(button) {
 			button.disabled = true;
-			button.classList.add('review-action-pending');
-			button.title = 'Applying Git change…';
-			button.innerHTML = icons.pending;
 		}
 
 		function setExpanded(nextExpanded) {
@@ -2724,7 +2736,9 @@ export function buildReviewDashboardPayload(
 			.map((file) => {
 				const pendingHunks = dashboardPendingHunks(file);
 				const pendingCount = pendingHunks.length;
-				const reviewedCount = file.acceptedHunks.length + file.rejectedHunks.length;
+				const acceptedCount = file.acceptedHunks.length;
+				const rejectedCount = file.rejectedHunks.length;
+				const reviewedCount = acceptedCount + rejectedCount;
 				const fileUri = file.uri.toString();
 				const findingCount = findingsByFile.get(fileUri)?.length ?? 0;
 				const suggestionCount = suggestionsByFile.get(fileUri)?.length ?? 0;
@@ -2737,7 +2751,15 @@ export function buildReviewDashboardPayload(
 					revision: file.revision,
 					relativePath: displayPath,
 					fileExtension: dashboardExtension(displayPath),
-					description: dashboardDescription(pendingCount, reviewedCount, findingCount, suggestionCount, dirty, file.skippedReason),
+					description: dashboardDescription(
+						pendingCount,
+						acceptedCount,
+						rejectedCount,
+						findingCount,
+						suggestionCount,
+						dirty,
+						file.skippedReason,
+					),
 					statusLabel: status.label,
 					statusKind: status.kind,
 					pendingCount,
@@ -2854,26 +2876,30 @@ function dashboardChunks(
 	mutationDisabled: boolean,
 ): ReviewDashboardChunk[] {
 	const uri = file.uri.toString();
-	const appliedByHunk = new Map(file.appliedAiSuggestions.map((suggestion) => [suggestion.hunkId, {
-		suggestionId: suggestion.suggestionId,
-		replacementText: suggestion.replacementText,
-	}]));
-	const chunks = pendingHunks.map((hunk): ReviewDashboardChunk => ({
-		hunkId: hunk.id,
-		kind: hunk.kind,
-		line: hunk.newStart,
-		oldLines: hunk.oldLines,
-		newLines: hunk.newLines,
-		findings: findingsByChunk.get(`${uri}#${hunk.id}`) ?? [],
-		suggestions: suggestionsByChunk.get(`${uri}#${hunk.id}`) ?? [],
-		appliedSuggestion: appliedByHunk.get(hunk.id),
-		reviewStatus: 'pending',
-		canAccept: !mutationDisabled,
-		canReject: !mutationDisabled,
-		canUndo: false,
-	}));
+	const appliedByHunk = new Map(file.appliedAiSuggestions.map((suggestion) => [suggestion.currentHunkId, suggestion]));
+	const chunks = pendingHunks.map((hunk): ReviewDashboardChunk => {
+		const applied = appliedByHunk.get(hunk.id);
+		const reviewItemHunkIds = applied ? [hunk.id, applied.sourceHunkId] : [hunk.id];
+		return {
+			hunkId: hunk.id,
+			kind: hunk.kind,
+			line: hunk.newStart,
+			oldLines: hunk.oldLines,
+			newLines: hunk.newLines,
+			findings: reviewItemsByHunkIds(findingsByChunk, uri, reviewItemHunkIds),
+			suggestions: reviewItemsByHunkIds(suggestionsByChunk, uri, reviewItemHunkIds),
+			appliedSuggestion: dashboardAppliedSuggestion(applied),
+			reviewStatus: 'pending',
+			canAccept: !mutationDisabled,
+			canReject: !mutationDisabled,
+			canUndo: false,
+		};
+	});
 	const seenIdentities = new Set(pendingHunks.map(reviewHunkIdentity));
 	const seenHunkIds = new Set(pendingHunks.map((hunk) => hunk.id));
+	for (const applied of file.appliedAiSuggestions) {
+		seenHunkIds.add(applied.sourceHunkId);
+	}
 	for (const hunk of [...file.acceptedHunks, ...file.rejectedHunks]) {
 		const identity = reviewHunkIdentity(hunk);
 		if (seenIdentities.has(identity)) {
@@ -2881,7 +2907,11 @@ function dashboardChunks(
 		}
 		seenIdentities.add(identity);
 		const originalHunkId = originalReviewedHunkId(hunk.id);
-		const reviewItemHunkIds = originalHunkId === hunk.id ? [hunk.id] : [hunk.id, originalHunkId];
+		const reviewItemHunkIds = [...new Set([
+			hunk.id,
+			originalHunkId,
+			hunk.appliedAiSuggestion?.sourceHunkId,
+		].filter((value): value is string => Boolean(value)))];
 		seenHunkIds.add(hunk.id);
 		seenHunkIds.add(originalHunkId);
 		chunks.push({
@@ -2892,7 +2922,9 @@ function dashboardChunks(
 			newLines: hunk.newLines,
 			findings: reviewItemsByHunkIds(findingsByChunk, uri, reviewItemHunkIds),
 			suggestions: reviewItemsByHunkIds(suggestionsByChunk, uri, reviewItemHunkIds),
-			appliedSuggestion: dashboardAppliedSuggestion(hunk.appliedAiSuggestion) ?? appliedByHunk.get(hunk.id) ?? appliedByHunk.get(originalHunkId),
+			appliedSuggestion: dashboardAppliedSuggestion(hunk.appliedAiSuggestion)
+				?? dashboardAppliedSuggestion(appliedByHunk.get(hunk.id))
+				?? dashboardAppliedSuggestion(appliedByHunk.get(originalHunkId)),
 			reviewStatus: 'reviewed',
 			reviewDecision: hunk.status,
 			canAccept: false,
@@ -2913,7 +2945,7 @@ function dashboardChunks(
 			newLines: 0,
 			findings: findingsByChunk.get(`${uri}#${item.hunkId}`) ?? [],
 			suggestions: suggestionsByChunk.get(`${uri}#${item.hunkId}`) ?? [],
-			appliedSuggestion: appliedByHunk.get(item.hunkId),
+			appliedSuggestion: dashboardAppliedSuggestion(appliedByHunk.get(item.hunkId)),
 			reviewStatus: 'reviewed',
 			canAccept: false,
 			canReject: false,
@@ -2963,7 +2995,8 @@ function dashboardPendingHunks(file: ReviewFileState): ReviewHunk[] {
 
 function dashboardDescription(
 	pendingCount: number,
-	reviewedCount: number,
+	acceptedCount: number,
+	rejectedCount: number,
 	findingCount: number,
 	suggestionCount: number,
 	dirty: boolean,
@@ -2974,10 +3007,13 @@ function dashboardDescription(
 	}
 	const parts: string[] = [];
 	if (pendingCount > 0) {
-		parts.push(`${pendingCount} pending`);
+		parts.push(`${pendingCount} Pending`);
 	}
-	if (reviewedCount > 0) {
-		parts.push(`${reviewedCount} reviewed`);
+	if (acceptedCount > 0) {
+		parts.push(`${acceptedCount} Accepted`);
+	}
+	if (rejectedCount > 0) {
+		parts.push(`${rejectedCount} Rejected`);
 	}
 	if (findingCount > 0) {
 		parts.push(`${findingCount} ${findingCount === 1 ? 'finding' : 'findings'}`);
@@ -3007,15 +3043,22 @@ function dashboardStatus(file: ReviewFileState): { label: string; kind: ReviewDa
 	if (file.skippedReason) {
 		return { label: 'Unsupported Git change', kind: 'skipped' };
 	}
-	if (file.hunks.length > 0) {
-		return { label: 'Pending', kind: file.baselineExists ? 'modified' : 'untracked' };
+
+	const changeKinds = new Set(
+		[...file.hunks, ...file.acceptedHunks, ...file.rejectedHunks]
+			.map((hunk) => hunk.kind)
+			.filter((kind) => kind === 'add' || kind === 'delete' || kind === 'modify'),
+	);
+	if (changeKinds.size === 1 && changeKinds.has('add')) {
+		return { label: 'U', kind: 'untracked' };
 	}
-	if (file.rejectedHunks.length > 0) {
-		return { label: 'Rejected', kind: file.currentExists ? 'modified' : 'deleted' };
+	if (changeKinds.size === 1 && changeKinds.has('delete')) {
+		return { label: 'D', kind: 'deleted' };
 	}
-	if (file.acceptedHunks.length > 0) {
-		return { label: 'Accepted · Staged', kind: file.currentExists ? 'modified' : 'deleted' };
+	if (changeKinds.size > 0) {
+		return { label: 'M', kind: 'modified' };
 	}
+
 	if (!file.currentExists) {
 		return { label: 'D', kind: 'deleted' };
 	}

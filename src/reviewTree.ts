@@ -80,7 +80,7 @@ export class ReviewTreeProvider implements vscode.TreeDataProvider<ReviewTreeNod
 		item.contextValue = 'cliDiffProject';
 		item.description = [
 			pending > 0 ? `${pending} Pending` : undefined,
-			accepted > 0 ? `${accepted} Accepted · Staged` : undefined,
+			accepted > 0 ? `${accepted} Accepted` : undefined,
 			rejected > 0 ? `${rejected} Rejected` : undefined,
 		].filter(Boolean).join(', ') || '0 Reviewed';
 		item.tooltip = element.project.rootUri.fsPath;
@@ -103,7 +103,7 @@ function fileDescription(
 		parts.push(`${pending} Pending`);
 	}
 	if (accepted > 0) {
-		parts.push(`${accepted} Accepted · Staged`);
+		parts.push(`${accepted} Accepted`);
 	}
 	if (rejected > 0) {
 		parts.push(`${rejected} Rejected`);

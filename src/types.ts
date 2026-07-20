@@ -49,6 +49,7 @@ export interface GitFileSnapshot {
 	headExists: boolean;
 	indexExists: boolean;
 	workingExists: boolean;
+	indexBlobOid?: string;
 }
 
 export interface ReviewedHunk extends ReviewHunk {
@@ -68,7 +69,8 @@ export interface ReviewedHunk extends ReviewHunk {
 
 export interface AppliedAiSuggestion {
 	suggestionId: string;
-	hunkId: string;
+	sourceHunkId: string;
+	currentHunkId: string;
 	originalHunk: ReviewHunk;
 	replacementText: string;
 	appliedHunk: ReviewHunk;
@@ -136,7 +138,6 @@ export interface FilePair {
 	skippedReason?: string;
 	gitSnapshot?: GitFileSnapshot;
 	pendingHunks?: GitReviewHunk[];
-	acceptedHunks?: ReviewedHunk[];
 	headOid?: string;
 }
 

@@ -96,6 +96,7 @@ export class ReviewController implements vscode.Disposable {
 	private readonly fileOperationQueue = new SerialOperationQueue<string>();
 	private gitRefreshTimer: NodeJS.Timeout | undefined;
 	private llmDashboardRefreshTimer: NodeJS.Timeout | undefined;
+	private aiReviewCheckpointSaveQueue = Promise.resolve();
 	private gitRefreshRequested = false;
 	private gitRefreshInFlight: Promise<void> | undefined;
 	private gitMutationDepth = 0;
@@ -433,6 +434,27 @@ export class ReviewController implements vscode.Disposable {
 				}
 				const key = uriKey(uri);
 				let file = files.get(key);
+				if (record.kind === 'accept') {
+					const current = file?.hunks.find((hunk) => hunk.fingerprint === record.hunk.fingerprint
+						&& (hunk.occurrence ?? 0) === (record.hunk.occurrence ?? 0));
+					const indexUnchanged = record.indexBlobOid === file?.gitSnapshot?.indexBlobOid;
+					if (record.state === 'flushing' && (!file || !current || !indexUnchanged)) {
+						await this.gitReviewJournal.clear(project, headOid);
+						break;
+					}
+					if (!file || !current || !indexUnchanged) {
+						await this.gitReviewJournal.remove(project, headOid, record.id);
+						continue;
+					}
+					if (record.state === 'flushing') {
+						await this.gitReviewJournal.setAcceptState(project, headOid, [record.id], 'reviewed');
+						record.state = 'reviewed';
+					}
+					const accepted = this.gitReviewJournal.toAcceptedHunk(record, this.requireGitHunk(current));
+					file.hunks = file.hunks.filter((hunk) => hunk.id !== current.id);
+					file.acceptedHunks.push(accepted);
+					continue;
+				}
 				if (!file) {
 					const current = await this.readCurrentText(uri, { preferDisk: true });
 					file = this.createManualBaselineFileState(uri, current.text);
@@ -451,7 +473,14 @@ export class ReviewController implements vscode.Disposable {
 					};
 					files.set(key, file);
 				}
-				file.rejectedHunks.push(this.gitReviewJournal.toReviewedHunk(record));
+				let rejected = this.gitReviewJournal.toReviewedHunk(record);
+				if (file.hunks.some((pending) => this.externalHunkTouchesDecision(pending, rejected))) {
+					await this.gitReviewJournal.remove(project, headOid, record.id);
+					continue;
+				}
+				const mappedStart = this.mapDecisionStartAfterExternalChanges(rejected.displayStart, file.hunks);
+				rejected = { ...rejected, displayStart: mappedStart, currentStart: mappedStart, zoneAfterLineNumber: mappedStart };
+				file.rejectedHunks.push(rejected);
 				if (record.state === 'stale') {
 					file.skippedReason = 'Rejected change is stale because the working file no longer matches its journal.';
 				}
@@ -535,11 +564,6 @@ export class ReviewController implements vscode.Disposable {
 	private createFileState(pair: FilePair): ReviewFileState {
 		if (pair.gitSnapshot) {
 			const pendingHunks = pair.pendingHunks ?? [];
-			const pendingEdits = pendingHunks.map((hunk) => ({ oldStart: hunk.oldStart, oldLines: hunk.oldLines, newLines: hunk.newLines }));
-			const acceptedHunks = (pair.acceptedHunks ?? []).map((hunk) => {
-				const displayStart = mapLineAfterLineEdits(hunk.newStart, pendingEdits);
-				return { ...hunk, displayStart, currentStart: displayStart, zoneAfterLineNumber: displayStart };
-			});
 			return {
 				uri: pair.uri,
 				relativePath: pair.relativePath,
@@ -548,7 +572,7 @@ export class ReviewController implements vscode.Disposable {
 				oldText: pair.gitSnapshot.headText,
 				newText: pair.gitSnapshot.workingText,
 				hunks: pendingHunks,
-				acceptedHunks,
+				acceptedHunks: [],
 				rejectedHunks: [],
 				appliedAiSuggestions: [],
 				originalText: pair.gitSnapshot.headText,
@@ -677,12 +701,23 @@ export class ReviewController implements vscode.Disposable {
 			}
 			const hunk = this.requireGitHunk(target.hunk);
 			const folder = this.requireGitFolder(target.file);
-			await Promise.all([
-				this.ensureGitHeadUnchanged(target.file, folder),
-				this.gitService.applyPatch(folder, hunk.patch, { cached: true, check: true }),
-			]);
-			await this.gitService.applyPatch(folder, hunk.patch, { cached: true });
-			await this.refreshGitReviewFile(target.file.uri);
+			const project = this.requireGitProject(target.file);
+			const headOid = await this.ensureGitHeadUnchanged(target.file, folder);
+			const appliedAiSuggestion = target.file.appliedAiSuggestions.find((suggestion) => suggestion.currentHunkId === target.hunk.id);
+			const record = await this.gitReviewJournal.accept(
+				project,
+				headOid,
+				target.file.relativePath,
+				target.file.uri,
+				hunk,
+				target.file.gitSnapshot?.indexBlobOid,
+				appliedAiSuggestion,
+			);
+			target.file.hunks = target.file.hunks.filter((candidate) => candidate.id !== target.hunk.id);
+			const accepted = this.gitReviewJournal.toAcceptedHunk(record, hunk);
+			target.file.acceptedHunks.push(accepted);
+			this.touchFileRevision(target.file);
+			this.refreshUi();
 			await this.syncNativeReviewAfterMutation(target.file.uri, { line: target.hunk.newStart, column: 0 });
 		} catch (error) {
 			this.showError(error);
@@ -720,7 +755,17 @@ export class ReviewController implements vscode.Disposable {
 				hunk,
 				target.file.gitSnapshot?.indexExists ?? target.file.baselineExists,
 			);
-			const record = await this.gitReviewJournal.prepare(project, headOid, target.file.relativePath, target.file.uri, hunk, beforeHash, afterHash);
+			const appliedAiSuggestion = target.file.appliedAiSuggestions.find((suggestion) => suggestion.currentHunkId === target.hunk.id);
+			const record = await this.gitReviewJournal.prepare(
+				project,
+				headOid,
+				target.file.relativePath,
+				target.file.uri,
+				hunk,
+				beforeHash,
+				afterHash,
+				appliedAiSuggestion,
+			);
 			let applied = false;
 			try {
 				await this.gitService.applyPatch(folder, hunk.patch, { reverse: true, check: true });
@@ -765,15 +810,27 @@ export class ReviewController implements vscode.Disposable {
 			if (!this.ensureFileCleanForReviewMutation(target.file)) {
 				return;
 			}
+			if (target.list === 'accepted' && target.hunk.appliedAiSuggestion && target.hunk.patch) {
+				const folder = this.requireGitFolder(target.file);
+				const project = this.requireGitProject(target.file);
+				const headOid = await this.ensureGitHeadUnchanged(target.file, folder);
+				const reviewSession = this.sessionForFile(target.file);
+				const storedReview = this.aiReviewStore.load(reviewSession);
+				await this.restoreAppliedSuggestionText(target.file, target.hunk.appliedAiSuggestion);
+				await this.gitReviewJournal.remove(project, headOid, target.hunk.id);
+				await this.refreshGitReviewFile(target.file.uri);
+				const restoredFile = this.resolveFile(target.file.uri.toString());
+				await this.saveAiReviewWithCurrentSignature(storedReview, restoredFile ? this.sessionForFile(restoredFile) : reviewSession);
+				await this.syncNativeReviewAfterMutation(target.file.uri, { line: target.hunk.displayStart, column: 0 });
+				return;
+			}
 			if (target.hunk.patch) {
 				const hunk = this.requireGitHunk(target.hunk);
 				const folder = this.requireGitFolder(target.file);
 				if (target.list === 'accepted') {
-					await Promise.all([
-						this.ensureGitHeadUnchanged(target.file, folder),
-						this.gitService.applyPatch(folder, hunk.patch, { cached: true, reverse: true, check: true }),
-					]);
-					await this.gitService.applyPatch(folder, hunk.patch, { cached: true, reverse: true });
+					const project = this.requireGitProject(target.file);
+					const headOid = await this.ensureGitHeadUnchanged(target.file, folder);
+					await this.gitReviewJournal.remove(project, headOid, target.hunk.id);
 				} else {
 					await this.ensureGitHeadUnchanged(target.file, folder);
 					if (target.hunk.operable === false) {
@@ -797,6 +854,20 @@ export class ReviewController implements vscode.Disposable {
 					}
 				}
 				await this.refreshGitReviewFile(target.file.uri);
+				if (target.list === 'rejected' && target.hunk.appliedAiSuggestion) {
+					const refreshed = this.resolveFile(target.file.uri.toString());
+					if (refreshed) {
+						const restored = this.findAppliedSuggestionHunk(refreshed, target.hunk.appliedAiSuggestion);
+						if (restored) {
+							refreshed.appliedAiSuggestions.push({
+								...target.hunk.appliedAiSuggestion,
+								currentHunkId: restored.id,
+								appliedHunk: { ...restored },
+							});
+						}
+					}
+				}
+				this.refreshUi();
 				await this.syncNativeReviewAfterMutation(target.file.uri, { line: target.hunk.displayStart, column: 0 });
 				return;
 			}
@@ -893,13 +964,25 @@ export class ReviewController implements vscode.Disposable {
 					return;
 				}
 				const folder = this.requireGitFolder(file);
-				const patch = this.gitService.combinePatches(hunks);
-				await Promise.all([
-					this.ensureGitHeadUnchanged(file, folder),
-					this.gitService.applyPatch(folder, patch, { cached: true, check: true }),
-				]);
-				await this.gitService.applyPatch(folder, patch, { cached: true });
-				await this.refreshGitReviewFile(file.uri);
+				const project = this.requireGitProject(file);
+				const headOid = await this.ensureGitHeadUnchanged(file, folder);
+				for (const hunk of hunks) {
+					const appliedAiSuggestion = file.appliedAiSuggestions.find((suggestion) => suggestion.currentHunkId === hunk.id);
+					const record = await this.gitReviewJournal.accept(
+						project,
+						headOid,
+						file.relativePath,
+						file.uri,
+						hunk,
+						file.gitSnapshot.indexBlobOid,
+						appliedAiSuggestion,
+					);
+					const accepted = this.gitReviewJournal.toAcceptedHunk(record, hunk);
+					file.acceptedHunks.push(accepted);
+				}
+				file.hunks = [];
+				this.touchFileRevision(file);
+				this.refreshUi();
 				await this.syncNativeReviewAfterMutation(file.uri);
 				return;
 			}
@@ -969,7 +1052,16 @@ export class ReviewController implements vscode.Disposable {
 				const afterHash = contentStateHash(rejectedText, file.gitSnapshot.indexExists);
 				const records = [];
 				for (const hunk of hunks) {
-					records.push(await this.gitReviewJournal.prepare(project, headOid, file.relativePath, file.uri, hunk, beforeHash, afterHash));
+					records.push(await this.gitReviewJournal.prepare(
+						project,
+						headOid,
+						file.relativePath,
+						file.uri,
+						hunk,
+						beforeHash,
+						afterHash,
+						file.appliedAiSuggestions.find((suggestion) => suggestion.currentHunkId === hunk.id),
+					));
 				}
 				const patch = this.gitService.combinePatches(hunks);
 				let applied = false;
@@ -1052,19 +1144,30 @@ export class ReviewController implements vscode.Disposable {
 				return;
 			}
 			if (file.gitSnapshot) {
-				const accepted = file.acceptedHunks.map((hunk) => this.requireGitHunk(hunk));
 				const rejected = file.rejectedHunks.filter((hunk) => hunk.operable !== false).map((hunk) => this.requireGitHunk(hunk));
-				if (accepted.length === 0 && rejected.length === 0) {
+				const acceptedSuggestions = file.acceptedHunks
+					.filter((hunk): hunk is ReviewedHunk & { appliedAiSuggestion: AppliedAiSuggestion } => Boolean(hunk.appliedAiSuggestion));
+				if (file.acceptedHunks.length === 0 && rejected.length === 0) {
 					return;
 				}
+				const aiReviewSession = acceptedSuggestions.length > 0 ? this.sessionForFile(file) : undefined;
+				const aiReviewToResign = aiReviewSession ? this.aiReviewStore.load(aiReviewSession) : undefined;
 				const folder = this.requireGitFolder(file);
-				const acceptedPatch = accepted.length > 0 ? this.gitService.combinePatches(accepted) : undefined;
 				const rejectedPatch = rejected.length > 0 ? this.gitService.combinePatches(rejected) : undefined;
+				const currentBeforeUndo = await this.readCurrentText(file.uri);
+				for (const hunk of acceptedSuggestions) {
+					const applied = hunk.appliedAiSuggestion;
+					if (!currentBeforeUndo.exists || !this.lineBlockAtCoordinateMatches(
+						currentBeforeUndo.text,
+						hunk.currentStart,
+						applied.appliedHunk.newLines,
+						applied.appliedHunk.newText,
+					)) {
+						throw new Error('An accepted AI suggestion no longer matches the current file. Refresh the review and try again.');
+					}
+				}
 				await Promise.all([
 					this.ensureGitHeadUnchanged(file, folder),
-					acceptedPatch
-						? this.gitService.applyPatch(folder, acceptedPatch, { cached: true, reverse: true, check: true })
-						: Promise.resolve(),
 					rejectedPatch
 						? this.gitService.applyPatch(folder, rejectedPatch, { check: true })
 						: Promise.resolve(),
@@ -1076,19 +1179,41 @@ export class ReviewController implements vscode.Disposable {
 						await this.gitReviewJournal.setState(rejectedProject, rejectedHeadOid, hunk.id, 'undoing');
 					}
 				}
-				let acceptedApplied = false;
 				try {
-					if (acceptedPatch) {
-						await this.gitService.applyPatch(folder, acceptedPatch, { cached: true, reverse: true });
-						acceptedApplied = true;
-					}
 					if (rejectedPatch) {
 						await this.withInternalWrite(file.uri, 'plugin', () => this.gitService.applyPatch(folder, rejectedPatch));
 						await this.synchronizeOpenDocumentAfterGitMutation(file.uri);
 					}
+					if (acceptedSuggestions.length > 0) {
+						const afterRejected = await this.readCurrentText(file.uri);
+						const rejectedEdits = file.rejectedHunks
+							.filter((candidate) => candidate.operable !== false)
+							.map((candidate) => ({
+								oldStart: candidate.currentStart,
+								oldLines: candidate.oldLines,
+								newLines: candidate.newLines,
+							}));
+						const restorations = acceptedSuggestions.map((hunk) => ({
+							start: mapLineAfterFileEdits(hunk.currentStart, rejectedEdits),
+							lines: hunk.appliedAiSuggestion.appliedHunk.newLines,
+							expected: hunk.appliedAiSuggestion.appliedHunk.newText,
+							replacement: hunk.appliedAiSuggestion.originalHunk.newText,
+						})).sort((left, right) => right.start - left.start);
+						for (const restoration of restorations) {
+							if (!this.lineBlockAtCoordinateMatches(afterRejected.text, restoration.start, restoration.lines, restoration.expected)) {
+								throw new Error('An accepted AI suggestion could not be safely restored after undoing rejected chunks.');
+							}
+						}
+						let restoredText = afterRejected.text;
+						for (const restoration of restorations) {
+							restoredText = replaceLineBlock(restoredText, restoration.start, restoration.lines, restoration.replacement);
+						}
+						await this.writeCurrentFileText(file.uri, restoredText);
+					}
 				} catch (error) {
-					if (acceptedPatch && acceptedApplied) {
-						await this.gitService.applyPatch(folder, acceptedPatch, { cached: true });
+					if (rejectedPatch) {
+						await this.gitService.applyPatch(folder, rejectedPatch, { reverse: true }).catch(() => undefined);
+						await this.synchronizeOpenDocumentAfterGitMutation(file.uri).catch(() => undefined);
 					}
 					if (rejectedProject && rejectedHeadOid !== undefined) {
 						for (const hunk of file.rejectedHunks.filter((candidate) => candidate.operable !== false)) {
@@ -1102,7 +1227,12 @@ export class ReviewController implements vscode.Disposable {
 						await this.gitReviewJournal.remove(rejectedProject, rejectedHeadOid, hunk.id);
 					}
 				}
+				const project = this.requireGitProject(file);
+				const headOid = project.headOid ?? await this.gitService.headOid(folder);
+				await this.gitReviewJournal.removeMany(project, headOid, file.acceptedHunks.map((hunk) => hunk.id));
 				await this.refreshGitReviewFile(file.uri);
+				const restoredFile = this.resolveFile(file.uri.toString());
+				await this.saveAiReviewWithCurrentSignature(aiReviewToResign, restoredFile ? this.sessionForFile(restoredFile) : aiReviewSession);
 				await this.syncNativeReviewAfterMutation(file.uri);
 				return;
 			}
@@ -1201,10 +1331,12 @@ export class ReviewController implements vscode.Disposable {
 		const folder = reviewProjectFolder(project);
 		await this.ensureGitHeadUnchanged(files[0], folder);
 		if (action === 'accept') {
-			const hunks = files.flatMap((file) => file.hunks.map((hunk) => this.requireGitHunk(hunk)));
-			const patch = this.gitService.combinePatches(hunks);
-			await this.gitService.applyPatch(folder, patch, { cached: true, check: true });
-			await this.gitService.applyPatch(folder, patch, { cached: true });
+			const headOid = project.headOid ?? await this.gitService.headOid(folder);
+			for (const file of files) {
+				for (const hunk of file.hunks.map((candidate) => this.requireGitHunk(candidate))) {
+					await this.gitReviewJournal.accept(project, headOid, file.relativePath, file.uri, hunk, file.gitSnapshot?.indexBlobOid);
+				}
+			}
 			return;
 		}
 		if (action === 'reject') {
@@ -1244,14 +1376,9 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 
-		const accepted = files.flatMap((file) => file.acceptedHunks.map((hunk) => this.requireGitHunk(hunk)));
 		const rejectedHunks = files.flatMap((file) => file.rejectedHunks.filter((hunk) => hunk.operable !== false));
 		const rejected = rejectedHunks.map((hunk) => this.requireGitHunk(hunk));
-		const acceptedPatch = accepted.length > 0 ? this.gitService.combinePatches(accepted) : undefined;
 		const rejectedPatch = rejected.length > 0 ? this.gitService.combinePatches(rejected) : undefined;
-		if (acceptedPatch) {
-			await this.gitService.applyPatch(folder, acceptedPatch, { cached: true, reverse: true, check: true });
-		}
 		if (rejectedPatch) {
 			await this.gitService.applyPatch(folder, rejectedPatch, { check: true });
 		}
@@ -1259,19 +1386,11 @@ export class ReviewController implements vscode.Disposable {
 		for (const hunk of rejectedHunks) {
 			await this.gitReviewJournal.setState(project, headOid, hunk.id, 'undoing');
 		}
-		let acceptedApplied = false;
 		try {
-			if (acceptedPatch) {
-				await this.gitService.applyPatch(folder, acceptedPatch, { cached: true, reverse: true });
-				acceptedApplied = true;
-			}
 			if (rejectedPatch) {
 				await this.withInternalWrites(files.map((file) => file.uri), () => this.gitService.applyPatch(folder, rejectedPatch));
 			}
 		} catch (error) {
-			if (acceptedPatch && acceptedApplied) {
-				await this.gitService.applyPatch(folder, acceptedPatch, { cached: true });
-			}
 			for (const hunk of rejectedHunks) {
 				await this.gitReviewJournal.setState(project, headOid, hunk.id, 'applied');
 			}
@@ -1280,6 +1399,7 @@ export class ReviewController implements vscode.Disposable {
 		for (const hunk of rejectedHunks) {
 			await this.gitReviewJournal.remove(project, headOid, hunk.id);
 		}
+		await this.gitReviewJournal.removeMany(project, headOid, files.flatMap((file) => file.acceptedHunks.map((hunk) => hunk.id)));
 	}
 
 	private bulkFileTargets(action: 'accept' | 'reject' | 'undo'): Array<{ file: ReviewFileState; chunkCount: number }> {
@@ -2135,9 +2255,9 @@ export class ReviewController implements vscode.Disposable {
 			if (!existingReview) {
 				await this.aiReviewStore.clear(session.rootUri);
 			}
-			this.startWikiRunLog({
+			const startEvent: AgentTraceEvent = {
 				kind: 'run_start',
-				title: 'AI review started',
+				title: existingReview ? 'AI review continued' : 'AI review started',
 				summary: `${files.length} file${files.length === 1 ? '' : 's'} with ${config.model}`,
 				status: 'running',
 				details: [this.wikiRunJsonDetail('Operation', {
@@ -2154,8 +2274,25 @@ export class ReviewController implements vscode.Disposable {
 					completedFiles: existingReview?.completedFiles.length ?? 0,
 					files: files.map((file) => ({ uri: file.uri.toString(), relativePath: file.relativePath, chunks: file.hunks.length })),
 				})],
-			}, 'review');
-			this.applyLlmWikiDashboardState({ status: 'reviewing', progress: 'Preparing AI review', error: undefined });
+			};
+			if (existingReview) {
+				this.wikiRunLogSource = 'review';
+				this.appendWikiRunLog(startEvent, {
+					source: 'review',
+					stage: existingReview.continuations?.[0]?.stage,
+					fileUri: existingReview.continuations?.[0]?.fileUri,
+				});
+			} else {
+				this.startWikiRunLog(startEvent, 'review');
+			}
+			const continuation = existingReview?.continuations?.[0];
+			this.applyLlmWikiDashboardState({
+				status: 'reviewing',
+				progress: continuation
+					? `Continuing ${continuation.stage}${continuation.fileUri ? ` (${continuation.fileUri})` : ''} at round ${continuation.checkpoint.nextRound}`
+					: existingReview ? 'Continuing AI review' : 'Preparing AI review',
+				error: undefined,
+			});
 			task.done = this.runAiReview(task, config, createLlmClient(config), session, language, strategy, fileConcurrency, maxRounds, includeWikiTools, existingReview);
 			await task.done;
 		} catch (error) {
@@ -2223,6 +2360,14 @@ export class ReviewController implements vscode.Disposable {
 						});
 					}
 				},
+				onCheckpoint: (review) => {
+					this.aiReviewCheckpointSaveQueue = this.aiReviewCheckpointSaveQueue.then(async () => {
+						if (this.currentWikiTask === task) {
+							await this.aiReviewStore.save(session, review);
+						}
+					});
+					return this.aiReviewCheckpointSaveQueue;
+				},
 			});
 			if (this.currentWikiTask === task) {
 				await this.aiReviewStore.save(session, result);
@@ -2240,7 +2385,11 @@ export class ReviewController implements vscode.Disposable {
 		} catch (error) {
 			if (!isAbortError(error)) {
 				if (error instanceof AiReviewPartialError) {
-					await this.aiReviewStore.save(session, error.review);
+					if (error.message.includes('AI review continuation is incompatible')) {
+						await this.aiReviewStore.clear(session.rootUri);
+					} else {
+						await this.aiReviewStore.save(session, error.review);
+					}
 					this.treeProvider.refresh();
 				}
 				this.showError(error);
@@ -2341,21 +2490,32 @@ export class ReviewController implements vscode.Disposable {
 
 			const replacementText = normalizeAiSuggestionReplacementText(suggestion.replacementText, hunk);
 			const currentText = replaceLineBlock(current.text, hunk.newStart, hunk.newLines, replacementText);
-			const updatedHunk = this.aiSuggestionHunk(hunk, currentText, replacementText);
 			await this.writeCurrentFileText(file.uri, currentText);
-			file.newText = currentText;
-			file.currentExists = true;
-			this.replacePendingHunkWithAppliedSuggestion(file, hunk, updatedHunk, {
-				suggestionId,
-				hunkId,
-				originalHunk: { ...hunk },
-				replacementText,
-				appliedHunk: { ...updatedHunk },
-				appliedAt: Date.now(),
-			});
-			this.touchFileRevision(file);
-			await this.saveAiReviewWithCurrentSignature(storedReview, reviewSession);
-			this.refreshReviewPresentation(file.uri);
+			await this.refreshGitReviewFile(file.uri);
+			const refreshedFile = this.resolveFile(uriString);
+			const appliedHunk = refreshedFile
+				? this.findRegeneratedSuggestionHunk(refreshedFile, hunk, replacementText)
+				: undefined;
+			if (!refreshedFile || !appliedHunk) {
+				await this.writeCurrentFileText(file.uri, current.text);
+				await this.refreshGitReviewFile(file.uri);
+				throw new Error('The AI suggestion could not be mapped to one unique Git chunk. The file was restored without applying it.');
+			}
+			refreshedFile.appliedAiSuggestions = [
+				...refreshedFile.appliedAiSuggestions.filter((item) => item.suggestionId !== suggestionId),
+				{
+					suggestionId,
+					sourceHunkId: hunkId,
+					currentHunkId: appliedHunk.id,
+					originalHunk: { ...hunk },
+					replacementText,
+					appliedHunk: { ...appliedHunk },
+					appliedAt: Date.now(),
+				},
+			];
+			this.touchFileRevision(refreshedFile);
+			await this.saveAiReviewWithCurrentSignature(storedReview, this.sessionForFile(refreshedFile));
+			this.refreshUi();
 			await this.refreshLlmWikiDashboardState();
 		} catch (error) {
 			this.showError(error);
@@ -2372,7 +2532,7 @@ export class ReviewController implements vscode.Disposable {
 				return;
 			}
 			const file = this.resolveFile(uriString);
-			const applied = file?.appliedAiSuggestions.find((item) => item.suggestionId === suggestionId && item.hunkId === hunkId);
+			const applied = file?.appliedAiSuggestions.find((item) => item.suggestionId === suggestionId && item.currentHunkId === hunkId);
 			const hunk = file?.hunks.find((item) => item.id === hunkId);
 			if (!file || !applied || !hunk) {
 				vscode.window.showInformationMessage('No applied AI suggestion selected.');
@@ -2383,25 +2543,10 @@ export class ReviewController implements vscode.Disposable {
 			}
 			const reviewSession = this.sessionForFile(file);
 			const storedReview = this.aiReviewStore.load(reviewSession);
-			const current = await this.readCurrentText(file.uri);
-			if (!current.exists || !this.lineBlockMatches(current.text, hunk.newStart, hunk.newLines, hunk.newText)) {
-				await this.refreshFile(file.uri, { reconcileExternalChanges: false });
-				return;
-			}
-
-			const restoredText = replaceLineBlock(current.text, hunk.newStart, hunk.newLines, applied.originalHunk.newText);
-			const restoredHunk = this.aiSuggestionHunk({
-				...applied.originalHunk,
-				newStart: hunk.newStart,
-				zoneAfterLineNumber: hunk.zoneAfterLineNumber,
-			}, restoredText, applied.originalHunk.newText);
-			await this.writeCurrentFileText(file.uri, restoredText);
-			file.newText = restoredText;
-			file.currentExists = true;
-			this.replacePendingHunkWithAppliedSuggestion(file, hunk, restoredHunk, undefined);
-			file.appliedAiSuggestions = file.appliedAiSuggestions.filter((item) => item.suggestionId !== suggestionId);
-			this.touchFileRevision(file);
-			await this.saveAiReviewWithCurrentSignature(storedReview, reviewSession);
+			await this.restoreAppliedSuggestionText(file, applied);
+			await this.refreshGitReviewFile(file.uri);
+			const restoredFile = this.resolveFile(uriString);
+			await this.saveAiReviewWithCurrentSignature(storedReview, restoredFile ? this.sessionForFile(restoredFile) : reviewSession);
 			this.refreshReviewPresentation(file.uri);
 			await this.refreshLlmWikiDashboardState();
 		} catch (error) {
@@ -2608,7 +2753,14 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private async refreshGitSessionFiles(request: GitSessionRefreshRequest): Promise<void> {
-		void request;
+		if (request.source === 'manual') {
+			await this.requestGitSessionRefresh();
+			await this.flushReviewedChangesToIndex();
+		}
+		await this.requestGitSessionRefresh();
+	}
+
+	private async requestGitSessionRefresh(): Promise<void> {
 		this.gitRefreshRequested = true;
 		while (this.gitRefreshRequested || this.gitRefreshInFlight) {
 			if (!this.gitRefreshInFlight) {
@@ -2622,6 +2774,53 @@ export class ReviewController implements vscode.Disposable {
 					this.gitRefreshInFlight = undefined;
 				}
 			}
+		}
+	}
+
+	private async flushReviewedChangesToIndex(): Promise<void> {
+		const session = this.activeSession;
+		if (!session || session.mode !== 'git') {
+			return;
+		}
+		const failures: string[] = [];
+		for (const project of session.projects ?? []) {
+			const files = [...session.files.values()].filter((file) => file.projectId === project.id
+				&& (file.acceptedHunks.length > 0 || file.rejectedHunks.length > 0));
+			if (files.length === 0) {
+				continue;
+			}
+			if (files.some((file) => this.isOpenDocumentDirty(file.uri))) {
+				failures.push(`${project.name}: save or revert reviewed files before Refresh.`);
+				continue;
+			}
+			const folder = reviewProjectFolder(project);
+			try {
+				const headOid = await this.gitService.headOid(folder);
+				if (project.headOid !== undefined && project.headOid !== headOid) {
+					throw new Error('Git history changed; the review session must be rebuilt.');
+				}
+				const accepted = files.flatMap((file) => file.acceptedHunks
+					.filter((hunk) => hunk.operable !== false)
+					.map((hunk) => this.requireGitHunk(hunk)));
+				const acceptedIds = files.flatMap((file) => file.acceptedHunks.map((hunk) => hunk.id));
+				if (accepted.length > 0) {
+					const patch = this.gitService.combinePatches(accepted);
+					await this.gitService.applyPatch(folder, patch, { cached: true, check: true });
+					await this.gitReviewJournal.setAcceptState(project, headOid, acceptedIds, 'flushing');
+					try {
+						await this.gitService.applyPatch(folder, patch, { cached: true });
+					} catch (error) {
+						await this.gitReviewJournal.setAcceptState(project, headOid, acceptedIds, 'reviewed');
+						throw error;
+					}
+				}
+				await this.gitReviewJournal.clear(project, headOid);
+			} catch (error) {
+				failures.push(`${project.name}: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+		if (failures.length > 0) {
+			void vscode.window.showWarningMessage(`Some reviewed changes could not be staged:\n${failures.join('\n')}`);
 		}
 	}
 
@@ -2663,6 +2862,9 @@ export class ReviewController implements vscode.Disposable {
 		await this.attachRejectedJournals(nextFiles, projects);
 		for (const [key, file] of nextFiles) {
 			const previous = previousFiles.get(key);
+			if (previous) {
+				this.restoreAcceptedAiSuggestions(file, previous);
+			}
 			if (previous && gitReviewFileStateFingerprint(previous) !== gitReviewFileStateFingerprint(file)) {
 				file.revision = previous.revision + 1;
 			}
@@ -2709,6 +2911,7 @@ export class ReviewController implements vscode.Disposable {
 				file.appliedAiSuggestions = previous.appliedAiSuggestions.filter((suggestion) => (
 					file.hunks.some((hunk) => hunk.fingerprint === suggestion.appliedHunk.fingerprint)
 				));
+				this.restoreAcceptedAiSuggestions(file, previous);
 				if (gitReviewFileStateFingerprint(previous) !== gitReviewFileStateFingerprint(file)) {
 					file.revision += 1;
 				}
@@ -2716,6 +2919,13 @@ export class ReviewController implements vscode.Disposable {
 			session.files.set(key, file);
 		}
 		this.refreshUi();
+	}
+
+	private restoreAcceptedAiSuggestions(file: ReviewFileState, previous: ReviewFileState): void {
+		for (const accepted of file.acceptedHunks) {
+			accepted.appliedAiSuggestion = previous.acceptedHunks.find((candidate) => candidate.fingerprint === accepted.fingerprint)?.appliedAiSuggestion
+				?? previous.appliedAiSuggestions.find((suggestion) => suggestion.appliedHunk.fingerprint === accepted.fingerprint);
+		}
 	}
 
 	private async refreshFile(uri: vscode.Uri, options: { reconcileExternalChanges?: boolean; preferDisk?: boolean } = {}): Promise<void> {
@@ -2756,7 +2966,7 @@ export class ReviewController implements vscode.Disposable {
 		file.hunks = diff.hunks;
 		this.normalizeReviewedDuplicateHunks(file);
 		file.appliedAiSuggestions = file.appliedAiSuggestions.filter((suggestion) => file.hunks.some((hunk) => (
-			hunk.id === suggestion.hunkId
+			hunk.id === suggestion.currentHunkId
 			&& hunk.newText === suggestion.appliedHunk.newText
 		)));
 		file.skippedReason = diff.skippedReason;
@@ -3053,65 +3263,53 @@ export class ReviewController implements vscode.Disposable {
 		file.revision += 1;
 	}
 
-	private aiSuggestionHunk(base: ReviewHunk, fileText: string, replacementText: string): ReviewHunk {
-		const newLines = splitLines(replacementText).length;
-		const kind = base.oldLines === 0 ? 'add' : newLines === 0 ? 'delete' : 'modify';
-		const newContext = captureLineBlockContext(fileText, base.newStart, newLines);
-		return {
-			...base,
-			kind,
-			newLines,
-			newText: replacementText,
-			newContextBefore: newContext.before,
-			newContextAfter: newContext.after,
-			zoneAfterLineNumber: base.newStart,
-		};
-	}
-
-	private replacePendingHunkWithAppliedSuggestion(
+	private findRegeneratedSuggestionHunk(
 		file: ReviewFileState,
-		previousHunk: ReviewHunk,
-		nextHunk: ReviewHunk,
-		applied: AppliedAiSuggestion | undefined,
-	): void {
-		const delta = nextHunk.newLines - previousHunk.newLines;
-		file.hunks = file.hunks.map((hunk) => {
-			if (hunk.id === previousHunk.id) {
-				return nextHunk;
-			}
-			return hunk.newStart > previousHunk.newStart ? this.shiftPendingHunkNewSide(file, hunk, delta) : hunk;
-		});
-		file.appliedAiSuggestions = file.appliedAiSuggestions.map((item) => {
-			if (item.hunkId === previousHunk.id) {
-				return item;
-			}
-			if (item.appliedHunk.newStart <= previousHunk.newStart) {
-				return item;
-			}
-			const appliedHunk = this.shiftPendingHunkNewSide(file, item.appliedHunk, delta);
-			return { ...item, appliedHunk };
-		});
-		if (applied) {
-			file.appliedAiSuggestions = [
-				...file.appliedAiSuggestions.filter((item) => item.hunkId !== applied.hunkId),
-				applied,
-			];
+		originalHunk: ReviewHunk,
+		replacementText: string,
+	): ReviewHunk | undefined {
+		const candidates = file.hunks.filter((candidate) => (
+			candidate.oldText === originalHunk.oldText
+			&& candidate.oldLines === originalHunk.oldLines
+			&& candidate.newText === replacementText
+		));
+		if (candidates.length === 1) {
+			return candidates[0];
 		}
+		const sameCoordinate = candidates.filter((candidate) => candidate.oldStart === originalHunk.oldStart);
+		return sameCoordinate.length === 1 ? sameCoordinate[0] : undefined;
 	}
 
-	private shiftPendingHunkNewSide(file: ReviewFileState, hunk: ReviewHunk, delta: number): ReviewHunk {
-		if (delta === 0) {
-			return hunk;
+	private findAppliedSuggestionHunk(file: ReviewFileState, applied: AppliedAiSuggestion): ReviewHunk | undefined {
+		return this.findRegeneratedSuggestionHunk(file, applied.originalHunk, applied.replacementText);
+	}
+
+	private async restoreAppliedSuggestionText(file: ReviewFileState, applied: AppliedAiSuggestion): Promise<void> {
+		const current = await this.readCurrentText(file.uri);
+		const candidates = [
+			...file.hunks,
+			...file.acceptedHunks,
+			...file.rejectedHunks,
+		].filter((hunk) => hunk.newText === applied.appliedHunk.newText);
+		const coordinate = candidates.find((hunk) => (
+			hunk.id === applied.currentHunkId
+			|| hunk.fingerprint === applied.appliedHunk.fingerprint
+		))?.newStart ?? applied.appliedHunk.newStart;
+		if (!current.exists || !this.lineBlockAtCoordinateMatches(
+			current.text,
+			coordinate,
+			applied.appliedHunk.newLines,
+			applied.appliedHunk.newText,
+		)) {
+			throw new Error('The accepted AI suggestion no longer matches the current file. Refresh the review and try again.');
 		}
-		const newStart = Math.max(0, hunk.newStart + delta);
-		const newContext = captureLineBlockContext(file.newText, newStart, hunk.newLines);
-		return {
-			...hunk,
-			newStart,
-			zoneAfterLineNumber: newStart,
-			newContextBefore: newContext.before,
-			newContextAfter: newContext.after,
-		};
+		const restoredText = replaceLineBlock(
+			current.text,
+			coordinate,
+			applied.appliedHunk.newLines,
+			applied.originalHunk.newText,
+		);
+		await this.writeCurrentFileText(file.uri, restoredText);
 	}
 
 	private async saveAiReviewWithCurrentSignature(review: StoredAiReview | undefined, session = this.visibleReviewSession()): Promise<void> {
@@ -3461,7 +3659,7 @@ export class ReviewController implements vscode.Disposable {
 
 	private removePendingHunk(file: ReviewFileState, hunk: ReviewHunk): void {
 		file.hunks = file.hunks.filter((item) => !this.isSameReviewHunk(item, hunk));
-		file.appliedAiSuggestions = file.appliedAiSuggestions.filter((item) => item.hunkId !== hunk.id);
+		file.appliedAiSuggestions = file.appliedAiSuggestions.filter((item) => item.currentHunkId !== hunk.id);
 	}
 
 	private normalizeReviewedDuplicateHunks(file: ReviewFileState): void {
@@ -3477,7 +3675,7 @@ export class ReviewController implements vscode.Disposable {
 		file.hunks = [];
 		this.normalizeReviewedDuplicateHunks(file);
 		file.appliedAiSuggestions = file.appliedAiSuggestions.filter((suggestion) => file.hunks.some((hunk) => (
-			hunk.id === suggestion.hunkId
+			hunk.id === suggestion.currentHunkId
 			&& hunk.newText === suggestion.appliedHunk.newText
 		)));
 		file.skippedReason = undefined;
@@ -3512,7 +3710,7 @@ export class ReviewController implements vscode.Disposable {
 		const baselineContext = captureLineBlockContext(file.oldText, baselineStart, baselineLines);
 		const currentContext = captureLineBlockContext(file.newText, currentStart, currentLines);
 		const appliedAiSuggestion = reviewSource === 'accept'
-			? file.appliedAiSuggestions.find((item) => item.hunkId === hunk.id && item.appliedHunk.newText === hunk.newText)
+			? file.appliedAiSuggestions.find((item) => item.currentHunkId === hunk.id && item.appliedHunk.newText === hunk.newText)
 			: undefined;
 		return {
 			...hunk,

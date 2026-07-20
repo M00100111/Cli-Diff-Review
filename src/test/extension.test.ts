@@ -5,7 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { AiReviewPartialError, AiReviewStore, CodeReviewAgentService, reviewChangeSignature, sortFindings, StoredAiReview, validateReviewFindings, validateReviewFindingsWithDiagnostics, validateReviewSuggestionsWithDiagnostics } from '../agent/codeReview';
-import { AgentRunner, type AgentTraceEvent, validateAgentResponse } from '../agent/runtime';
+import { AgentRunner, type AgentRunCheckpoint, type AgentTraceEvent, validateAgentResponse } from '../agent/runtime';
 import { createReadOnlyAgentTools, createWikiAgentTools } from '../agent/tools';
 import { acceptHunkInBaseline, computeLineDiff } from '../diffEngine';
 import { GitService, parseCatFileBatch } from '../gitService';
@@ -204,8 +204,7 @@ suite('Review webview compatibility', () => {
 		assert.ok(source.includes("Buffer.from(uri.toString(), 'utf8').toString('base64url')"));
 		assert.ok(source.includes("Buffer.from(encoded, 'base64url').toString('utf8')"));
 		assert.ok(source.includes('uri: file.uri.toString()'));
-		assert.ok(source.includes('document.uri.scheme === ReviewWebviewManager.deletedDocumentScheme ? file.newText : document.getText()'));
-		assert.ok(source.includes('readOnly: document.uri.scheme === ReviewWebviewManager.deletedDocumentScheme'));
+		assert.ok(source.includes('const usesReviewStateText = document.uri.scheme === ReviewWebviewManager.deletedDocumentScheme || !file.currentExists;'));
 		assert.ok(source.includes('if (host.document.uri.scheme === ReviewWebviewManager.deletedDocumentScheme)'));
 		assert.match(source, /host\.document\.uri\.scheme === ReviewWebviewManager\.deletedDocumentScheme[\s\S]*?await this\.postState\(host\);[\s\S]*?return;/);
 		assert.ok(source.includes('editor.updateOptions({ readOnly: Boolean(state.readOnly) });'));
@@ -235,6 +234,33 @@ suite('Review webview compatibility', () => {
 		const createEditorIndex = source.indexOf('createEditor();');
 		const readyIndex = source.indexOf('ready = true;', createEditorIndex);
 		assert.ok(createEditorIndex >= 0 && readyIndex > createEditorIndex);
+	});
+
+	test('drops stale open-document text when a rejected added file no longer exists', () => {
+		const uri = vscode.Uri.file('/repo/package.json');
+		const file = reviewFileState(uri, 'package.json', {
+			oldText: '',
+			newText: '',
+			currentExists: false,
+		});
+		const staleOpenDocument = {
+			uri,
+			isDirty: false,
+			getText: () => '{\n  "stale": true\n}\n',
+		} as vscode.TextDocument;
+		const manager = Object.create(ReviewWebviewManager.prototype) as {
+			serialize(file: ReviewFileState, document: vscode.TextDocument): {
+				newText: string;
+				dirty: boolean;
+				readOnly: boolean;
+			};
+		};
+
+		const payload = manager.serialize(file, staleOpenDocument);
+
+		assert.strictEqual(payload.newText, '');
+		assert.strictEqual(payload.dirty, false);
+		assert.strictEqual(payload.readOnly, true);
 	});
 
 	test('closes Review editors without pending hunks after manual refresh', () => {
@@ -479,9 +505,10 @@ suite('Review controller bulk actions', () => {
 		assert.ok(source.includes('appliedSuggestion.originalHunk.newText'));
 		assert.ok(source.includes('appliedAiSuggestion'));
 		assert.ok(source.includes('aiReviewToResign = appliedSuggestion ? this.aiReviewStore.load(aiReviewSession) : undefined;'));
-		assert.ok(source.includes('await this.saveAiReviewWithCurrentSignature(aiReviewToResign, aiReviewSession);'));
-		assert.ok(source.includes('await this.saveAiReviewWithCurrentSignature(storedReview, reviewSession);'));
-		assert.ok(source.includes('this.replacePendingHunkWithAppliedSuggestion'));
+		assert.ok(source.includes('await this.saveAiReviewWithCurrentSignature(aiReviewToResign'));
+		assert.ok(source.includes('await this.saveAiReviewWithCurrentSignature(storedReview'));
+		assert.ok(source.includes('this.findRegeneratedSuggestionHunk'));
+		assert.ok(source.includes('await this.refreshGitReviewFile(file.uri)'));
 	});
 
 	test('wires review editor mode through native editor and review page presenters', () => {
@@ -509,7 +536,7 @@ suite('Review controller bulk actions', () => {
 		assert.ok(nativeSource.includes("'vscode.diff'"));
 		assert.ok(nativeSource.includes("this.reviewDocumentUri(file, 'before')"));
 		assert.ok(nativeSource.includes("this.reviewDocumentUri(file, 'after')"));
-		assert.ok(nativeSource.includes("return payload.side === 'after' ? file.newText : file.oldText;"));
+		assert.ok(nativeSource.includes("return payload.side === 'after' ? file.newText : this.beforeText(file);"));
 		assert.ok(nativeSource.includes('public async syncOpen(uri: vscode.Uri, reveal?: NativeReviewRevealPosition): Promise<boolean>'));
 		assert.ok(nativeSource.includes('private readonly openFileKeys = new Set<string>();'));
 		assert.ok(nativeSource.includes('vscode.window.tabGroups.onDidChangeTabs'));
@@ -529,6 +556,9 @@ suite('Review controller bulk actions', () => {
 		assert.ok(nativeSource.includes('private isUriLike(value: unknown): value is vscode.Uri'));
 		assert.ok(nativeSource.includes("get<boolean>('nativeDiffInline', true)"));
 		assert.ok(nativeSource.includes("diffConfig.update('renderSideBySide', false, vscode.ConfigurationTarget.Workspace)"));
+		assert.strictEqual(nativeSource.includes('registerCodeLensProvider'), false);
+		assert.strictEqual(nativeSource.includes('provideReviewCodeLenses'), false);
+		assert.strictEqual(nativeSource.includes("diffConfig.update('codeLens'"), false);
 		assert.ok(nativeSource.includes("vscode.commands.executeCommand('revealLine'"));
 		assert.ok(nativeSource.includes('input instanceof vscode.TabInputTextDiff'));
 		assert.ok(nativeSource.includes('closeCompleted(): vscode.Uri[]'));
@@ -563,27 +593,43 @@ suite('Review controller bulk actions', () => {
 		assert.strictEqual(manager.reviewDocumentPayload(after)?.side, 'after');
 	});
 
-	test('provides working Accept, Reject, and Undo CodeLens actions in the native diff editor', () => {
+	test('hides accepted chunks from the native diff without adding review CodeLens actions', () => {
 		const uri = vscode.Uri.file('/repo/src/app.ts');
-		const pending = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
-		const file = reviewFileState(uri, 'src/app.ts', { hunks: [pending], revision: 7 });
+		const oldText = 'old\nkeep\n';
+		const newText = 'new\nkeep\npending\n';
+		const [accepted, pending] = computeLineDiff(uri.toString(), oldText, newText);
+		const file = reviewFileState(uri, 'src/app.ts', {
+			oldText,
+			newText,
+			hunks: [pending],
+			acceptedHunks: [reviewedHunkFrom(accepted, 'accept')],
+			revision: 7,
+		});
 		const session: ReviewSession = {
-			id: 'native-actions', mode: 'git', rootUri: vscode.Uri.file('/repo'), createdAt: 1,
+			id: 'native-accepted-baseline', mode: 'git', rootUri: vscode.Uri.file('/repo'), createdAt: 1,
 			files: new Map([[uri.toString(), file]]),
 		};
 		const manager = Object.create(NativeReviewEditorManager.prototype) as any;
 		manager.getSession = () => session;
+		const before = manager.reviewDocumentUriForFileUri(uri, 'before');
 		const after = manager.reviewDocumentUriForFileUri(uri, 'after');
-		let lenses = manager.provideReviewCodeLenses({ uri: after, lineCount: 1 } as vscode.TextDocument) as vscode.CodeLens[];
-		assert.deepStrictEqual(lenses.map((lens) => lens.command?.command), ['cli-diff.acceptChange', 'cli-diff.rejectChange']);
-		assert.deepStrictEqual(lenses[0].command?.arguments, [uri.toString(), pending.id, 7]);
 
-		file.hunks = [];
-		file.acceptedHunks = [reviewedHunkFrom(pending, 'accept')];
-		lenses = manager.provideReviewCodeLenses({ uri: after, lineCount: 1 } as vscode.TextDocument) as vscode.CodeLens[];
-		assert.strictEqual(lenses.length, 1);
-		assert.strictEqual(lenses[0].command?.command, 'cli-diff.restoreChange');
-		assert.deepStrictEqual(lenses[0].command?.arguments, [uri.toString(), file.acceptedHunks[0].id, 7]);
+		assert.strictEqual(manager.provideReviewDocumentContent(before), 'new\nkeep\n');
+		assert.strictEqual(manager.provideReviewDocumentContent(after), newText);
+
+		for (const [caseName, baseline, working] of [
+			['add', '', 'added\n'],
+			['delete', 'deleted\n', ''],
+			['modify', 'before\n', 'after\n'],
+		] as const) {
+			const acceptedHunk = computeLineDiff(`${uri.toString()}#${caseName}`, baseline, working)[0];
+			const acceptedFile = reviewFileState(uri, `src/${caseName}.ts`, {
+				oldText: baseline,
+				newText: working,
+				acceptedHunks: [reviewedHunkFrom(acceptedHunk, 'accept')],
+			});
+			assert.strictEqual(manager.beforeText(acceptedFile), working, `${caseName} should disappear from native diff after accept`);
+		}
 	});
 });
 
@@ -929,13 +975,14 @@ suite('Review state', () => {
 		});
 		const mappedFindingFile = findingPayload.files.find((file) => file.relativePath === 'src/pending.ts');
 		const mappedFindingChunk = mappedFindingFile?.chunks.find((chunk) => chunk.hunkId === pendingHunk.id);
-		assert.strictEqual(mappedFindingFile?.description, '1 pending, 1 finding');
+		assert.strictEqual(mappedFindingFile?.description, '1 Pending, 1 finding');
 		assert.strictEqual(mappedFindingChunk?.findings[0].title, 'Mapped finding');
 		session.files.set(pendingUri.toString(), reviewFileState(pendingUri, 'src/pending.ts', {
 			hunks: [pendingHunk],
 			appliedAiSuggestions: [{
 				suggestionId: 'suggestion-1',
-				hunkId: pendingHunk.id,
+				sourceHunkId: pendingHunk.id,
+				currentHunkId: pendingHunk.id,
 				originalHunk: pendingHunk,
 				replacementText: 'suggested\n',
 				appliedHunk: { ...pendingHunk, newText: 'suggested\n' },
@@ -968,7 +1015,7 @@ suite('Review state', () => {
 			}],
 		});
 		const suggestionFile = suggestionPayload.files.find((file) => file.relativePath === 'src/pending.ts');
-		assert.strictEqual(suggestionFile?.description, '1 pending, 1 suggestion');
+		assert.strictEqual(suggestionFile?.description, '1 Pending, 1 suggestion');
 		assert.strictEqual(suggestionFile?.chunks[0].suggestions[0].replacementText, 'suggested\n');
 		assert.strictEqual(suggestionFile?.chunks[0].appliedSuggestion?.suggestionId, 'suggestion-1');
 		assert.strictEqual(suggestionFile?.aiReviewResult?.summary, 'Model returned 0 findings. Accepted 1 of 1 suggestions.');
@@ -985,7 +1032,7 @@ suite('Review state', () => {
 		});
 		assert.strictEqual(
 			pluralReviewPayload.files.find((file) => file.relativePath === 'src/pending.ts')?.description,
-			'1 pending, 2 findings, 2 suggestions',
+			'1 Pending, 2 findings, 2 suggestions',
 		);
 		const skippedReviewPayload = buildReviewDashboardPayload(session, pendingUri, () => false, {
 			...defaultLlmWikiDashboardState(),
@@ -1000,7 +1047,8 @@ suite('Review state', () => {
 				id: `accept-1-${reviewedHunk.id}`,
 				appliedAiSuggestion: {
 					suggestionId: 'suggestion-reviewed',
-					hunkId: reviewedHunk.id,
+					sourceHunkId: reviewedHunk.id,
+					currentHunkId: reviewedHunk.id,
 					originalHunk: reviewedHunk,
 					replacementText: 'better reviewed\n',
 					appliedHunk: { ...reviewedHunk, newText: 'better reviewed\n' },
@@ -1054,7 +1102,7 @@ suite('Review state', () => {
 		const otherFileChunk = reviewedFindingPayload.files
 			.find((file) => file.relativePath === 'src/pending.ts')
 			?.chunks.find((chunk) => chunk.hunkId === pendingHunk.id);
-		assert.strictEqual(reviewedFindingFile?.description, '1 reviewed, 1 finding, 1 suggestion');
+		assert.strictEqual(reviewedFindingFile?.description, '1 Accepted, 1 finding, 1 suggestion');
 		assert.strictEqual(reviewedFindingFile?.chunks.length, 1);
 		assert.notStrictEqual(reviewedFindingChunk?.hunkId, reviewedHunk.id);
 		assert.strictEqual(reviewedFindingChunk?.reviewStatus, 'reviewed');
@@ -1111,6 +1159,56 @@ suite('Review state', () => {
 		}]);
 	});
 
+	test('classifies dashboard files from chunk change kinds instead of review decisions', () => {
+		const addedUri = vscode.Uri.file('D:/repo/src/added.ts');
+		const deletedUri = vscode.Uri.file('D:/repo/src/deleted.ts');
+		const modifiedUri = vscode.Uri.file('D:/repo/src/modified.ts');
+		const mixedUri = vscode.Uri.file('D:/repo/src/mixed.ts');
+		const acceptedAddUri = vscode.Uri.file('D:/repo/src/accepted-add.ts');
+		const addHunk = computeLineDiff(addedUri.toString(), '', 'added\n')[0];
+		const deleteHunk = computeLineDiff(deletedUri.toString(), 'deleted\n', '')[0];
+		const modifyHunk = computeLineDiff(modifiedUri.toString(), 'before\n', 'after\n')[0];
+		const session: ReviewSession = {
+			id: 'dashboard-change-kinds',
+			mode: 'git',
+			rootUri: vscode.Uri.file('D:/repo'),
+			createdAt: 1,
+			files: new Map([
+				[addedUri.toString(), reviewFileState(addedUri, 'src/added.ts', { hunks: [addHunk] })],
+				[deletedUri.toString(), reviewFileState(deletedUri, 'src/deleted.ts', { hunks: [deleteHunk] })],
+				[modifiedUri.toString(), reviewFileState(modifiedUri, 'src/modified.ts', { hunks: [modifyHunk] })],
+				[mixedUri.toString(), reviewFileState(mixedUri, 'src/mixed.ts', { hunks: [addHunk, deleteHunk] })],
+				[acceptedAddUri.toString(), reviewFileState(acceptedAddUri, 'src/accepted-add.ts', {
+					acceptedHunks: [reviewedHunkFrom(addHunk, 'accept')],
+				})],
+			]),
+		};
+
+		const files = new Map(buildReviewDashboardPayload(session, undefined, () => false)
+			.files.map((file) => [file.relativePath, file]));
+		assert.deepStrictEqual(
+			[files.get('src/added.ts')?.statusLabel, files.get('src/added.ts')?.statusKind],
+			['U', 'untracked'],
+		);
+		assert.deepStrictEqual(
+			[files.get('src/deleted.ts')?.statusLabel, files.get('src/deleted.ts')?.statusKind],
+			['D', 'deleted'],
+		);
+		assert.deepStrictEqual(
+			[files.get('src/modified.ts')?.statusLabel, files.get('src/modified.ts')?.statusKind],
+			['M', 'modified'],
+		);
+		assert.deepStrictEqual(
+			[files.get('src/mixed.ts')?.statusLabel, files.get('src/mixed.ts')?.statusKind],
+			['M', 'modified'],
+		);
+		assert.deepStrictEqual(
+			[files.get('src/accepted-add.ts')?.statusLabel, files.get('src/accepted-add.ts')?.statusKind],
+			['U', 'untracked'],
+		);
+		assert.strictEqual(files.get('src/accepted-add.ts')?.description, '1 Accepted');
+	});
+
 	test('deduplicates dashboard chunks when reviewed hunks reappear as pending', () => {
 		const uri = vscode.Uri.file('D:/repo/src/duplicate.ts');
 		const rejectedUri = vscode.Uri.file('D:/repo/src/rejected-duplicate.ts');
@@ -1140,7 +1238,7 @@ suite('Review state', () => {
 
 		assert.strictEqual(acceptedFile?.pendingCount, 1);
 		assert.strictEqual(acceptedFile?.reviewedCount, 1);
-		assert.strictEqual(acceptedFile?.description, '1 pending, 1 reviewed');
+		assert.strictEqual(acceptedFile?.description, '1 Pending, 1 Accepted');
 		assert.deepStrictEqual(acceptedFile?.chunks.map((chunk) => chunk.reviewStatus), ['reviewed', 'pending']);
 		assert.strictEqual(acceptedFile?.chunks.some((chunk) => chunk.hunkId === duplicateHunk.id), false);
 		assert.strictEqual(acceptedFile?.chunks.some((chunk) => chunk.hunkId === pendingHunk.id), true);
@@ -1222,8 +1320,9 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('restoreScrollTop(reviewFileDetail, detailScrollTop)'));
 		assert.ok(view.webview.html.includes('function aiReviewActionLabel'));
 		assert.ok(view.webview.html.includes("return 'Generate AI review'"));
-		assert.ok(view.webview.html.includes("'Retry AI review'"));
+		assert.ok(!view.webview.html.includes("'Retry AI review'"));
 		assert.ok(view.webview.html.includes("'Continue AI review'"));
+		assert.ok(view.webview.html.includes("action.title = 'Undo AI suggestion'"));
 		assert.ok(view.webview.html.includes("return 'Regenerate AI review'"));
 		assert.ok(view.webview.html.includes("wiki.aiReviewStatus === 'partial'"));
 		assert.ok(view.webview.html.includes("typeof item.round === 'number'"));
@@ -1237,6 +1336,9 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('review-chunk'));
 		assert.ok(view.webview.html.includes('review-chunk-action'));
 		assert.ok(view.webview.html.includes('function chunkActionButton'));
+		assert.strictEqual(view.webview.html.includes('review-action-pending'), false);
+		assert.strictEqual(view.webview.html.includes('review-action-spin'), false);
+		assert.strictEqual(view.webview.html.includes("button.innerHTML = icons.pending"), false);
 		assert.ok(view.webview.html.includes('acceptAllButton.addEventListener'));
 		assert.ok(view.webview.html.includes('rejectAllButton.addEventListener'));
 		assert.ok(view.webview.html.includes('undoAllButton.addEventListener'));
@@ -2416,6 +2518,63 @@ suite('Agent runtime', () => {
 		assert.strictEqual(unlimitedResult.result.summary, 'done');
 	});
 
+	test('does not cap tool calls and resumes from the last complete Agent round', async () => {
+		const tool = {
+			name: 'echo',
+			description: 'Echo.',
+			parameters: { type: 'object', properties: { value: { type: 'number' } }, required: ['value'], additionalProperties: false },
+			execute: async (args: Record<string, unknown>) => args,
+		};
+		const calls = Array.from({ length: 41 }, (_, index) => ({ id: `call-${index}`, name: 'echo', arguments: { value: index } }));
+		const responses = [
+			JSON.stringify({ type: 'tool_calls', calls }),
+			'network unavailable',
+		];
+		let checkpoint: AgentRunCheckpoint | undefined;
+		await assert.rejects(() => new AgentRunner().run({
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: {
+				completeJson: async () => {
+					const response = responses.shift();
+					if (response === 'network unavailable') {
+						throw new Error(response);
+					}
+					return response ?? '';
+				},
+			},
+			systemPrompt: 'test checkpoint',
+			userPrompt: 'test',
+			tools: [tool],
+			maxRounds: 'unlimited',
+			onCheckpoint: (value) => {
+				checkpoint = value;
+			},
+		}), /network unavailable/);
+		assert.ok(checkpoint);
+		assert.strictEqual(checkpoint.nextRound, 2);
+		assert.strictEqual(checkpoint.toolCalls, 41);
+
+		const resumedRequests: unknown[] = [];
+		const resumed = await new AgentRunner().run({
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: {
+				completeJson: async (request) => {
+					resumedRequests.push(request);
+					return '{"type":"final","result":{"summary":"continued"}}';
+				},
+			},
+			systemPrompt: 'test checkpoint',
+			userPrompt: 'test',
+			tools: [tool],
+			maxRounds: 'unlimited',
+			resumeFrom: checkpoint,
+		});
+		assert.strictEqual(resumed.rounds, 2);
+		assert.strictEqual(resumed.toolCalls, 41);
+		assert.strictEqual(resumed.result.summary, 'continued');
+		assert.ok(JSON.stringify(resumedRequests[0]).includes('tool_results'));
+	});
+
 	test('reads deleted review files from the review session snapshot', async () => {
 		const uri = vscode.Uri.file('/repo/src/deleted.ts');
 		const hunk = computeLineDiff(uri.toString(), 'export const removed = true;\n', '')[0];
@@ -3167,7 +3326,8 @@ suite('AI review findings', () => {
 		const appliedHunk = { ...originalHunk, newText: 'suggested\n' };
 		const appliedSuggestion = {
 			suggestionId: 'suggestion-1',
-			hunkId: originalHunk.id,
+			sourceHunkId: originalHunk.id,
+			currentHunkId: originalHunk.id,
 			originalHunk,
 			replacementText: 'suggested\n',
 			appliedHunk,
@@ -3219,7 +3379,8 @@ suite('AI review findings', () => {
 		const appliedHunk = { ...originalHunk, newText: 'suggested\n' };
 		const appliedSuggestion = {
 			suggestionId: 'suggestion-1',
-			hunkId: originalHunk.id,
+			sourceHunkId: originalHunk.id,
+			currentHunkId: originalHunk.id,
 			originalHunk,
 			replacementText: 'suggested\n',
 			appliedHunk,
@@ -3283,7 +3444,8 @@ suite('AI review findings', () => {
 		};
 		const appliedSuggestion = {
 			suggestionId: 'suggestion-1',
-			hunkId: originalHunk.id,
+			sourceHunkId: originalHunk.id,
+			currentHunkId: originalHunk.id,
 			originalHunk,
 			replacementText: suggestionText,
 			appliedHunk,
@@ -3408,7 +3570,7 @@ suite('Git service', () => {
 		}
 	});
 
-	test('stages and unstages exactly one Git hunk with the same patch', async function (this: Mocha.Context) {
+	test('uses a staged hunk as the new baseline and keeps only remaining working changes', async function (this: Mocha.Context) {
 		this.timeout(30000);
 		const root = createTempGitRepo();
 		try {
@@ -3425,14 +3587,11 @@ suite('Git service', () => {
 			await service.applyPatch(folder, first.patch, { cached: true, check: true });
 			await service.applyPatch(folder, first.patch, { cached: true });
 			let refreshed = (await service.createFilePairs(folder))[0];
-			assert.strictEqual(refreshed.acceptedHunks?.length, 1);
 			assert.strictEqual(refreshed.pendingHunks?.length, 1);
-			const accepted = refreshed.acceptedHunks?.[0];
-			assert.ok(accepted?.patch);
-			await service.applyPatch(folder, accepted.patch, { cached: true, reverse: true, check: true });
-			await service.applyPatch(folder, accepted.patch, { cached: true, reverse: true });
+			assert.match(refreshed.oldText, /new-a/);
+			await service.applyPatch(folder, first.patch, { cached: true, reverse: true, check: true });
+			await service.applyPatch(folder, first.patch, { cached: true, reverse: true });
 			refreshed = (await service.createFilePairs(folder))[0];
-			assert.strictEqual(refreshed.acceptedHunks?.length, 0);
 			assert.strictEqual(refreshed.pendingHunks?.length, 2);
 		} finally {
 			removeTempRepo(root);
@@ -3506,13 +3665,12 @@ suite('Git service', () => {
 			git(root, 'add', 'tracked.txt');
 			pairs = await service.createFilePairs(folder);
 			byPath = filePairsByPath(pairs);
-			assert.strictEqual(byPath.get('tracked.txt')?.acceptedHunks?.length, 1);
-			assert.strictEqual(byPath.get('tracked.txt')?.pendingHunks?.length, 0);
+			assert.strictEqual(byPath.has('tracked.txt'), false);
 
 			writeRepoFile(root, 'tracked.txt', 'base\nwork\nunstaged\n');
 			pairs = await service.createFilePairs(folder);
 			byPath = filePairsByPath(pairs);
-			assert.strictEqual(byPath.get('tracked.txt')?.oldText, 'base\n');
+			assert.strictEqual(byPath.get('tracked.txt')?.oldText, 'base\nwork\n');
 			assert.strictEqual(byPath.get('tracked.txt')?.gitSnapshot?.indexText, 'base\nwork\n');
 			assert.strictEqual(byPath.get('tracked.txt')?.newText, 'base\nwork\nunstaged\n');
 
@@ -3525,7 +3683,7 @@ suite('Git service', () => {
 			git(root, 'add', 'loose.txt');
 			pairs = await service.createFilePairs(folder);
 			byPath = filePairsByPath(pairs);
-			assert.strictEqual(byPath.get('loose.txt')?.acceptedHunks?.length, 1);
+			assert.strictEqual(byPath.has('loose.txt'), false);
 
 			fs.unlinkSync(path.join(root, 'delete.txt'));
 			pairs = await service.createFilePairs(folder);
@@ -3536,7 +3694,7 @@ suite('Git service', () => {
 			git(root, 'add', 'delete.txt');
 			pairs = await service.createFilePairs(folder);
 			byPath = filePairsByPath(pairs);
-			assert.strictEqual(byPath.get('delete.txt')?.acceptedHunks?.length, 1);
+			assert.strictEqual(byPath.has('delete.txt'), false);
 
 			writeRepoFile(root, '.env', 'secret\n');
 			writeRepoFile(root, '.cache/output.txt', 'cache\n');
@@ -3581,10 +3739,9 @@ suite('Git service', () => {
 
 			const pairs = await service.createFilePairs(folder);
 			const byPath = filePairsByPath(pairs);
-			assert.strictEqual(byPath.get('tracked.txt')?.oldText, 'old\npending-old\n');
+			assert.strictEqual(byPath.get('tracked.txt')?.oldText, 'accepted\npending-old\n');
 			assert.strictEqual(byPath.get('tracked.txt')?.gitSnapshot?.indexText, 'accepted\npending-old\n');
 			assert.strictEqual(byPath.get('tracked.txt')?.newText, 'accepted\npending-new\n');
-			assert.strictEqual(byPath.get('tracked.txt')?.acceptedHunks?.length, 1);
 			assert.strictEqual(byPath.get('tracked.txt')?.pendingHunks?.length, 1);
 		} finally {
 			removeTempRepo(root);
@@ -3605,7 +3762,7 @@ suite('Git service', () => {
 			await service.stageFile(folder, 'tracked.txt');
 
 			const pairs = await service.createFilePairs(folder);
-			assert.strictEqual(filePairsByPath(pairs).get('tracked.txt')?.acceptedHunks?.length, 1);
+			assert.strictEqual(filePairsByPath(pairs).has('tracked.txt'), false);
 		} finally {
 			removeTempRepo(root);
 		}
@@ -3626,10 +3783,10 @@ suite('Git service', () => {
 
 			const pairs = await service.createFilePairs(folder);
 			const byPath = filePairsByPath(pairs);
-			assert.strictEqual(byPath.get('loose.txt')?.oldText, '');
+			assert.strictEqual(byPath.get('loose.txt')?.oldText, 'accepted\n');
 			assert.strictEqual(byPath.get('loose.txt')?.gitSnapshot?.indexText, 'accepted\n');
 			assert.strictEqual(byPath.get('loose.txt')?.newText, 'accepted\npending\n');
-			assert.strictEqual(byPath.get('loose.txt')?.baselineExists, false);
+			assert.strictEqual(byPath.get('loose.txt')?.baselineExists, true);
 			assert.strictEqual(byPath.get('loose.txt')?.gitSnapshot?.indexExists, true);
 		} finally {
 			removeTempRepo(root);
@@ -3663,7 +3820,7 @@ suite('Git service', () => {
 	});
 });
 
-suite('Git reject journal', () => {
+suite('Git review journal', () => {
 	test('recovers applied rejects after restart and invalidates them on HEAD change', async function (this: Mocha.Context) {
 		this.timeout(10000);
 		const root = createTempGitRepo();
@@ -3695,6 +3852,149 @@ suite('Git reject journal', () => {
 			const invalidated = await restarted.load(project, `${project.headOid}-changed`);
 			assert.strictEqual(invalidated.headChanged, true);
 			assert.deepStrictEqual(invalidated.records, []);
+		} finally {
+			removeTempRepo(root);
+			fs.rmSync(storage, { recursive: true, force: true });
+		}
+	});
+
+	test('persists accepted decisions without staging and flushes them on manual refresh', async function (this: Mocha.Context) {
+		this.timeout(10000);
+		const root = createTempGitRepo();
+		const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-accepted-journal-'));
+		try {
+			writeRepoFile(root, 'tracked.txt', 'old\n');
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+			writeRepoFile(root, 'tracked.txt', 'new\n');
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			const project = (await service.discoverProjects(folder))[0];
+			const pair = (await service.createFilePairs(folder))[0];
+			const hunk = pair.pendingHunks?.[0];
+			assert.ok(hunk);
+			const uri = vscode.Uri.file(path.join(root, 'tracked.txt'));
+			const context = { storageUri: vscode.Uri.file(storage), globalStorageUri: vscode.Uri.file(storage) } as vscode.ExtensionContext;
+			const journal = new GitReviewJournalStore(context);
+			const record = await journal.accept(project, project.headOid ?? '', pair.relativePath, uri, hunk, pair.gitSnapshot?.indexBlobOid);
+
+			assert.strictEqual((await service.readIndexEntry(folder, 'tracked.txt')).text, 'old\n');
+			const restored = await new GitReviewJournalStore(context).load(project, project.headOid ?? '');
+			assert.strictEqual(restored.records.length, 1);
+			assert.strictEqual(restored.records[0].kind, 'accept');
+
+			const file = reviewFileState(uri, pair.relativePath, {
+				projectId: project.id,
+				oldText: pair.oldText,
+				newText: pair.newText,
+				hunks: [],
+				acceptedHunks: [journal.toAcceptedHunk(record, hunk)],
+				gitSnapshot: pair.gitSnapshot,
+				headOid: pair.headOid,
+			});
+			const session: ReviewSession = {
+				id: 'flush-accepted', mode: 'git', rootUri: vscode.Uri.file(root), createdAt: 1,
+				files: new Map([[uri.toString(), file]]), projects: [project],
+			};
+			const controller = Object.create(ReviewController.prototype) as any;
+			Object.assign(controller, {
+				activeSession: session,
+				gitService: service,
+				gitReviewJournal: journal,
+				isOpenDocumentDirty: () => false,
+			});
+
+			await controller.flushReviewedChangesToIndex();
+
+			assert.strictEqual((await service.readIndexEntry(folder, 'tracked.txt')).text, 'new\n');
+			assert.deepStrictEqual((await journal.load(project, project.headOid ?? '')).records, []);
+		} finally {
+			removeTempRepo(root);
+			fs.rmSync(storage, { recursive: true, force: true });
+		}
+	});
+
+	test('invalidates an accepted decision when a new working edit replaces the same hunk', async function (this: Mocha.Context) {
+		this.timeout(10000);
+		const root = createTempGitRepo();
+		const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-overlap-journal-'));
+		try {
+			writeRepoFile(root, 'tracked.txt', 'old\n');
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+			writeRepoFile(root, 'tracked.txt', 'reviewed\n');
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			const project = (await service.discoverProjects(folder))[0];
+			const firstPair = (await service.createFilePairs(folder))[0];
+			const reviewedHunk = firstPair.pendingHunks?.[0];
+			assert.ok(reviewedHunk);
+			const uri = vscode.Uri.file(path.join(root, 'tracked.txt'));
+			const context = { storageUri: vscode.Uri.file(storage), globalStorageUri: vscode.Uri.file(storage) } as vscode.ExtensionContext;
+			const journal = new GitReviewJournalStore(context);
+			await journal.accept(project, project.headOid ?? '', firstPair.relativePath, uri, reviewedHunk, firstPair.gitSnapshot?.indexBlobOid);
+
+			writeRepoFile(root, 'tracked.txt', 'replaced-after-review\n');
+			const latestPair = (await service.createFilePairs(folder))[0];
+			const file = reviewFileState(uri, latestPair.relativePath, {
+				projectId: project.id,
+				oldText: latestPair.oldText,
+				newText: latestPair.newText,
+				hunks: latestPair.pendingHunks ?? [],
+				gitSnapshot: latestPair.gitSnapshot,
+				headOid: latestPair.headOid,
+			});
+			const files = new Map([[uri.toString(), file]]);
+			const controller = Object.create(ReviewController.prototype) as any;
+			Object.assign(controller, { gitReviewJournal: journal, aiReviewStore: { clear: async () => undefined } });
+
+			await controller.attachRejectedJournals(files, [project]);
+
+			assert.strictEqual(file.acceptedHunks.length, 0);
+			assert.strictEqual(file.hunks.length, 1);
+			assert.strictEqual(file.hunks[0].newText, 'replaced-after-review\n');
+			assert.deepStrictEqual((await journal.load(project, project.headOid ?? '')).records, []);
+		} finally {
+			removeTempRepo(root);
+			fs.rmSync(storage, { recursive: true, force: true });
+		}
+	});
+
+	test('reattaches an unchanged accepted decision after restart', async function (this: Mocha.Context) {
+		this.timeout(10000);
+		const root = createTempGitRepo();
+		const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-restore-accepted-'));
+		try {
+			writeRepoFile(root, 'tracked.txt', 'old\n');
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+			writeRepoFile(root, 'tracked.txt', 'reviewed\n');
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			const project = (await service.discoverProjects(folder))[0];
+			const pair = (await service.createFilePairs(folder))[0];
+			const hunk = pair.pendingHunks?.[0];
+			assert.ok(hunk);
+			const uri = vscode.Uri.file(path.join(root, 'tracked.txt'));
+			const context = { storageUri: vscode.Uri.file(storage), globalStorageUri: vscode.Uri.file(storage) } as vscode.ExtensionContext;
+			await new GitReviewJournalStore(context).accept(project, project.headOid ?? '', pair.relativePath, uri, hunk, pair.gitSnapshot?.indexBlobOid);
+			const restarted = new GitReviewJournalStore(context);
+			const file = reviewFileState(uri, pair.relativePath, {
+				projectId: project.id,
+				oldText: pair.oldText,
+				newText: pair.newText,
+				hunks: pair.pendingHunks ?? [],
+				gitSnapshot: pair.gitSnapshot,
+				headOid: pair.headOid,
+			});
+			const controller = Object.create(ReviewController.prototype) as any;
+			Object.assign(controller, { gitReviewJournal: restarted, aiReviewStore: { clear: async () => undefined } });
+
+			await controller.attachRejectedJournals(new Map([[uri.toString(), file]]), [project]);
+
+			assert.strictEqual(file.hunks.length, 0);
+			assert.strictEqual(file.acceptedHunks.length, 1);
+			assert.strictEqual(file.acceptedHunks[0].status, 'accepted');
 		} finally {
 			removeTempRepo(root);
 			fs.rmSync(storage, { recursive: true, force: true });

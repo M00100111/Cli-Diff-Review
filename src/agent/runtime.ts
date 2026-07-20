@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { completeLlm, LlmClient, LlmCompletion, LlmMessage, LlmToolCall, LlmToolDefinition } from '../llm/client';
 import { LlmRuntimeConfig } from '../llm/config';
 import { isJsonObject, parseStrictJsonObject } from '../llm/json';
@@ -57,10 +58,20 @@ export interface AgentRunOptions {
 	onProgress?: (progress: AgentProgress) => void;
 	onTrace?: (event: AgentTraceEvent) => void;
 	maxRounds?: number | 'unlimited';
-	maxToolCalls?: number | 'unlimited';
 	maxToolResultChars?: number;
 	maxContextChars?: number;
 	maxRunMs?: number;
+	resumeFrom?: AgentRunCheckpoint;
+	onCheckpoint?: (checkpoint: AgentRunCheckpoint) => void | Promise<void>;
+}
+
+export interface AgentRunCheckpoint {
+	version: 1;
+	nextRound: number;
+	messages: LlmMessage[];
+	toolCalls: number;
+	toolResultChars: number;
+	runFingerprint: string;
 }
 
 export interface AgentRunResult {
@@ -98,7 +109,6 @@ export class AgentRunner {
 	public async run(options: AgentRunOptions): Promise<AgentRunResult> {
 		const maxRounds = options.maxRounds ?? 12;
 		const unlimitedRounds = maxRounds === 'unlimited';
-		const maxToolCalls = options.maxToolCalls ?? 40;
 		const maxToolResultChars = options.maxToolResultChars ?? 300000;
 		const maxContextChars = options.maxContextChars ?? 800000;
 		const maxRunMs = options.maxRunMs ?? 5 * 60 * 1000;
@@ -119,25 +129,46 @@ export class AgentRunner {
 		const signal = runAbortController.signal;
 		const tools = new Map(options.tools.map((tool) => [tool.name, tool]));
 		const nativeTools = providerUsesNativeTools(options.config.provider);
-		const messages: LlmMessage[] = [
+		const initialMessages: LlmMessage[] = [
 			{ role: 'system', content: `${nativeTools ? nativeToolProtocolPrompt : protocolPrompt}\n\n${options.systemPrompt}\n\nAvailable tools:\n${toolDescriptions(options.tools)}` },
 			{ role: 'user', content: options.userPrompt },
 		];
-		let toolCalls = 0;
-		let toolResultChars = 0;
+		const runFingerprint = agentRunFingerprint(options, nativeTools);
+		if (options.resumeFrom && options.resumeFrom.runFingerprint !== runFingerprint) {
+			throw new Error('AI review continuation is incompatible with the current model, prompt, or tools. Generate a new AI review.');
+		}
+		const messages: LlmMessage[] = options.resumeFrom
+			? cloneMessages(options.resumeFrom.messages)
+			: initialMessages;
+		let toolCalls = options.resumeFrom?.toolCalls ?? 0;
+		let toolResultChars = options.resumeFrom?.toolResultChars ?? 0;
+		const firstRound = options.resumeFrom?.nextRound ?? 1;
+		if (!unlimitedRounds && firstRound > maxRounds) {
+			throw new Error(`AI review continuation already consumed ${firstRound - 1} rounds. Increase Cli Diff: AI Review Max Rounds to continue.`);
+		}
 		emitTrace(options, {
 			kind: 'run_start',
-			title: 'Agent started',
-			summary: `${providerName(options.config.provider)} model ${options.config.model}`,
+			title: options.resumeFrom ? 'Agent continued' : 'Agent started',
+			summary: options.resumeFrom
+				? `${providerName(options.config.provider)} model ${options.config.model} at round ${firstRound}`
+				: `${providerName(options.config.provider)} model ${options.config.model}`,
 			status: 'running',
 			details: [
 				jsonDetail('Initial messages', messages),
 				jsonDetail('Tools', toolDefinitions(options.tools)),
 			],
 		});
+		await options.onCheckpoint?.({
+			version: 1,
+			nextRound: firstRound,
+			messages: cloneMessages(messages),
+			toolCalls,
+			toolResultChars,
+			runFingerprint,
+		});
 
 		try {
-			for (let round = 1; unlimitedRounds || round <= maxRounds; round += 1) {
+			for (let round = firstRound; unlimitedRounds || round <= maxRounds; round += 1) {
 				throwIfAborted(signal);
 				if (Date.now() - startedAt > maxRunMs) {
 					throw new Error('Agent exceeded its runtime limit.');
@@ -162,9 +193,6 @@ export class AgentRunner {
 					return result;
 				}
 
-				if (maxToolCalls !== 'unlimited' && toolCalls + response.calls.length > maxToolCalls) {
-					throw new Error('Agent exceeded its tool call limit.');
-				}
 				const results: Array<{ id: string; name: string; ok: boolean; result?: unknown; error?: string }> = [];
 				for (const call of response.calls) {
 					throwIfAborted(signal);
@@ -233,6 +261,14 @@ export class AgentRunner {
 					messages.push({ role: 'assistant', content: response.content });
 					messages.push({ role: 'user', content });
 				}
+				await options.onCheckpoint?.({
+					version: 1,
+					nextRound: round + 1,
+					messages: cloneMessages(messages),
+					toolCalls,
+					toolResultChars,
+					runFingerprint,
+				});
 			}
 			throw new Error(`Agent exceeded its round limit (${maxRounds}).`);
 		} catch (error) {
@@ -253,6 +289,28 @@ export class AgentRunner {
 			options.signal?.removeEventListener('abort', abortFromCaller);
 		}
 	}
+}
+
+function agentRunFingerprint(options: AgentRunOptions, nativeTools: boolean): string {
+	return createHash('sha256').update(JSON.stringify({
+		provider: options.config.provider,
+		baseUrl: options.config.baseUrl,
+		model: options.config.model,
+		jsonOutputEnabled: options.config.jsonOutputEnabled,
+		thinkingMode: options.config.thinkingMode,
+		strictTools: options.config.strictTools,
+		nativeTools,
+		systemPrompt: options.systemPrompt,
+		userPrompt: options.userPrompt,
+		tools: toolDefinitions(options.tools),
+	})).digest('hex');
+}
+
+function cloneMessages(messages: LlmMessage[]): LlmMessage[] {
+	return messages.map((message) => ({
+		...message,
+		toolCalls: message.toolCalls?.map((call) => ({ ...call })),
+	}));
 }
 
 export function validateAgentResponse(value: unknown): AgentResponse {

@@ -104,7 +104,7 @@
       },
       {
         "command": "cli-diff.refresh",
-        "title": "Refresh Review",
+        "title": "Refresh and Stage Reviewed Changes",
         "category": "Cli Diff Review",
         "icon": "$(refresh)"
       },
@@ -290,7 +290,7 @@
           "type": "number",
           "default": 64,
           "minimum": 0,
-          "description": "Maximum AI Review agent rounds per file. 0 means unlimited."
+          "description": "Maximum rounds for each AI Review agent. Applies to knowledge, planning, file, and integration agents. 0 means unlimited."
         },
         "cliDiff.aiReviewFileConcurrency": {
           "type": "number",

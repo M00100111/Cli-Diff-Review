@@ -8,7 +8,7 @@ import { isAbortError } from '../wiki/cancellation';
 import { isWikiPath } from '../wiki/paths';
 import type { WikiFreshnessAssessment } from '../wiki/state';
 import { createReadOnlyAgentTools } from './tools';
-import { AgentRunner, AgentTraceDetail, AgentTraceEvent } from './runtime';
+import { AgentRunCheckpoint, AgentRunner, AgentTraceDetail, AgentTraceEvent } from './runtime';
 
 export type AiReviewSeverity = 'error' | 'warning' | 'suggestion' | 'info';
 
@@ -83,9 +83,18 @@ export interface StoredAiReview {
 	knowledgeContextSummary?: string;
 	knowledgeFreshness?: WikiFreshnessAssessment;
 	knowledgeClaims?: AiReviewKnowledgeClaim[];
+	knowledgeContext?: AiReviewKnowledgeContext;
 	planSummary?: string;
+	reviewPlan?: AiReviewPlan;
 	failedFile?: string;
 	error?: string;
+	continuations?: AiReviewContinuation[];
+}
+
+export interface AiReviewContinuation {
+	stage: AiReviewTraceStage;
+	fileUri?: string;
+	checkpoint: AgentRunCheckpoint;
 }
 
 export interface CodeReviewTraceContext {
@@ -151,6 +160,7 @@ export interface CodeReviewAgentOptions {
 	onProgress?: (message: string) => void;
 	onTrace?: (event: AgentTraceEvent, context: CodeReviewTraceContext) => void;
 	onFileComplete?: (review: StoredAiReview) => void | Promise<void>;
+	onCheckpoint?: (review: StoredAiReview) => void | Promise<void>;
 }
 
 const severities = new Set<AiReviewSeverity>(['error', 'warning', 'suggestion', 'info']);
@@ -186,15 +196,19 @@ export class CodeReviewAgentService {
 		let plan = storedReviewPlan(review);
 		if (pipeline === 'multi' && !review.planSummary) {
 			try {
-				knowledgeContext = await this.runKnowledgeRetrieval(options, files, limits);
+				knowledgeContext = await this.runKnowledgeRetrieval(options, files, limits, review);
+				review.knowledgeContext = knowledgeContext;
 				review.knowledgeContextSummary = knowledgeContext.summary;
 				review.knowledgeFreshness = knowledgeContext.freshness;
 				review.knowledgeClaims = knowledgeContext.claims;
-				plan = await this.runPlanning(options, files, knowledgeContext, limits);
+				await this.persistReviewProgress(options, review);
+				plan = await this.runPlanning(options, files, knowledgeContext, limits, review);
+				review.reviewPlan = plan;
 				review.planSummary = plan.summary;
 				review.completedIntegration = false;
+				await this.persistReviewProgress(options, review);
 			} catch (error) {
-				if (strategy === 'Auto') {
+				if (strategy === 'Auto' && !isContinuationIncompatibleError(error)) {
 					emitReviewTrace(options, stageTraceContext('plan', files), {
 						kind: 'run_error',
 						title: 'AI review strategy fallback',
@@ -208,7 +222,10 @@ export class CodeReviewAgentService {
 					review.knowledgeContextSummary = undefined;
 					review.knowledgeFreshness = undefined;
 					review.knowledgeClaims = undefined;
+					review.knowledgeContext = undefined;
 					review.planSummary = undefined;
+					review.reviewPlan = undefined;
+					review.continuations = [];
 					knowledgeContext = storedKnowledgeContext(review, Boolean(options.includeWikiTools));
 					plan = storedReviewPlan(review);
 				} else {
@@ -231,6 +248,7 @@ export class CodeReviewAgentService {
 		review.completedFiles = files.map((file) => file.uri.toString());
 		review.failedFile = undefined;
 		review.error = undefined;
+		review.continuations = [];
 		review.pipeline = pipeline;
 		review.completedIntegration = pipeline === 'multi' ? true : undefined;
 		review.generatedAt = new Date().toISOString();
@@ -256,7 +274,7 @@ export class CodeReviewAgentService {
 		if (concurrency <= 1) {
 			for (const entry of pendingFiles) {
 				try {
-					const validation = await this.runSingleFileReview(options, entry.file, entry.index, files.length, limits, pipeline, changeSummary, knowledgeContext, plan, review.findings.length, review.suggestions.length);
+					const validation = await this.runSingleFileReview(options, review, entry.file, entry.index, files.length, limits, pipeline, changeSummary, knowledgeContext, plan, review.findings.length, review.suggestions.length);
 					await this.applyFileReviewValidation(options, files, review, completedFiles, pipeline, entry.file, validation);
 				} catch (error) {
 					this.throwFileReviewPartial(review, entry.file, error);
@@ -293,7 +311,7 @@ export class CodeReviewAgentService {
 					return;
 				}
 				try {
-					const validation = await this.runSingleFileReview(options, entry.file, entry.index, files.length, limits, pipeline, changeSummary, knowledgeContext, plan, 0, 0);
+					const validation = await this.runSingleFileReview(options, review, entry.file, entry.index, files.length, limits, pipeline, changeSummary, knowledgeContext, plan, 0, 0);
 					results.set(entry.pendingIndex, validation);
 					await enqueueFlush();
 				} catch (error) {
@@ -314,6 +332,7 @@ export class CodeReviewAgentService {
 
 	private async runSingleFileReview(
 		options: CodeReviewAgentOptions,
+		review: StoredAiReview,
 		file: ReviewFileState,
 		index: number,
 		fileCount: number,
@@ -343,8 +362,9 @@ export class CodeReviewAgentService {
 			onProgress: (progress) => options.onProgress?.(file.relativePath + ': ' + progress.message),
 			onTrace: (event) => options.onTrace?.(event, context),
 			maxRounds: limits.maxRounds,
-			maxToolCalls: limits.maxToolCalls,
 			maxRunMs: limits.maxRunMs,
+			resumeFrom: this.continuationFor(review, 'file', file.uri.toString())?.checkpoint,
+			onCheckpoint: (checkpoint) => this.saveContinuation(options, review, 'file', file.uri.toString(), checkpoint),
 		});
 		try {
 			const validation = validateAiReviewResult(result.result, file, findingStartOrder, suggestionStartOrder);
@@ -361,6 +381,7 @@ export class CodeReviewAgentService {
 					jsonTraceDetail('Accepted suggestions', validation.suggestions),
 				],
 			}, context);
+			this.clearContinuation(review, 'file', file.uri.toString());
 			return validation;
 		} catch (error) {
 			options.onTrace?.({
@@ -422,9 +443,11 @@ export class CodeReviewAgentService {
 		options: CodeReviewAgentOptions,
 		files: ReviewFileState[],
 		limits: ReturnType<typeof aiReviewRunLimits>,
+		review: StoredAiReview,
 	): Promise<AiReviewKnowledgeContext> {
 		const context = stageTraceContext('knowledge', files);
 		if (!options.includeWikiTools) {
+			this.clearContinuation(review, 'knowledge');
 			const skipped = defaultKnowledgeContext(false, options.knowledgeFreshness);
 			emitReviewTrace(options, context, {
 				kind: 'run_complete',
@@ -447,7 +470,10 @@ export class CodeReviewAgentService {
 			onProgress: (progress) => options.onProgress?.(`Knowledge: ${progress.message}`),
 			onTrace: (event) => options.onTrace?.(event, context),
 			...stageRunLimits(limits),
+			resumeFrom: this.continuationFor(review, 'knowledge')?.checkpoint,
+			onCheckpoint: (checkpoint) => this.saveContinuation(options, review, 'knowledge', undefined, checkpoint),
 		});
+		this.clearContinuation(review, 'knowledge');
 		const knowledgeContext = knowledgeContextFromResult(result.result, options.knowledgeFreshness);
 		emitReviewTrace(options, context, {
 			kind: 'parse_success',
@@ -467,6 +493,7 @@ export class CodeReviewAgentService {
 		files: ReviewFileState[],
 		knowledgeContext: AiReviewKnowledgeContext,
 		limits: ReturnType<typeof aiReviewRunLimits>,
+		review: StoredAiReview,
 	): Promise<AiReviewPlan> {
 		const context = stageTraceContext('plan', files);
 		options.onProgress?.('Planning AI review');
@@ -480,7 +507,10 @@ export class CodeReviewAgentService {
 			onProgress: (progress) => options.onProgress?.(`Plan: ${progress.message}`),
 			onTrace: (event) => options.onTrace?.(event, context),
 			...stageRunLimits(limits),
+			resumeFrom: this.continuationFor(review, 'plan')?.checkpoint,
+			onCheckpoint: (checkpoint) => this.saveContinuation(options, review, 'plan', undefined, checkpoint),
 		});
+		this.clearContinuation(review, 'plan');
 		return reviewPlanFromResult(result.result, files);
 	}
 
@@ -506,6 +536,8 @@ export class CodeReviewAgentService {
 				onProgress: (progress) => options.onProgress?.(`Integration: ${progress.message}`),
 				onTrace: (event) => options.onTrace?.(event, context),
 				...stageRunLimits(limits),
+				resumeFrom: this.continuationFor(review, 'integration')?.checkpoint,
+				onCheckpoint: (checkpoint) => this.saveContinuation(options, review, 'integration', undefined, checkpoint),
 			});
 			const validation = validateIntegrationReviewFindingsWithDiagnostics(result.result, files, fileFindings.length);
 			options.onTrace?.({
@@ -521,6 +553,7 @@ export class CodeReviewAgentService {
 			}, context);
 			review.findings = mergeFileAndIntegrationFindings(fileFindings, validation.findings);
 			review.completedIntegration = true;
+			this.clearContinuation(review, 'integration');
 			review.failedFile = undefined;
 			review.error = undefined;
 			review.generatedAt = new Date().toISOString();
@@ -534,6 +567,35 @@ export class CodeReviewAgentService {
 			review.generatedAt = new Date().toISOString();
 			throw new AiReviewPartialError(review.error, cloneStoredReview(review), error);
 		}
+	}
+
+	private continuationFor(review: StoredAiReview, stage: AiReviewTraceStage, fileUri?: string): AiReviewContinuation | undefined {
+		return review.continuations?.find((continuation) => continuation.stage === stage && continuation.fileUri === fileUri);
+	}
+
+	private async saveContinuation(
+		options: CodeReviewAgentOptions,
+		review: StoredAiReview,
+		stage: AiReviewTraceStage,
+		fileUri: string | undefined,
+		checkpoint: AgentRunCheckpoint,
+	): Promise<void> {
+		const continuation: AiReviewContinuation = { stage, fileUri, checkpoint };
+		review.continuations = [
+			...(review.continuations ?? []).filter((item) => item.stage !== stage || item.fileUri !== fileUri),
+			continuation,
+		];
+		review.status = 'partial';
+		review.generatedAt = new Date().toISOString();
+		await this.persistReviewProgress(options, review);
+	}
+
+	private clearContinuation(review: StoredAiReview, stage: AiReviewTraceStage, fileUri?: string): void {
+		review.continuations = (review.continuations ?? []).filter((item) => item.stage !== stage || item.fileUri !== fileUri);
+	}
+
+	private async persistReviewProgress(options: CodeReviewAgentOptions, review: StoredAiReview): Promise<void> {
+		await options.onCheckpoint?.(cloneStoredReview(review));
 	}
 }
 export class AiReviewStore {
@@ -592,9 +654,12 @@ function normalizeStoredReview(review: StoredAiReview, signature: string, files:
 		knowledgeContextSummary: typeof review.knowledgeContextSummary === 'string' ? review.knowledgeContextSummary : undefined,
 		knowledgeFreshness: normalizeKnowledgeFreshness(review.knowledgeFreshness),
 		knowledgeClaims: normalizeKnowledgeClaims(review.knowledgeClaims),
+		knowledgeContext: isJsonObject(review.knowledgeContext) ? review.knowledgeContext as unknown as AiReviewKnowledgeContext : undefined,
 		planSummary: typeof review.planSummary === 'string' ? review.planSummary : undefined,
+		reviewPlan: isJsonObject(review.reviewPlan) ? review.reviewPlan as unknown as AiReviewPlan : undefined,
 		failedFile: typeof review.failedFile === 'string' ? review.failedFile : undefined,
 		error: typeof review.error === 'string' ? review.error : undefined,
+		continuations: normalizeContinuations(review.continuations),
 	};
 }
 
@@ -700,12 +765,10 @@ function hasPublicSurfaceText(hunk: ReviewHunk): boolean {
 	return /\bexport\s+(interface|type|class|function|const|enum)\b|commands\.registerCommand|\bcontributes\b|\bconfiguration\b/.test(`${hunk.oldText}\n${hunk.newText}`);
 }
 
-function stageRunLimits(limits: ReturnType<typeof aiReviewRunLimits>): Pick<Parameters<AgentRunner['run']>[0], 'maxRounds' | 'maxToolCalls' | 'maxRunMs'> {
-	const configuredRounds = limits.maxRounds === 'unlimited' ? 12 : limits.maxRounds;
+function stageRunLimits(limits: ReturnType<typeof aiReviewRunLimits>): Pick<Parameters<AgentRunner['run']>[0], 'maxRounds' | 'maxRunMs'> {
 	return {
-		maxRounds: Math.max(4, Math.min(12, configuredRounds)),
-		maxToolCalls: 32,
-		maxRunMs: Math.min(limits.maxRunMs, 10 * 60 * 1000),
+		maxRounds: limits.maxRounds,
+		maxRunMs: limits.maxRunMs,
 	};
 }
 
@@ -759,6 +822,16 @@ function defaultKnowledgeContext(wikiAvailable: boolean, freshness?: WikiFreshne
 }
 
 function storedKnowledgeContext(review: StoredAiReview, wikiAvailable: boolean): AiReviewKnowledgeContext {
+	if (review.knowledgeContext) {
+		return {
+			...review.knowledgeContext,
+			relevantPages: [...review.knowledgeContext.relevantPages],
+			perFileHints: { ...review.knowledgeContext.perFileHints },
+			interfaceContracts: [...review.knowledgeContext.interfaceContracts],
+			workflowRisks: [...review.knowledgeContext.workflowRisks],
+			claims: [...review.knowledgeContext.claims],
+		};
+	}
 	const context = defaultKnowledgeContext(wikiAvailable, review.knowledgeFreshness);
 	if (review.knowledgeContextSummary) {
 		context.summary = review.knowledgeContextSummary;
@@ -770,6 +843,14 @@ function storedKnowledgeContext(review: StoredAiReview, wikiAvailable: boolean):
 }
 
 function storedReviewPlan(review: StoredAiReview): AiReviewPlan {
+	if (review.reviewPlan) {
+		return {
+			...review.reviewPlan,
+			riskAreas: [...review.reviewPlan.riskAreas],
+			integrationChecks: [...review.reviewPlan.integrationChecks],
+			filePlans: { ...review.reviewPlan.filePlans },
+		};
+	}
 	return {
 		summary: review.planSummary ?? 'No multi-agent review plan is available.',
 		changeIntent: review.planSummary ?? '',
@@ -1040,20 +1121,17 @@ function originalReviewedHunkId(hunkId: string): string {
 }
 function aiReviewRunLimits(maxRounds: number | 'unlimited' | undefined): {
 	maxRounds: number | 'unlimited';
-	maxToolCalls: number | 'unlimited';
 	maxRunMs: number;
 } {
 	if (maxRounds === 'unlimited') {
 		return {
 			maxRounds: 'unlimited',
-			maxToolCalls: 'unlimited',
 			maxRunMs: 60 * 60 * 1000,
 		};
 	}
 	const rounds = Math.max(1, Math.floor(maxRounds ?? 64));
 	return {
 		maxRounds: rounds,
-		maxToolCalls: Math.max(48, rounds * 4),
 		maxRunMs: Math.max(10 * 60 * 1000, rounds * 60 * 1000),
 	};
 }
@@ -1069,11 +1147,20 @@ export function sourcePendingFiles(session: ReviewSession | undefined): ReviewFi
 export function reviewChangeSignature(session: ReviewSession): string {
 	const payload = sourceReviewFiles(session).map((file) => ({
 		path: file.relativePath,
+		indexBlobOid: file.gitSnapshot?.indexBlobOid,
 		hunks: [...file.hunks, ...file.acceptedHunks, ...file.rejectedHunks]
 			.map(stableReviewHunkSignature)
 			.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
 	}));
-	return createHash('sha256').update(JSON.stringify({ sessionId: session.id, files: payload })).digest('hex');
+	return createHash('sha256').update(JSON.stringify({
+		rootUri: session.rootUri.toString(),
+		projects: (session.projects ?? []).map((project) => ({
+			id: project.id,
+			rootUri: project.rootUri.toString(),
+			headOid: project.headOid,
+		})).sort((left, right) => left.id.localeCompare(right.id)),
+		files: payload,
+	})).digest('hex');
 }
 
 function sourceReviewFiles(session: ReviewSession): ReviewFileState[] {
@@ -1493,12 +1580,70 @@ function cloneStoredReview(review: StoredAiReview): StoredAiReview {
 		knowledgeContextSummary: review.knowledgeContextSummary,
 		knowledgeFreshness: review.knowledgeFreshness,
 		knowledgeClaims: review.knowledgeClaims ? [...review.knowledgeClaims] : undefined,
+		knowledgeContext: review.knowledgeContext ? {
+			...review.knowledgeContext,
+			relevantPages: [...review.knowledgeContext.relevantPages],
+			perFileHints: { ...review.knowledgeContext.perFileHints },
+			interfaceContracts: [...review.knowledgeContext.interfaceContracts],
+			workflowRisks: [...review.knowledgeContext.workflowRisks],
+			claims: [...review.knowledgeContext.claims],
+		} : undefined,
 		planSummary: review.planSummary,
+		reviewPlan: review.reviewPlan ? {
+			...review.reviewPlan,
+			riskAreas: [...review.reviewPlan.riskAreas],
+			integrationChecks: [...review.reviewPlan.integrationChecks],
+			filePlans: { ...review.reviewPlan.filePlans },
+		} : undefined,
+		continuations: review.continuations?.map((continuation) => ({
+			...continuation,
+			checkpoint: {
+				...continuation.checkpoint,
+				messages: continuation.checkpoint.messages.map((message) => ({
+					...message,
+					toolCalls: message.toolCalls?.map((call) => ({ ...call })),
+				})),
+			},
+		})),
 	};
+}
+
+function normalizeContinuations(value: unknown): AiReviewContinuation[] {
+	if (!Array.isArray(value)) {
+		return [];
+	}
+	return value.filter((item): item is AiReviewContinuation => {
+		if (!isJsonObject(item) || !['knowledge', 'plan', 'file', 'integration'].includes(String(item.stage))) {
+			return false;
+		}
+		const checkpoint = item.checkpoint;
+		return isJsonObject(checkpoint)
+			&& checkpoint.version === 1
+			&& typeof checkpoint.nextRound === 'number'
+			&& checkpoint.nextRound >= 1
+			&& Array.isArray(checkpoint.messages)
+			&& typeof checkpoint.toolCalls === 'number'
+			&& typeof checkpoint.toolResultChars === 'number'
+			&& typeof checkpoint.runFingerprint === 'string';
+	}).map((item) => ({
+		...item,
+		fileUri: typeof item.fileUri === 'string' ? item.fileUri : undefined,
+		checkpoint: {
+			...item.checkpoint,
+			nextRound: Math.floor(item.checkpoint.nextRound),
+			toolCalls: Math.max(0, Math.floor(item.checkpoint.toolCalls)),
+			toolResultChars: Math.max(0, Math.floor(item.checkpoint.toolResultChars)),
+			messages: item.checkpoint.messages.map((message) => ({ ...message })),
+		},
+	}));
 }
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function isContinuationIncompatibleError(error: unknown): boolean {
+	return errorMessage(error).includes('AI review continuation is incompatible');
 }
 
 function textTraceDetail(label: string, content: string): AgentTraceDetail {

@@ -392,14 +392,15 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 	}
 
 	private serialize(file: ReviewFileState, document: vscode.TextDocument, revealPosition?: { line: number; column: number }): ReviewWebviewPayload {
+		const usesReviewStateText = document.uri.scheme === ReviewWebviewManager.deletedDocumentScheme || !file.currentExists;
 		return {
 			uri: file.uri.toString(),
 			relativePath: file.relativePath,
 			oldText: file.oldText,
-			newText: document.uri.scheme === ReviewWebviewManager.deletedDocumentScheme ? file.newText : document.getText(),
+			newText: usesReviewStateText ? file.newText : document.getText(),
 			revision: file.revision,
-			dirty: document.isDirty,
-			readOnly: document.uri.scheme === ReviewWebviewManager.deletedDocumentScheme,
+			dirty: usesReviewStateText ? false : document.isDirty,
+			readOnly: usesReviewStateText,
 			languageId: languageIdFromPath(file.relativePath),
 			pendingHunks: file.hunks,
 			acceptedHunks: file.acceptedHunks,
@@ -880,7 +881,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 			add: 'Add',
 			delete: 'Delete',
 			modify: 'modify',
-			accepted: 'Accepted · Staged',
+			accepted: 'Accepted',
 			rejected: 'Rejected',
 			noData: '0 pending \\u00b7 0 reviewed',
 			goToDefinition: 'Go to Definition',
@@ -1282,7 +1283,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 		function buildHunkEntries() {
 			const reviewedKeys = new Set(state.acceptedHunks.concat(state.rejectedHunks).map(hunkIdentity));
 			const appliedByHunk = new Map((state.appliedAiSuggestions || []).map(function (suggestion) {
-				return [suggestion.hunkId, suggestion];
+				return [suggestion.currentHunkId, suggestion];
 			}));
 			const pending = state.pendingHunks.filter(function (hunk) {
 				return !reviewedKeys.has(hunkIdentity(hunk));
