@@ -3452,6 +3452,38 @@ suite('AI review findings', () => {
 		assert.strictEqual(noCandidate.ok, false);
 		assert.strictEqual(noCandidate.reason, 'no-candidate');
 		assert.strictEqual(noCandidate.diagnostics.candidateCount, 0);
+		assert.strictEqual(noCandidate.diagnostics.regeneratedHunkCount, 0);
+		assert.strictEqual(noCandidate.diagnostics.referenceCompared, true);
+		assert.strictEqual(noCandidate.diagnostics.matchesExpectedReference, false);
+		assert.strictEqual(noCandidate.diagnostics.resolvedToIndex, false);
+
+		const resolvedFile = reviewFileState(uri, 'src/diagnostic.ts', { oldText: baseline, newText: baseline, hunks: [] });
+		const resolved = controller.findRegeneratedSuggestionHunks(resolvedFile, original, [], before);
+		assert.strictEqual(resolved.ok, false);
+		assert.strictEqual(resolved.reason, 'no-candidate');
+		assert.strictEqual(resolved.diagnostics.matchesExpectedReference, true);
+		assert.strictEqual(resolved.diagnostics.resolvedToIndex, true);
+
+		const outsideCandidate = {
+			...candidate,
+			id: 'outside-candidate',
+			oldStart: candidate.oldStart + 10,
+			newStart: candidate.newStart + 10,
+		};
+		const outsideFile = reviewFileState(uri, 'src/diagnostic.ts', { oldText: baseline, newText: after, hunks: [outsideCandidate] });
+		const outside = controller.findRegeneratedSuggestionHunks(outsideFile, original, [], before);
+		assert.strictEqual(outside.ok, false);
+		assert.strictEqual(outside.reason, 'no-candidate');
+		assert.strictEqual(outside.diagnostics.regeneratedHunkCount, 1);
+		assert.strictEqual(outside.diagnostics.outsideScopeCandidateCount, 1);
+		assert.strictEqual(outside.diagnostics.regeneratedHunks[0].disposition, 'outside-target-scope');
+
+		const preservedFile = reviewFileState(uri, 'src/diagnostic.ts', { oldText: baseline, newText: after, hunks: [candidate] });
+		const preserved = controller.findRegeneratedSuggestionHunks(preservedFile, original, [candidate], before);
+		assert.strictEqual(preserved.ok, false);
+		assert.strictEqual(preserved.reason, 'no-candidate');
+		assert.strictEqual(preserved.diagnostics.preservedOtherHunkCount, 1);
+		assert.strictEqual(preserved.diagnostics.regeneratedHunks[0].disposition, 'preserved-other');
 
 		const overlapFile = reviewFileState(uri, 'src/diagnostic.ts', { oldText: baseline, newText: after, hunks: [candidate] });
 		const overlap = controller.findRegeneratedSuggestionHunks(overlapFile, original, [original], before);
@@ -3465,6 +3497,8 @@ suite('AI review findings', () => {
 		assert.strictEqual(ambiguous.ok, false);
 		assert.strictEqual(ambiguous.reason, 'ambiguous');
 		assert.strictEqual(ambiguous.diagnostics.validGroupCount, 3);
+		assert.strictEqual(ambiguous.diagnostics.regeneratedHunkCount, 2);
+		assert.ok(ambiguous.diagnostics.regeneratedHunks.every((hunk: { disposition: string }) => hunk.disposition === 'candidate'));
 		const serialized = JSON.stringify(ambiguous.diagnostics);
 		assert.strictEqual(serialized.includes('old-secret'), false);
 		assert.strictEqual(serialized.includes('pending-secret'), false);

@@ -87,6 +87,15 @@ type SuggestionMappingFailureReason =
 
 interface SuggestionMappingDiagnostics {
 	original: Pick<ReviewHunk, 'kind' | 'oldStart' | 'oldLines' | 'newStart' | 'newLines'>;
+	regeneratedHunkCount: number;
+	regeneratedHunks: Array<Pick<GitReviewHunk, 'fingerprint' | 'occurrence' | 'kind' | 'oldStart' | 'oldLines' | 'newStart' | 'newLines'> & {
+		disposition: 'candidate' | 'preserved-other' | 'outside-target-scope';
+	}>;
+	preservedOtherHunkCount: number;
+	outsideScopeCandidateCount: number;
+	referenceCompared: boolean;
+	matchesExpectedReference: boolean;
+	resolvedToIndex: boolean;
 	candidateCount: number;
 	candidates: Array<Pick<GitReviewHunk, 'fingerprint' | 'occurrence' | 'oldStart' | 'oldLines' | 'newStart' | 'newLines'>>;
 	otherPendingCount: number;
@@ -3382,6 +3391,13 @@ export class ReviewController implements vscode.Disposable {
 		beforeText: string,
 	): SuggestionMappingResult {
 		const gitHunks = file.hunks.map((hunk) => this.requireGitHunk(hunk));
+		const withoutOriginalHunk = replaceLineBlock(
+			beforeText,
+			originalHunk.newStart,
+			originalHunk.newLines,
+			originalHunk.oldText,
+		);
+		const matchesExpectedReference = file.newText === withoutOriginalHunk;
 		const preservedOtherIds = new Set<string>();
 		for (const previous of otherHunks) {
 			const match = gitHunks.find((candidate) => candidate.fingerprint === previous.fingerprint
@@ -3393,6 +3409,8 @@ export class ReviewController implements vscode.Disposable {
 		const candidates = gitHunks.filter((candidate) => !preservedOtherIds.has(candidate.id)
 			&& this.gitHunkTouchesBaselineScope(candidate, originalHunk))
 			.sort((left, right) => left.oldStart - right.oldStart || left.newStart - right.newStart || left.id.localeCompare(right.id));
+		const outsideScopeCandidateCount = gitHunks.filter((candidate) => !preservedOtherIds.has(candidate.id)
+			&& !this.gitHunkTouchesBaselineScope(candidate, originalHunk)).length;
 		const diagnostics: SuggestionMappingDiagnostics = {
 			original: {
 				kind: originalHunk.kind,
@@ -3401,6 +3419,26 @@ export class ReviewController implements vscode.Disposable {
 				newStart: originalHunk.newStart,
 				newLines: originalHunk.newLines,
 			},
+			regeneratedHunkCount: gitHunks.length,
+			regeneratedHunks: gitHunks.map((candidate) => ({
+				fingerprint: candidate.fingerprint,
+				occurrence: candidate.occurrence,
+				kind: candidate.kind,
+				oldStart: candidate.oldStart,
+				oldLines: candidate.oldLines,
+				newStart: candidate.newStart,
+				newLines: candidate.newLines,
+				disposition: preservedOtherIds.has(candidate.id)
+					? 'preserved-other'
+					: this.gitHunkTouchesBaselineScope(candidate, originalHunk)
+						? 'candidate'
+						: 'outside-target-scope',
+			})),
+			preservedOtherHunkCount: preservedOtherIds.size,
+			outsideScopeCandidateCount,
+			referenceCompared: true,
+			matchesExpectedReference,
+			resolvedToIndex: matchesExpectedReference && candidates.length === 0,
 			candidateCount: candidates.length,
 			candidates: candidates.map((candidate) => ({
 				fingerprint: candidate.fingerprint,
@@ -3419,12 +3457,6 @@ export class ReviewController implements vscode.Disposable {
 		if (candidates.length === 0) {
 			return { ok: false, reason: 'no-candidate', diagnostics };
 		}
-		const withoutOriginalHunk = replaceLineBlock(
-			beforeText,
-			originalHunk.newStart,
-			originalHunk.newLines,
-			originalHunk.oldText,
-		);
 		const validGroups: Array<{ members: GitReviewHunk[]; undoText: string }> = [];
 		for (let start = 0; start < candidates.length; start += 1) {
 			for (let end = start; end < candidates.length; end += 1) {
@@ -3509,6 +3541,13 @@ export class ReviewController implements vscode.Disposable {
 				newStart: originalHunk.newStart,
 				newLines: originalHunk.newLines,
 			},
+			regeneratedHunkCount: 0,
+			regeneratedHunks: [],
+			preservedOtherHunkCount: 0,
+			outsideScopeCandidateCount: 0,
+			referenceCompared: false,
+			matchesExpectedReference: false,
+			resolvedToIndex: false,
 			candidateCount: 0,
 			candidates: [],
 			otherPendingCount,
