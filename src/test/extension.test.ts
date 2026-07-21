@@ -502,7 +502,8 @@ suite('Review controller bulk actions', () => {
 		assert.ok(source.includes('private async applyAiSuggestionCore'));
 		assert.ok(source.includes('private async undoAiSuggestionCore'));
 		assert.ok(source.includes('normalizeAiSuggestionReplacementText(suggestion.replacementText, hunk)'));
-		assert.ok(source.includes('appliedSuggestion.originalHunk.newText'));
+		assert.ok(source.includes('this.retainAppliedAiSuggestions'));
+		assert.ok(source.includes("console.error('[Cli Diff Review] AI suggestion mapping failed'"));
 		assert.ok(source.includes('appliedAiSuggestion'));
 		assert.ok(source.includes('aiReviewToResign = appliedSuggestion ? this.aiReviewStore.load(aiReviewSession) : undefined;'));
 		assert.ok(source.includes('await this.saveAiReviewWithCurrentSignature(aiReviewToResign'));
@@ -3414,13 +3415,105 @@ suite('AI review findings', () => {
 		});
 		const controller = Object.create(ReviewController.prototype) as any;
 		Object.assign(controller, { gitService: new GitService() });
-		const resolution = controller.findRegeneratedSuggestionHunks(file, original, [], before) as { members: GitReviewHunk[]; undoText: string };
+		const resolution = controller.findRegeneratedSuggestionHunks(file, original, [], before) as {
+			ok: boolean;
+			members?: GitReviewHunk[];
+			undoText?: string;
+		};
+		assert.strictEqual(resolution.ok, true);
+		assert.ok(resolution.members);
 		assert.strictEqual(resolution.members.length, 2);
 		assert.strictEqual(resolution.undoText, before);
 		const logical = controller.createLogicalSuggestionHunk(file, original, resolution.members, original.id) as GitReviewHunk;
 		assert.strictEqual(logical.memberHunks?.length, 2);
 		assert.strictEqual(logical.reviewItemId, original.id);
 		assert.ok(logical.id.startsWith('suggestion-'));
+	});
+
+	test('reports structured AI suggestion mapping failure reasons without source text', () => {
+		const uri = vscode.Uri.file('/repo/src/diagnostic.ts');
+		const baseline = 'old-secret\n';
+		const before = 'pending-secret\n';
+		const after = 'suggested-secret\n';
+		const original = computeLineDiff(uri.toString(), baseline, before)[0];
+		const candidateBase = computeLineDiff(uri.toString(), baseline, after)[0];
+		const candidate = {
+			...candidateBase,
+			layer: 'pending',
+			patch: 'patch-a',
+			fingerprint: 'candidate-a',
+			projectId: 'project',
+			occurrence: 0,
+		} as GitReviewHunk;
+		const controller = Object.create(ReviewController.prototype) as any;
+
+		const noCandidateFile = reviewFileState(uri, 'src/diagnostic.ts', { oldText: baseline, newText: after, hunks: [] });
+		const noCandidate = controller.findRegeneratedSuggestionHunks(noCandidateFile, original, [], before);
+		assert.strictEqual(noCandidate.ok, false);
+		assert.strictEqual(noCandidate.reason, 'no-candidate');
+		assert.strictEqual(noCandidate.diagnostics.candidateCount, 0);
+
+		const overlapFile = reviewFileState(uri, 'src/diagnostic.ts', { oldText: baseline, newText: after, hunks: [candidate] });
+		const overlap = controller.findRegeneratedSuggestionHunks(overlapFile, original, [original], before);
+		assert.strictEqual(overlap.ok, false);
+		assert.strictEqual(overlap.reason, 'other-hunk-overlap');
+		assert.ok(overlap.diagnostics.overlappingGroupCount > 0);
+
+		const duplicate = { ...candidate, id: 'candidate-b', patch: 'patch-b', fingerprint: 'candidate-b' };
+		const ambiguousFile = reviewFileState(uri, 'src/diagnostic.ts', { oldText: baseline, newText: after, hunks: [candidate, duplicate] });
+		const ambiguous = controller.findRegeneratedSuggestionHunks(ambiguousFile, original, [], before);
+		assert.strictEqual(ambiguous.ok, false);
+		assert.strictEqual(ambiguous.reason, 'ambiguous');
+		assert.strictEqual(ambiguous.diagnostics.validGroupCount, 3);
+		const serialized = JSON.stringify(ambiguous.diagnostics);
+		assert.strictEqual(serialized.includes('old-secret'), false);
+		assert.strictEqual(serialized.includes('pending-secret'), false);
+		assert.strictEqual(serialized.includes('suggested-secret'), false);
+
+		const multiBaseline = 'target-old-a\ntarget-old-b\nkeep-1\nkeep-2\nkeep-3\nother-old\n';
+		const multiBefore = 'target-pending-a\ntarget-pending-b\nkeep-1\nkeep-2\nkeep-3\nother-pending\n';
+		const [targetOriginal, otherOriginal] = computeLineDiff(uri.toString(), multiBaseline, multiBefore);
+		const partialCandidateBase = computeLineDiff(
+			uri.toString(),
+			multiBaseline,
+			'target-suggested-a\ntarget-old-b\nkeep-1\nkeep-2\nkeep-3\nother-old\n',
+		)[0];
+		const partialCandidate = {
+			...partialCandidateBase,
+			layer: 'pending',
+			patch: 'partial-patch',
+			fingerprint: 'partial-candidate',
+			projectId: 'project',
+		} as GitReviewHunk;
+		const targetResidualFile = reviewFileState(uri, 'src/diagnostic.ts', {
+			oldText: multiBaseline,
+			newText: 'target-suggested-a\ntarget-suggested-b\nkeep-1\nkeep-2\nkeep-3\nother-pending\n',
+			hunks: [partialCandidate],
+		});
+		const targetResidual = controller.findRegeneratedSuggestionHunks(targetResidualFile, targetOriginal, [], multiBefore);
+		assert.strictEqual(targetResidual.ok, false);
+		assert.strictEqual(targetResidual.reason, 'target-residual');
+
+		const fullCandidateBase = computeLineDiff(
+			uri.toString(),
+			multiBaseline,
+			'target-suggested-a\ntarget-suggested-b\nkeep-1\nkeep-2\nkeep-3\nother-old\n',
+		)[0];
+		const fullCandidate = {
+			...fullCandidateBase,
+			layer: 'pending',
+			patch: 'full-patch',
+			fingerprint: 'full-candidate',
+			projectId: 'project',
+		} as GitReviewHunk;
+		const otherResidualFile = reviewFileState(uri, 'src/diagnostic.ts', {
+			oldText: multiBaseline,
+			newText: 'target-suggested-a\ntarget-suggested-b\nkeep-1\nkeep-2\nkeep-3\nother-formatted\n',
+			hunks: [fullCandidate],
+		});
+		const otherResidual = controller.findRegeneratedSuggestionHunks(otherResidualFile, targetOriginal, [otherOriginal], multiBefore);
+		assert.strictEqual(otherResidual.ok, false);
+		assert.strictEqual(otherResidual.reason, 'other-hunk-residual');
 	});
 
 	test('keeps AI suggestions loadable after undoing an accepted AI suggestion chunk', async () => {
@@ -3467,16 +3560,13 @@ suite('AI review findings', () => {
 		assert.strictEqual(store.load(session)?.suggestions[0].id, 'suggestion-1');
 
 		source.acceptedHunks = [];
-		source.hunks = [originalHunk];
+		source.hunks = [appliedHunk];
 		const restoredSignature = reviewChangeSignature(session);
-		assert.notStrictEqual(restoredSignature, appliedSignature);
-		assert.strictEqual(store.load(session), undefined);
-
-		await store.save(session, { ...review, signature: restoredSignature });
+		assert.strictEqual(restoredSignature, appliedSignature);
 		assert.strictEqual(store.load(session)?.suggestions[0].id, 'suggestion-1');
 	});
 
-	test('file-level undo restores accepted AI suggestion chunks to their original pending text', async () => {
+	test('file-level undo keeps accepted AI suggestion text as pending', async () => {
 		const sourceUri = vscode.Uri.file('/repo/src/app.ts');
 		const originalHunk = computeLineDiff(sourceUri.toString(), 'old\n', 'new\n')[0];
 		const appliedHunk = { ...originalHunk, newText: 'suggested\n' };
@@ -3524,15 +3614,14 @@ suite('AI review findings', () => {
 
 		assert.strictEqual(source.acceptedHunks.length, 0);
 		assert.strictEqual(source.oldText, 'old\n');
-		assert.strictEqual(source.newText, 'new\n');
-		assert.strictEqual(harness.currentText(), 'new\n');
-		assert.deepStrictEqual(harness.writes, ['new\n']);
+		assert.strictEqual(source.newText, 'suggested\n');
+		assert.strictEqual(harness.currentText(), 'suggested\n');
+		assert.deepStrictEqual(harness.writes, []);
 		assert.strictEqual(source.hunks.length, 0);
-		assert.strictEqual(source.hunks.some((hunk) => hunk.newText.includes('suggested')), false);
 		assert.strictEqual(store.load(session)?.suggestions[0].id, 'suggestion-1');
 	});
 
-	test('file-level undo restores mixed accepted AI suggestion and rejected chunks in current order', async () => {
+	test('file-level undo keeps accepted AI suggestion while restoring rejected chunks', async () => {
 		const sourceUri = vscode.Uri.file('/repo/src/mixed.ts');
 		const baseline = 'old\nsame\nreject-old\n';
 		const pending = 'new\nsame\nreject-new\n';
@@ -3580,9 +3669,10 @@ suite('AI review findings', () => {
 		assert.strictEqual(source.acceptedHunks.length, 0);
 		assert.strictEqual(source.rejectedHunks.length, 0);
 		assert.strictEqual(source.oldText, baseline);
-		assert.strictEqual(source.newText, pending);
-		assert.strictEqual(harness.currentText(), pending);
-		assert.deepStrictEqual(harness.writes, [pending]);
+		const restored = 'suggested-a\nsuggested-b\nsame\nreject-new\n';
+		assert.strictEqual(source.newText, restored);
+		assert.strictEqual(harness.currentText(), restored);
+		assert.deepStrictEqual(harness.writes, [restored]);
 		assert.strictEqual(source.hunks.length, 0);
 	});
 });
@@ -4176,6 +4266,179 @@ suite('Git review journal', () => {
 			assert.strictEqual(restartedFile.acceptedHunks[0].memberHunks?.length, 2);
 			assert.strictEqual(restartedFile.acceptedHunks[0].reviewItemId, original.id);
 			await service.applyPatch(folder, restartedFile.acceptedHunks[0].patch ?? '', { cached: true, check: true });
+		} finally {
+			removeTempRepo(root);
+			fs.rmSync(storage, { recursive: true, force: true });
+		}
+	});
+
+	test('undoing an accepted suggestion keeps suggested text pending until suggestion undo', async function (this: Mocha.Context) {
+		this.timeout(10000);
+		const root = createTempGitRepo();
+		const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-layered-suggestion-undo-'));
+		try {
+			writeRepoFile(root, 'tracked.txt', 'old\n');
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+			writeRepoFile(root, 'tracked.txt', 'suggested\n');
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			const project = (await service.discoverProjects(folder))[0];
+			const pair = (await service.createFilePairs(folder))[0];
+			const suggestedHunk = pair.pendingHunks?.[0];
+			assert.ok(suggestedHunk);
+			const uri = vscode.Uri.file(path.join(root, 'tracked.txt'));
+			const originalHunk = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
+			const appliedSuggestion = {
+				suggestionId: 'suggestion-layered',
+				sourceHunkId: originalHunk.id,
+				currentHunkId: suggestedHunk.id,
+				reviewItemId: originalHunk.id,
+				originalHunk,
+				replacementText: 'suggested\n',
+				appliedHunk: suggestedHunk,
+				appliedHunks: [suggestedHunk],
+				appliedWorkingText: 'suggested\n',
+				undoWorkingText: 'new\n',
+				appliedAt: 1,
+			};
+			const context = { storageUri: vscode.Uri.file(storage), globalStorageUri: vscode.Uri.file(storage) } as vscode.ExtensionContext;
+			const journal = new GitReviewJournalStore(context);
+			const record = await journal.accept(
+				project,
+				project.headOid ?? '',
+				pair.relativePath,
+				uri,
+				suggestedHunk,
+				pair.gitSnapshot?.indexBlobOid,
+				appliedSuggestion,
+			);
+			const file = reviewFileState(uri, pair.relativePath, {
+				projectId: project.id,
+				oldText: pair.oldText,
+				newText: pair.newText,
+				hunks: [],
+				acceptedHunks: [journal.toAcceptedHunk(record, suggestedHunk)],
+				appliedAiSuggestions: [],
+				gitSnapshot: pair.gitSnapshot,
+				headOid: pair.headOid,
+			});
+			const session: ReviewSession = {
+				id: 'layered-suggestion-undo', mode: 'git', rootUri: vscode.Uri.file(root), createdAt: 1,
+				files: new Map([[uri.toString(), file]]), projects: [project],
+			};
+			const controller = Object.create(ReviewController.prototype) as any;
+			Object.assign(controller, {
+				activeSession: session,
+				gitService: service,
+				gitReviewJournal: journal,
+				aiReviewStore: { load: () => undefined, save: async () => undefined, clear: async () => undefined },
+				isOpenDocumentDirty: () => false,
+				refreshUi: () => undefined,
+				syncNativeReviewAfterMutation: async () => undefined,
+				refreshReviewPresentation: () => undefined,
+				refreshLlmWikiDashboardState: async () => undefined,
+				writeCurrentFileText: async (_uri: vscode.Uri, text: string) => writeRepoFile(root, 'tracked.txt', text),
+			});
+
+			await controller.restoreChangeCore(uri.toString(), record.id, file.revision);
+			let restored = session.files.get(uri.toString());
+			assert.strictEqual(fs.readFileSync(path.join(root, 'tracked.txt'), 'utf8'), 'suggested\n');
+			assert.strictEqual(restored?.acceptedHunks.length, 0);
+			assert.strictEqual(restored?.hunks.length, 1);
+			assert.strictEqual(restored?.hunks[0].newText, 'suggested\n');
+			assert.strictEqual(restored?.appliedAiSuggestions.length, 1);
+
+			await controller.undoAiSuggestionCore(uri.toString(), restored?.hunks[0].id, appliedSuggestion.suggestionId);
+			restored = session.files.get(uri.toString());
+			assert.strictEqual(fs.readFileSync(path.join(root, 'tracked.txt'), 'utf8'), 'new\n');
+			assert.strictEqual(restored?.hunks.length, 1);
+			assert.strictEqual(restored?.hunks[0].newText, 'new\n');
+			assert.strictEqual(restored?.appliedAiSuggestions.length, 0);
+		} finally {
+			removeTempRepo(root);
+			fs.rmSync(storage, { recursive: true, force: true });
+		}
+	});
+
+	test('undoing a rejected suggestion restores suggested text and its applied state', async function (this: Mocha.Context) {
+		this.timeout(10000);
+		const root = createTempGitRepo();
+		const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-layered-reject-undo-'));
+		try {
+			writeRepoFile(root, 'tracked.txt', 'old\n');
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+			writeRepoFile(root, 'tracked.txt', 'suggested\n');
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			const project = (await service.discoverProjects(folder))[0];
+			const pair = (await service.createFilePairs(folder))[0];
+			const suggestedHunk = pair.pendingHunks?.[0];
+			assert.ok(suggestedHunk);
+			const uri = vscode.Uri.file(path.join(root, 'tracked.txt'));
+			const originalHunk = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
+			const appliedSuggestion = {
+				suggestionId: 'suggestion-rejected',
+				sourceHunkId: originalHunk.id,
+				currentHunkId: suggestedHunk.id,
+				reviewItemId: originalHunk.id,
+				originalHunk,
+				replacementText: 'suggested\n',
+				appliedHunk: suggestedHunk,
+				appliedHunks: [suggestedHunk],
+				appliedWorkingText: 'suggested\n',
+				undoWorkingText: 'new\n',
+				appliedAt: 1,
+			};
+			const context = { storageUri: vscode.Uri.file(storage), globalStorageUri: vscode.Uri.file(storage) } as vscode.ExtensionContext;
+			const journal = new GitReviewJournalStore(context);
+			const record = await journal.prepare(
+				project,
+				project.headOid ?? '',
+				pair.relativePath,
+				uri,
+				suggestedHunk,
+				await fileStateHash(uri),
+				expectedRejectedFileHash(pair.newText, suggestedHunk, pair.gitSnapshot?.indexExists ?? true),
+				appliedSuggestion,
+			);
+			await service.applyPatch(folder, suggestedHunk.patch, { reverse: true });
+			await journal.setState(project, project.headOid ?? '', record.id, 'applied');
+
+			const restartedJournal = new GitReviewJournalStore(context);
+			const files = new Map<string, ReviewFileState>();
+			const controller = Object.create(ReviewController.prototype) as any;
+			Object.assign(controller, {
+				gitService: service,
+				gitReviewJournal: restartedJournal,
+				aiReviewStore: { load: () => undefined, save: async () => undefined, clear: async () => undefined },
+				isOpenDocumentDirty: () => false,
+				refreshUi: () => undefined,
+				syncNativeReviewAfterMutation: async () => undefined,
+				synchronizeOpenDocumentAfterGitMutation: async () => undefined,
+				humanEditBatches: new Map(),
+				humanSaveIntents: new Map(),
+				internalWriteDepth: new Map(),
+				writeGraceUntil: new Map(),
+				showError: (error: unknown) => { throw error; },
+			});
+			await controller.attachRejectedJournals(files, [project]);
+			const rejectedFile = files.get(uri.toString());
+			assert.ok(rejectedFile);
+			const session: ReviewSession = {
+				id: 'layered-reject-undo', mode: 'git', rootUri: vscode.Uri.file(root), createdAt: 1,
+				files, projects: [project],
+			};
+			controller.activeSession = session;
+
+			await controller.restoreChangeCore(uri.toString(), rejectedFile.rejectedHunks[0].id, rejectedFile.revision);
+			const restored = session.files.get(uri.toString());
+			assert.strictEqual(fs.readFileSync(path.join(root, 'tracked.txt'), 'utf8'), 'suggested\n');
+			assert.strictEqual(restored?.rejectedHunks.length, 0);
+			assert.strictEqual(restored?.hunks.length, 1);
+			assert.strictEqual(restored?.hunks[0].newText, 'suggested\n');
+			assert.strictEqual(restored?.appliedAiSuggestions.length, 1);
 		} finally {
 			removeTempRepo(root);
 			fs.rmSync(storage, { recursive: true, force: true });
