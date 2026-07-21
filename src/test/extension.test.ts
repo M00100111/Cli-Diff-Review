@@ -4122,6 +4122,87 @@ suite('Git review journal', () => {
 		}
 	});
 
+	test('keeps AI findings and suggestions attached after rejecting an entire file', async function (this: Mocha.Context) {
+		this.timeout(10000);
+		const root = createTempGitRepo();
+		const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-file-reject-ai-'));
+		try {
+			const middle = Array.from({ length: 10 }, (_, index) => `keep-${index}\n`).join('');
+			writeRepoFile(root, 'tracked.txt', `old-top\n${middle}old-bottom\n`);
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+			writeRepoFile(root, 'tracked.txt', `new-top\n${middle}new-bottom\n`);
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			const project = (await service.discoverProjects(folder))[0];
+			const pair = (await service.createFilePairs(folder))[0];
+			const hunks = pair.pendingHunks ?? [];
+			assert.strictEqual(hunks.length, 2);
+			const uri = pair.uri;
+			const file = reviewFileState(uri, pair.relativePath, {
+				projectId: project.id,
+				oldText: pair.oldText,
+				newText: pair.newText,
+				hunks,
+				gitSnapshot: pair.gitSnapshot,
+				headOid: pair.headOid,
+			});
+			const session: ReviewSession = {
+				id: 'file-reject-ai', mode: 'git', rootUri: vscode.Uri.file(root), createdAt: 1,
+				files: new Map([[uri.toString(), file]]), projects: [project],
+			};
+			const memento = new TestMemento();
+			const aiStore = new AiReviewStore(memento as unknown as vscode.Memento);
+			const review = storedAiReview({
+				signature: reviewChangeSignature(session),
+				findings: hunks.map((hunk, index) => aiReviewFinding(uri, pair.relativePath, hunk, `finding-${index}`, index)),
+				suggestions: hunks.map((hunk, index) => aiReviewSuggestion(uri, pair.relativePath, hunk, `suggestion-${index}`, index)),
+				completedFiles: [uri.toString()],
+			});
+			await aiStore.save(session, review);
+			const context = { storageUri: vscode.Uri.file(storage), globalStorageUri: vscode.Uri.file(storage) } as vscode.ExtensionContext;
+			const journal = new GitReviewJournalStore(context);
+			const controller = Object.create(ReviewController.prototype) as any;
+			Object.assign(controller, {
+				activeSession: session,
+				gitService: service,
+				gitReviewJournal: journal,
+				aiReviewStore: aiStore,
+				isOpenDocumentDirty: () => false,
+				refreshUi: () => undefined,
+				syncNativeReviewAfterMutation: async () => undefined,
+				synchronizeOpenDocumentAfterGitMutation: async () => undefined,
+				humanEditBatches: new Map(),
+				humanSaveIntents: new Map(),
+				internalWriteDepth: new Map(),
+				writeGraceUntil: new Map(),
+				showError: (error: unknown) => { throw error; },
+			});
+
+			await controller.rejectFileCore(file, file.revision);
+			const rejectedFile = session.files.get(uri.toString());
+			assert.ok(rejectedFile);
+			assert.strictEqual(rejectedFile.rejectedHunks.length, 2);
+			assert.strictEqual(rejectedFile.gitSnapshot?.indexBlobOid, pair.gitSnapshot?.indexBlobOid);
+			assert.strictEqual(reviewChangeSignature(session), review.signature);
+			const restoredReview = aiStore.load(session);
+			assert.strictEqual(restoredReview?.findings.length, 2);
+			assert.strictEqual(restoredReview?.suggestions.length, 2);
+			const records = (await journal.load(project, project.headOid ?? '')).records;
+			assert.ok(records.every((record) => record.kind !== 'reject' || record.indexBlobOid === pair.gitSnapshot?.indexBlobOid));
+			const payload = buildReviewDashboardPayload(session, uri, () => false, {
+				...defaultLlmWikiDashboardState(),
+				reviewFindings: restoredReview?.findings ?? [],
+				reviewSuggestions: restoredReview?.suggestions ?? [],
+			});
+			assert.strictEqual(payload.files[0].chunks.length, 2);
+			assert.ok(payload.files[0].chunks.every((chunk) => chunk.findings.length === 1 && chunk.suggestions.length === 1));
+		} finally {
+			removeTempRepo(root);
+			fs.rmSync(storage, { recursive: true, force: true });
+		}
+	});
+
 	test('persists accepted decisions without staging and flushes them on manual refresh', async function (this: Mocha.Context) {
 		this.timeout(10000);
 		const root = createTempGitRepo();

@@ -12,6 +12,7 @@ export interface GitIndexEntry {
 	exists: boolean;
 	text: string;
 	mode: string;
+	oid?: string;
 }
 
 export interface GitApplyOptions {
@@ -298,7 +299,8 @@ export class GitService {
 				return { exists: false, text: '', mode: '100644' };
 			}
 			const mode = listing.match(/^(\d{6})\s+/)?.[1] ?? '100644';
-			return { exists: true, text: await this.gitInPath(rootPath, ['show', `:${relativePath}`]), mode };
+			const oid = listing.match(/^\d{6}\s+([0-9a-f]{40,64})\s+/i)?.[1];
+			return { exists: true, text: await this.gitInPath(rootPath, ['show', `:${relativePath}`]), mode, oid };
 		} catch {
 			return { exists: false, text: '', mode: '100644' };
 		}

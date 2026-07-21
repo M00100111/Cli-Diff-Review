@@ -450,8 +450,10 @@ export class ReviewController implements vscode.Disposable {
 	): Promise<void> {
 		let headChanged = false;
 		for (const project of projects) {
-			const headOid = project.headOid ?? await this.gitService.headOid(reviewProjectFolder(project));
+			const folder = reviewProjectFolder(project);
+			const headOid = project.headOid ?? await this.gitService.headOid(folder);
 			project.headOid = headOid;
+			const indexEntries = new Map<string, { exists: boolean; text: string; mode: string; oid?: string }>();
 			const loaded = await this.gitReviewJournal.load(project, headOid);
 			headChanged ||= loaded.headChanged;
 			if (loaded.headChanged) {
@@ -516,21 +518,38 @@ export class ReviewController implements vscode.Disposable {
 					file.acceptedHunks.push(accepted);
 					continue;
 				}
+				let indexEntry = indexEntries.get(record.relativePath);
+				if (!indexEntry) {
+					indexEntry = await this.gitService.readIndexEntry(folder, record.relativePath);
+					indexEntries.set(record.relativePath, indexEntry);
+				}
+				const indexIdentityChanged = (record.indexExists !== undefined && record.indexExists !== indexEntry.exists)
+					|| (record.indexBlobOid !== undefined && record.indexBlobOid !== indexEntry.oid);
+				if (indexIdentityChanged && record.state !== 'stale') {
+					record.state = 'stale';
+					await this.gitReviewJournal.setState(project, headOid, record.id, 'stale');
+				}
 				if (!file) {
 					const current = await this.readCurrentText(uri, { preferDisk: true });
-					file = this.createManualBaselineFileState(uri, current.text);
+					file = this.createManualBaselineFileState(uri, indexEntry.text);
 					file.relativePath = record.relativePath;
 					file.projectId = project.id;
 					file.projectName = project.name;
+					file.oldText = indexEntry.text;
+					file.newText = current.text;
+					file.originalText = indexEntry.text;
+					file.originalExists = indexEntry.exists;
+					file.baselineExists = indexEntry.exists;
 					file.currentExists = current.exists;
 					file.headOid = headOid;
 					file.gitSnapshot = {
-						headText: current.text,
-						indexText: current.text,
+						headText: indexEntry.text,
+						indexText: indexEntry.text,
 						workingText: current.text,
-						headExists: current.exists,
-						indexExists: current.exists,
+						headExists: indexEntry.exists,
+						indexExists: indexEntry.exists,
 						workingExists: current.exists,
+						indexBlobOid: indexEntry.oid,
 					};
 					files.set(key, file);
 				}
@@ -826,6 +845,10 @@ export class ReviewController implements vscode.Disposable {
 				beforeHash,
 				afterHash,
 				appliedAiSuggestion,
+				{
+					exists: target.file.gitSnapshot?.indexExists ?? target.file.baselineExists,
+					oid: target.file.gitSnapshot?.indexBlobOid,
+				},
 			);
 			let applied = false;
 			try {
@@ -1096,6 +1119,7 @@ export class ReviewController implements vscode.Disposable {
 						beforeHash,
 						afterHash,
 						file.appliedAiSuggestions.find((suggestion) => suggestion.currentHunkId === hunk.id),
+						{ exists: file.gitSnapshot.indexExists, oid: file.gitSnapshot.indexBlobOid },
 					));
 				}
 				const patch = this.gitService.combinePatches(hunks);
@@ -1369,6 +1393,10 @@ export class ReviewController implements vscode.Disposable {
 						beforeHash,
 						afterHash,
 						file.appliedAiSuggestions.find((suggestion) => suggestion.currentHunkId === hunk.id),
+						{
+							exists: file.gitSnapshot?.indexExists ?? file.baselineExists,
+							oid: file.gitSnapshot?.indexBlobOid,
+						},
 					));
 				}
 			}

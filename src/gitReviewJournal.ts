@@ -18,6 +18,8 @@ export interface RejectJournalRecord {
 	state: RejectJournalState;
 	beforeHash: string;
 	afterHash: string;
+	indexExists?: boolean;
+	indexBlobOid?: string;
 	createdAt: number;
 	sourceHunkId?: string;
 	reviewItemId?: string;
@@ -179,6 +181,7 @@ export class GitReviewJournalStore {
 		beforeHash: string,
 		afterHash: string,
 		appliedAiSuggestion?: AppliedAiSuggestion,
+		indexIdentity?: { exists: boolean; oid?: string },
 	): Promise<RejectJournalRecord> {
 		const loaded = await this.load(project, headOid);
 		const record: RejectJournalRecord = {
@@ -193,6 +196,8 @@ export class GitReviewJournalStore {
 			state: 'prepared',
 			beforeHash,
 			afterHash,
+			indexExists: indexIdentity?.exists,
+			indexBlobOid: indexIdentity?.oid,
 			createdAt: Date.now(),
 			sourceHunkId: hunk.sourceHunkId ?? appliedAiSuggestion?.sourceHunkId ?? hunk.id,
 			reviewItemId: hunk.reviewItemId ?? appliedAiSuggestion?.reviewItemId ?? appliedAiSuggestion?.sourceHunkId ?? hunk.id,
