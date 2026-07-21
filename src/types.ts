@@ -33,6 +33,9 @@ export interface ReviewHunk {
 	projectId?: string;
 	occurrence?: number;
 	operable?: boolean;
+	sourceHunkId?: string;
+	reviewItemId?: string;
+	memberHunks?: GitReviewHunk[];
 }
 
 export interface GitReviewHunk extends ReviewHunk {
@@ -71,9 +74,14 @@ export interface AppliedAiSuggestion {
 	suggestionId: string;
 	sourceHunkId: string;
 	currentHunkId: string;
+	reviewItemId?: string;
 	originalHunk: ReviewHunk;
 	replacementText: string;
 	appliedHunk: ReviewHunk;
+	appliedHunks?: ReviewHunk[];
+	appliedText?: string;
+	appliedWorkingText?: string;
+	undoWorkingText?: string;
 	appliedAt: number;
 }
 

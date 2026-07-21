@@ -19,6 +19,9 @@ export interface RejectJournalRecord {
 	beforeHash: string;
 	afterHash: string;
 	createdAt: number;
+	sourceHunkId?: string;
+	reviewItemId?: string;
+	memberHunks?: GitReviewHunk[];
 	appliedAiSuggestion?: AppliedAiSuggestion;
 }
 
@@ -34,6 +37,9 @@ export interface AcceptJournalRecord {
 	state: AcceptJournalState;
 	indexBlobOid?: string;
 	createdAt: number;
+	sourceHunkId?: string;
+	reviewItemId?: string;
+	memberHunks?: GitReviewHunk[];
 	appliedAiSuggestion?: AppliedAiSuggestion;
 }
 
@@ -155,6 +161,9 @@ export class GitReviewJournalStore {
 			state: 'reviewed',
 			indexBlobOid,
 			createdAt: Date.now(),
+			sourceHunkId: hunk.sourceHunkId ?? appliedAiSuggestion?.sourceHunkId ?? hunk.id,
+			reviewItemId: hunk.reviewItemId ?? appliedAiSuggestion?.reviewItemId ?? appliedAiSuggestion?.sourceHunkId ?? hunk.id,
+			memberHunks: hunk.memberHunks ?? [hunk],
 			appliedAiSuggestion,
 		};
 		await this.write(project, headOid, [...loaded.records, record]);
@@ -185,6 +194,9 @@ export class GitReviewJournalStore {
 			beforeHash,
 			afterHash,
 			createdAt: Date.now(),
+			sourceHunkId: hunk.sourceHunkId ?? appliedAiSuggestion?.sourceHunkId ?? hunk.id,
+			reviewItemId: hunk.reviewItemId ?? appliedAiSuggestion?.reviewItemId ?? appliedAiSuggestion?.sourceHunkId ?? hunk.id,
+			memberHunks: hunk.memberHunks ?? [hunk],
 			appliedAiSuggestion,
 		};
 		await this.write(project, headOid, [...loaded.records, record]);
@@ -221,6 +233,9 @@ export class GitReviewJournalStore {
 			...reviewedHunkFromGit({ ...record.hunk, layer: 'rejected', patch: record.patch }, 'reject', record.createdAt),
 			id: record.id,
 			operable: record.state === 'applied',
+			sourceHunkId: record.sourceHunkId ?? record.hunk.sourceHunkId ?? record.hunk.id,
+			reviewItemId: record.reviewItemId ?? record.sourceHunkId ?? record.hunk.id,
+			memberHunks: record.memberHunks ?? record.hunk.memberHunks ?? [record.hunk],
 			appliedAiSuggestion: record.appliedAiSuggestion,
 		};
 	}
@@ -230,6 +245,9 @@ export class GitReviewJournalStore {
 			...reviewedHunkFromGit({ ...current, layer: 'accepted', patch: record.patch }, 'accept', record.createdAt),
 			id: record.id,
 			operable: record.state === 'reviewed',
+			sourceHunkId: record.sourceHunkId ?? record.hunk.sourceHunkId ?? record.hunk.id,
+			reviewItemId: record.reviewItemId ?? record.sourceHunkId ?? record.hunk.id,
+			memberHunks: record.memberHunks ?? record.hunk.memberHunks ?? [record.hunk],
 			appliedAiSuggestion: record.appliedAiSuggestion,
 		};
 	}

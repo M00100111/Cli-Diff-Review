@@ -33,7 +33,7 @@ import {
 	SerialOperationQueue,
 } from '../reviewState';
 import { replaceLineBlock, splitLines } from '../text';
-import { FilePair, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewProject, ReviewSession, visibleReviewFiles } from '../types';
+import { FilePair, GitReviewHunk, ReviewedHunk, ReviewFileState, ReviewHunk, ReviewProject, ReviewSession, visibleReviewFiles } from '../types';
 import { agentsGuidanceEndMarker, agentsGuidanceStartMarker, mergeManagedAgentsGuidance, removeManagedAgentsGuidanceBlock } from '../wiki/agentsGuidance';
 import { normalizeWikiFilePath, validateWikiInitializationResponse, WikiInitializationService } from '../wiki/wikiInitializer';
 import { WikiStateService } from '../wiki/state';
@@ -1110,6 +1110,24 @@ suite('Review state', () => {
 		assert.strictEqual(reviewedFindingChunk?.suggestions[0].replacementText, 'better reviewed\n');
 		assert.strictEqual(reviewedFindingChunk?.appliedSuggestion?.suggestionId, 'suggestion-reviewed');
 		assert.strictEqual(otherFileChunk?.findings[0].title, 'Other file finding');
+
+		const journalAccepted = {
+			...reviewedHunkFrom(reviewedHunk, 'accept'),
+			id: 'journal-random-id',
+			sourceHunkId: reviewedHunk.id,
+			reviewItemId: reviewedHunk.id,
+		};
+		session.files.set(reviewedUri.toString(), reviewFileState(reviewedUri, 'src/reviewed.ts', {
+			acceptedHunks: [journalAccepted],
+		}));
+		const journalAcceptedPayload = buildReviewDashboardPayload(session, reviewedUri, () => false, {
+			...defaultLlmWikiDashboardState(),
+			reviewFindings: [aiReviewFinding(reviewedUri, 'src/reviewed.ts', reviewedHunk, 'journal-finding', 0)],
+		});
+		const journalAcceptedFile = journalAcceptedPayload.files.find((file) => file.relativePath === 'src/reviewed.ts');
+		assert.strictEqual(journalAcceptedFile?.chunks.length, 1);
+		assert.strictEqual(journalAcceptedFile?.chunks[0].hunkId, 'journal-random-id');
+		assert.strictEqual(journalAcceptedFile?.chunks[0].findings[0].title, 'Finding');
 	});
 
 	test('maps AI review related hunk ids to dashboard related chunks', () => {
@@ -1379,12 +1397,13 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes("type: 'applyAiSuggestion'"));
 		assert.strictEqual(view.webview.html.includes("type: applied ? 'undoAiSuggestion' : 'applyAiSuggestion'"), false);
 		assert.ok(view.webview.html.includes('review-file-result'));
-		assert.ok(view.webview.html.includes("details.setAttribute('open', '')"));
-		assert.ok(view.webview.html.includes('const reviewChunkOpenStates = new Map()'));
-		assert.ok(view.webview.html.includes('details.dataset.reviewChunkKey = chunkKey'));
-		assert.ok(view.webview.html.includes('reviewChunkOpenStates.has(chunkKey)'));
-		assert.ok(view.webview.html.includes("details.addEventListener('toggle'"));
-		assert.ok(view.webview.html.includes('reviewChunkOpenStates.set(chunkKey, details.open)'));
+		assert.strictEqual(view.webview.html.includes("details.setAttribute('open', '')"), false);
+		assert.strictEqual(view.webview.html.includes('reviewChunkOpenStates'), false);
+		assert.strictEqual(view.webview.html.includes("const details = document.createElement(expandable ? 'details' : 'div')"), false);
+		assert.strictEqual(view.webview.html.includes('id="findings"'), false);
+		assert.strictEqual(view.webview.html.includes('function renderFindings'), false);
+		assert.strictEqual(view.webview.html.includes('findings for current file'), false);
+		assert.ok(view.webview.html.includes("const container = document.createElement('div')"));
 		assert.strictEqual(view.webview.html.includes('No findings for this chunk.'), false);
 		assert.ok(view.webview.html.includes("chunk.reviewStatus === 'reviewed'"));
 		assert.strictEqual(view.webview.html.includes('review-chunk-preview'), false);
@@ -3320,6 +3339,90 @@ suite('AI review findings', () => {
 		assert.strictEqual(store.load(session), undefined);
 	});
 
+	test('keeps AI review and stable chunk identities when Reject shifts later hunks', () => {
+		const uri = vscode.Uri.file('/repo/src/shifted.ts');
+		const baseline = 'one\nkeep-a\nkeep-b\nkeep-c\nold-two\n';
+		const working = 'ONE\nkeep-a\nkeep-b\nkeep-c\nTWO\n';
+		const hunks = computeLineDiff(uri.toString(), baseline, working);
+		assert.strictEqual(hunks.length, 2);
+		const previous = reviewFileState(uri, 'src/shifted.ts', { hunks });
+		const beforeSession: ReviewSession = {
+			id: 'before-reject',
+			mode: 'git',
+			rootUri: vscode.Uri.file('/repo'),
+			createdAt: 1,
+			files: new Map([[uri.toString(), previous]]),
+		};
+		const signature = reviewChangeSignature(beforeSession);
+		const shiftedSecond = {
+			...hunks[1],
+			id: 'regenerated-second',
+			newStart: Math.max(0, hunks[1].newStart - 1),
+		};
+		const rejectedFirst = {
+			...reviewedHunkFrom(hunks[0], 'reject'),
+			id: 'reject-record',
+			sourceHunkId: hunks[0].id,
+			reviewItemId: hunks[0].id,
+		};
+		const current = reviewFileState(uri, 'src/shifted.ts', {
+			hunks: [shiftedSecond],
+			rejectedHunks: [rejectedFirst],
+		});
+		const afterSession: ReviewSession = { ...beforeSession, id: 'after-reject', files: new Map([[uri.toString(), current]]) };
+		assert.strictEqual(reviewChangeSignature(afterSession), signature);
+		const controller = Object.create(ReviewController.prototype) as any;
+		controller.restoreStableReviewItemIdentities(current, previous);
+		assert.strictEqual(current.hunks[0].sourceHunkId, hunks[1].id);
+		assert.strictEqual(current.hunks[0].reviewItemId, hunks[1].id);
+		const payload = buildReviewDashboardPayload(afterSession, uri, () => false, {
+			...defaultLlmWikiDashboardState(),
+			reviewFindings: [aiReviewFinding(uri, 'src/shifted.ts', hunks[1], 'shifted-finding', 0)],
+		});
+		const shiftedChunk = payload.files[0].chunks.find((chunk) => chunk.hunkId === shiftedSecond.id);
+		assert.strictEqual(shiftedChunk?.findings[0].title, 'Finding');
+	});
+
+	test('maps a suggestion split by Git into one logical chunk using file-state validation', () => {
+		const uri = vscode.Uri.file('/repo/src/split.ts');
+		const middle = Array.from({ length: 8 }, (_, index) => `old-${index}\n`);
+		const baseline = ['head\n', 'old-top\n', ...middle, 'old-bottom\n', 'tail\n'].join('');
+		const before = ['head\n', 'new-top\n', ...middle.map((_, index) => `changed-${index}\n`), 'new-bottom\n', 'tail\n'].join('');
+		const after = ['head\n', 'new-top\n', ...middle, 'new-bottom\n', 'tail\n'].join('');
+		const original = computeLineDiff(uri.toString(), baseline, before)[0];
+		const members = computeLineDiff(uri.toString(), baseline, after).map((hunk, index): GitReviewHunk => ({
+			...hunk,
+			layer: 'pending',
+			patch: `patch-${index}`,
+			fingerprint: `fingerprint-${index}`,
+			projectId: 'project',
+			occurrence: 0,
+		}));
+		assert.strictEqual(members.length, 2);
+		const file = reviewFileState(uri, 'src/split.ts', {
+			oldText: baseline,
+			newText: after,
+			hunks: members,
+			gitSnapshot: {
+				headText: baseline,
+				indexText: baseline,
+				workingText: after,
+				headExists: true,
+				indexExists: true,
+				workingExists: true,
+			},
+		});
+		const controller = Object.create(ReviewController.prototype) as any;
+		Object.assign(controller, { gitService: new GitService() });
+		const resolution = controller.findRegeneratedSuggestionHunks(file, original, [], before) as { members: GitReviewHunk[]; undoText: string };
+		assert.strictEqual(resolution.members.length, 2);
+		assert.strictEqual(resolution.undoText, before);
+		const logical = controller.createLogicalSuggestionHunk(file, original, resolution.members, original.id) as GitReviewHunk;
+		assert.strictEqual(logical.memberHunks?.length, 2);
+		assert.strictEqual(logical.reviewItemId, original.id);
+		assert.ok(logical.id.startsWith('suggestion-'));
+	});
+
 	test('keeps AI suggestions loadable after undoing an accepted AI suggestion chunk', async () => {
 		const sourceUri = vscode.Uri.file('/repo/src/app.ts');
 		const originalHunk = computeLineDiff(sourceUri.toString(), 'old\n', 'new\n')[0];
@@ -3877,6 +3980,9 @@ suite('Git review journal', () => {
 			const context = { storageUri: vscode.Uri.file(storage), globalStorageUri: vscode.Uri.file(storage) } as vscode.ExtensionContext;
 			const journal = new GitReviewJournalStore(context);
 			const record = await journal.accept(project, project.headOid ?? '', pair.relativePath, uri, hunk, pair.gitSnapshot?.indexBlobOid);
+			assert.strictEqual(record.sourceHunkId, hunk.id);
+			assert.strictEqual(record.reviewItemId, hunk.id);
+			assert.strictEqual(record.memberHunks?.length, 1);
 
 			assert.strictEqual((await service.readIndexEntry(folder, 'tracked.txt')).text, 'old\n');
 			const restored = await new GitReviewJournalStore(context).load(project, project.headOid ?? '');
@@ -3995,6 +4101,81 @@ suite('Git review journal', () => {
 			assert.strictEqual(file.hunks.length, 0);
 			assert.strictEqual(file.acceptedHunks.length, 1);
 			assert.strictEqual(file.acceptedHunks[0].status, 'accepted');
+		} finally {
+			removeTempRepo(root);
+			fs.rmSync(storage, { recursive: true, force: true });
+		}
+	});
+
+	test('reattaches every member of an accepted logical suggestion chunk after restart', async function (this: Mocha.Context) {
+		this.timeout(10000);
+		const root = createTempGitRepo();
+		const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-logical-accepted-'));
+		try {
+			const middle = Array.from({ length: 8 }, (_, index) => `old-${index}\n`);
+			const baseline = ['head\n', 'old-top\n', ...middle, 'old-bottom\n', 'tail\n'].join('');
+			const before = ['head\n', 'new-top\n', ...middle.map((_, index) => `changed-${index}\n`), 'new-bottom\n', 'tail\n'].join('');
+			const after = ['head\n', 'new-top\n', ...middle, 'new-bottom\n', 'tail\n'].join('');
+			writeRepoFile(root, 'tracked.txt', baseline);
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+			writeRepoFile(root, 'tracked.txt', after);
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			const project = (await service.discoverProjects(folder))[0];
+			const pair = (await service.createFilePairs(folder))[0];
+			const members = pair.pendingHunks ?? [];
+			assert.strictEqual(members.length, 2);
+			const uri = vscode.Uri.file(path.join(root, 'tracked.txt'));
+			const file = reviewFileState(uri, pair.relativePath, {
+				projectId: project.id,
+				oldText: pair.oldText,
+				newText: pair.newText,
+				hunks: members,
+				gitSnapshot: pair.gitSnapshot,
+				headOid: pair.headOid,
+			});
+			const original = computeLineDiff(uri.toString(), baseline, before)[0];
+			const controller = Object.create(ReviewController.prototype) as any;
+			Object.assign(controller, { gitService: service });
+			const logical = controller.createLogicalSuggestionHunk(file, original, members, original.id) as GitReviewHunk;
+			const appliedSuggestion = {
+				suggestionId: 'suggestion-logical',
+				sourceHunkId: original.id,
+				currentHunkId: logical.id,
+				reviewItemId: original.id,
+				originalHunk: original,
+				replacementText: logical.newText,
+				appliedHunk: logical,
+				appliedHunks: members,
+				appliedText: logical.newText,
+				appliedAt: 1,
+			};
+			const context = { storageUri: vscode.Uri.file(storage), globalStorageUri: vscode.Uri.file(storage) } as vscode.ExtensionContext;
+			const journal = new GitReviewJournalStore(context);
+			await journal.accept(project, project.headOid ?? '', pair.relativePath, uri, logical, pair.gitSnapshot?.indexBlobOid, appliedSuggestion);
+
+			const restartedFile = reviewFileState(uri, pair.relativePath, {
+				projectId: project.id,
+				oldText: pair.oldText,
+				newText: pair.newText,
+				hunks: members,
+				gitSnapshot: pair.gitSnapshot,
+				headOid: pair.headOid,
+			});
+			const restartedController = Object.create(ReviewController.prototype) as any;
+			Object.assign(restartedController, {
+				gitService: service,
+				gitReviewJournal: new GitReviewJournalStore(context),
+				aiReviewStore: { clear: async () => undefined },
+			});
+			await restartedController.attachRejectedJournals(new Map([[uri.toString(), restartedFile]]), [project]);
+
+			assert.strictEqual(restartedFile.hunks.length, 0);
+			assert.strictEqual(restartedFile.acceptedHunks.length, 1);
+			assert.strictEqual(restartedFile.acceptedHunks[0].memberHunks?.length, 2);
+			assert.strictEqual(restartedFile.acceptedHunks[0].reviewItemId, original.id);
+			await service.applyPatch(folder, restartedFile.acceptedHunks[0].patch ?? '', { cached: true, check: true });
 		} finally {
 			removeTempRepo(root);
 			fs.rmSync(storage, { recursive: true, force: true });

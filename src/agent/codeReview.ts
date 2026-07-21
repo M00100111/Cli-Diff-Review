@@ -1176,10 +1176,6 @@ function sourceReviewFiles(session: ReviewSession): ReviewFileState[] {
 function stableReviewHunkSignature(hunk: ReviewHunk): Record<string, unknown> {
 	return {
 		kind: hunk.kind,
-		oldStart: hunk.oldStart,
-		oldLines: hunk.oldLines,
-		newStart: hunk.newStart,
-		newLines: hunk.newLines,
 		oldText: hunk.oldText,
 		newText: hunk.newText,
 	};

@@ -606,8 +606,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		.wiki-logo[hidden],
 		.wiki-action[hidden],
 		.wiki-run-list[hidden],
-		.review-file-detail[hidden],
-		.findings[hidden] { display: none; }
+		.review-file-detail[hidden] { display: none; }
 		.wiki-field {
 			display: flex;
 			flex-direction: column;
@@ -837,28 +836,6 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			font-size: 11px;
 			line-height: 1.35;
 		}
-		.findings {
-			display: flex;
-			flex-direction: column;
-			gap: 3px;
-			max-height: min(42vh, 360px);
-			overflow: auto;
-		}
-		.finding {
-			display: grid;
-			grid-template-columns: 7px minmax(0, 1fr);
-			gap: 6px;
-			padding: 5px 6px;
-			border: 1px solid var(--tree-border);
-			border-radius: 3px;
-			text-align: left;
-		}
-		.finding-marker { width: 7px; height: 7px; margin-top: 4px; border-radius: 50%; background: var(--muted); }
-		.finding.error .finding-marker { background: var(--vscode-errorForeground); }
-		.finding.warning .finding-marker { background: var(--vscode-editorWarning-foreground); }
-		.finding.suggestion .finding-marker { background: var(--vscode-editorInfo-foreground); }
-		.finding-title { display: block; font-weight: 600; overflow-wrap: anywhere; }
-		.finding-detail { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; line-height: 1.3; overflow-wrap: anywhere; }
 		.review-file-detail {
 			display: flex;
 			flex-direction: column;
@@ -923,18 +900,6 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		.review-chunk.has-suggestion {
 			box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 65%, transparent);
 		}
-		.review-chunk[open] {
-			background: var(--vscode-list-hoverBackground, var(--vscode-sideBar-background));
-		}
-		.review-chunk.add[open] {
-			background: color-mix(in srgb, var(--vscode-sideBar-background) 86%, var(--untracked) 14%);
-		}
-		.review-chunk.delete[open] {
-			background: color-mix(in srgb, var(--vscode-sideBar-background) 86%, var(--deleted) 14%);
-		}
-		.review-chunk.modify[open] {
-			background: color-mix(in srgb, var(--vscode-sideBar-background) 86%, var(--modified) 14%);
-		}
 		.review-chunk-summary {
 			display: grid;
 			grid-template-columns: minmax(0, 1fr) auto;
@@ -944,7 +909,6 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			cursor: pointer;
 			list-style: none;
 		}
-		.review-chunk-summary::-webkit-details-marker { display: none; }
 		.review-chunk-side {
 			display: flex;
 			align-items: flex-start;
@@ -1379,7 +1343,6 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			</form>
 			<div class="wiki-main" id="wikiMain" hidden>
 				<img class="wiki-logo" id="wikiLogo" src="${iconUri}" alt="">
-				<div class="findings" id="findings" hidden></div>
 				<div class="review-file-detail" id="reviewFileDetail" hidden></div>
 				<div class="wiki-run-list" id="wikiRunList" hidden></div>
 				<div class="wiki-status" id="wikiStatus"></div>
@@ -1431,7 +1394,6 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const wikiConfig = document.getElementById('wikiConfig');
 		const wikiMain = document.getElementById('wikiMain');
 		const wikiLogo = document.getElementById('wikiLogo');
-		const findings = document.getElementById('findings');
 		const reviewFileDetail = document.getElementById('reviewFileDetail');
 		const wikiRunList = document.getElementById('wikiRunList');
 		const wikiStatus = document.getElementById('wikiStatus');
@@ -1544,7 +1506,6 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		let reviewDetailUri;
 		let renderedReviewDetailUri;
 		const pendingScrollTops = new WeakMap();
-		const reviewChunkOpenStates = new Map();
 		toggle.addEventListener('click', () => setExpanded(!expanded));
 		toggle.addEventListener('keydown', (event) => {
 			if (event.key === 'Enter' || event.key === ' ') {
@@ -1676,7 +1637,6 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				return;
 			}
 			if (!wiki.configured) {
-				renderFindings([]);
 				renderReviewFileDetail(reviewDetailFile);
 				renderRunLog([], wiki.runLogSource);
 				wikiLogo.hidden = hasReviewDetail;
@@ -1691,11 +1651,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 
 			const initialized = wiki.status === 'initialized';
 			const running = isAgentRunning(wiki.status);
-			const currentFindings = wiki.findings || [];
-			renderFindings(hasReviewDetail || hasRunLog ? [] : currentFindings);
 			renderReviewFileDetail(reviewDetailFile);
 			renderRunLog(hasReviewDetail ? [] : runLog, wiki.runLogSource);
-			wikiLogo.hidden = running || currentFindings.length > 0 || hasRunLog || hasReviewDetail;
+			wikiLogo.hidden = running || hasRunLog || hasReviewDetail;
 			wikiAction.classList.toggle('secondary', running);
 			wikiAction.hidden = false;
 			wikiAction.disabled = !wiki.workspaceAvailable && !running;
@@ -1926,8 +1884,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			if (running) {
 				return wiki.progress || 'Agent running';
 			}
-			if ((wiki.findings || []).length > 0) {
-				return (wiki.findings || []).length + ' findings for current file';
+			if (wiki.aiReviewStatus === 'complete') {
+				return 'AI review ready';
 			}
 			if (wiki.aiReviewStatus === 'partial') {
 				const completed = wiki.aiReviewCompletedFileCount || 0;
@@ -1953,30 +1911,6 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				return wiki.progress || 'Initialization paused';
 			}
 			return wiki.progress || 'Ready';
-		}
-
-		function renderFindings(items) {
-			findings.replaceChildren();
-			findings.hidden = items.length === 0;
-			for (const item of items) {
-				const button = document.createElement('button');
-				button.className = 'finding ' + item.severity;
-				button.title = item.explanation + '\\n\\n' + item.recommendation;
-				button.addEventListener('click', () => vscode.postMessage({ type: 'openFinding', uri: item.uri, hunkId: item.hunkId }));
-				const marker = document.createElement('span');
-				marker.className = 'finding-marker';
-				button.appendChild(marker);
-				const body = document.createElement('span');
-				const title = document.createElement('span');
-				title.className = 'finding-title';
-				title.textContent = item.title;
-				const detail = document.createElement('span');
-				detail.className = 'finding-detail';
-				detail.textContent = item.severity + ' · line ' + (item.line + 1);
-				body.append(title, detail);
-				button.appendChild(body);
-				findings.appendChild(button);
-			}
 		}
 
 		function renderReviewFileDetail(file) {
@@ -2037,44 +1971,24 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		function renderReviewChunk(file, chunk) {
 			const findings = chunk.findings || [];
 			const suggestions = chunk.suggestions || [];
-			const expandable = findings.length > 0 || suggestions.length > 0;
-			const chunkKey = file.uri + '#' + chunk.hunkId;
-			const details = document.createElement(expandable ? 'details' : 'div');
+			const container = document.createElement('div');
 			const kindClass = ['add', 'delete', 'modify'].includes(chunk.kind) ? chunk.kind : 'modify';
-			details.className = 'review-chunk ' + kindClass
+			container.className = 'review-chunk ' + kindClass
 				+ (findings.length > 0 ? ' has-findings' : ' no-findings')
 				+ (suggestions.length > 0 ? ' has-suggestion' : '');
-			if (expandable) {
-				const openState = reviewChunkOpenStates.has(chunkKey)
-					? reviewChunkOpenStates.get(chunkKey)
-					: true;
-				details.dataset.reviewChunkKey = chunkKey;
-				details.open = openState;
-				if (openState) {
-					details.setAttribute('open', '');
-				} else {
-					details.removeAttribute('open');
-				}
-				reviewChunkOpenStates.set(chunkKey, openState);
-				details.addEventListener('toggle', () => {
-					reviewChunkOpenStates.set(chunkKey, details.open);
-				});
-			}
 
-			const summary = document.createElement(expandable ? 'summary' : 'div');
-			summary.className = 'review-chunk-summary';
-			summary.addEventListener('click', () => vscode.postMessage({ type: 'openChunk', uri: file.uri, hunkId: chunk.hunkId }));
-			if (!expandable) {
-				summary.setAttribute('role', 'button');
-				summary.tabIndex = 0;
-				summary.addEventListener('keydown', (event) => {
-					if (event.key !== 'Enter' && event.key !== ' ') {
-						return;
-					}
-					event.preventDefault();
-					vscode.postMessage({ type: 'openChunk', uri: file.uri, hunkId: chunk.hunkId });
-				});
-			}
+			const header = document.createElement('div');
+			header.className = 'review-chunk-summary';
+			header.setAttribute('role', 'button');
+			header.tabIndex = 0;
+			header.addEventListener('click', () => vscode.postMessage({ type: 'openChunk', uri: file.uri, hunkId: chunk.hunkId }));
+			header.addEventListener('keydown', (event) => {
+				if (event.key !== 'Enter' && event.key !== ' ') {
+					return;
+				}
+				event.preventDefault();
+				vscode.postMessage({ type: 'openChunk', uri: file.uri, hunkId: chunk.hunkId });
+			});
 			const main = document.createElement('span');
 			main.className = 'wiki-run-main';
 			const title = document.createElement('span');
@@ -2099,15 +2013,15 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				actions.appendChild(chunkActionButton('acceptChunk', file.uri, chunk.hunkId, file.revision, !chunk.canAccept, 'Accept chunk', 'accept'));
 			}
 			side.append(actions);
-			summary.append(main, side);
-			details.appendChild(summary);
-			if (!expandable) {
-				return details;
+			header.append(main, side);
+			container.appendChild(header);
+
+			if (suggestions.length === 0 && findings.length === 0) {
+				return container;
 			}
 
 			const body = document.createElement('div');
 			body.className = 'review-chunk-body';
-
 			for (const suggestion of suggestions) {
 				body.appendChild(renderReviewChunkSuggestion(file, chunk, suggestion));
 			}
@@ -2115,8 +2029,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			for (const finding of findings) {
 				body.appendChild(renderReviewChunkFinding(file, finding));
 			}
-			details.appendChild(body);
-			return details;
+			container.appendChild(body);
+			return container;
 		}
 
 		function renderReviewChunkSuggestion(file, chunk, suggestion) {
@@ -2770,7 +2684,7 @@ export function buildReviewDashboardPayload(
 					acceptDisabled: mutationDisabled || pendingCount === 0,
 					rejectDisabled: mutationDisabled || pendingCount === 0,
 					undoDisabled: mutationDisabled || reviewedCount === 0,
-					chunks: dashboardChunks(file, pendingHunks, findingsByChunk, findingsByFile, suggestionsByChunk, suggestionsByFile, mutationDisabled),
+					chunks: dashboardChunks(file, pendingHunks, findingsByChunk, suggestionsByChunk, mutationDisabled),
 					aiReviewResult: fileResultsByUri.get(file.uri.toString()),
 				};
 			})
@@ -2838,11 +2752,20 @@ function dashboardHunkLinks(session: ReviewSession | undefined): Map<string, Rev
 	const links = new Map<string, ReviewDashboardRelatedChunk[]>();
 	for (const file of visibleReviewFiles(session)) {
 		for (const hunk of file.hunks) {
-			addDashboardHunkLink(links, hunk.id, { uri: file.uri.toString(), hunkId: hunk.id, relativePath: file.relativePath, line: hunk.newStart });
+			const link = { uri: file.uri.toString(), hunkId: hunk.id, relativePath: file.relativePath, line: hunk.newStart };
+			addDashboardHunkLink(links, hunk.id, link);
+			addDashboardHunkLink(links, hunk.reviewItemId ?? hunk.sourceHunkId ?? hunk.id, link);
+			if (hunk.sourceHunkId) {
+				addDashboardHunkLink(links, hunk.sourceHunkId, link);
+			}
 		}
 		for (const hunk of [...file.acceptedHunks, ...file.rejectedHunks]) {
 			const link = { uri: file.uri.toString(), hunkId: hunk.id, relativePath: file.relativePath, line: hunk.displayStart };
 			addDashboardHunkLink(links, hunk.id, link);
+			addDashboardHunkLink(links, hunk.reviewItemId ?? hunk.sourceHunkId ?? hunk.id, link);
+			if (hunk.sourceHunkId) {
+				addDashboardHunkLink(links, hunk.sourceHunkId, link);
+			}
 			const original = originalReviewedHunkId(hunk.id);
 			if (original !== hunk.id) {
 				addDashboardHunkLink(links, original, { ...link, hunkId: original });
@@ -2870,16 +2793,16 @@ function dashboardChunks(
 	file: ReviewFileState,
 	pendingHunks: ReviewHunk[],
 	findingsByChunk: Map<string, ReviewDashboardFinding[]>,
-	findingsByFile: Map<string, ReviewDashboardFinding[]>,
 	suggestionsByChunk: Map<string, AiReviewChunkSuggestion[]>,
-	suggestionsByFile: Map<string, AiReviewChunkSuggestion[]>,
 	mutationDisabled: boolean,
 ): ReviewDashboardChunk[] {
 	const uri = file.uri.toString();
 	const appliedByHunk = new Map(file.appliedAiSuggestions.map((suggestion) => [suggestion.currentHunkId, suggestion]));
 	const chunks = pendingHunks.map((hunk): ReviewDashboardChunk => {
 		const applied = appliedByHunk.get(hunk.id);
-		const reviewItemHunkIds = applied ? [hunk.id, applied.sourceHunkId] : [hunk.id];
+		const reviewItemId = applied?.reviewItemId ?? hunk.reviewItemId ?? hunk.sourceHunkId ?? hunk.id;
+		const reviewItemHunkIds = [...new Set([hunk.id, hunk.sourceHunkId, applied?.sourceHunkId, reviewItemId]
+			.filter((value): value is string => Boolean(value)))];
 		return {
 			hunkId: hunk.id,
 			kind: hunk.kind,
@@ -2896,10 +2819,6 @@ function dashboardChunks(
 		};
 	});
 	const seenIdentities = new Set(pendingHunks.map(reviewHunkIdentity));
-	const seenHunkIds = new Set(pendingHunks.map((hunk) => hunk.id));
-	for (const applied of file.appliedAiSuggestions) {
-		seenHunkIds.add(applied.sourceHunkId);
-	}
 	for (const hunk of [...file.acceptedHunks, ...file.rejectedHunks]) {
 		const identity = reviewHunkIdentity(hunk);
 		if (seenIdentities.has(identity)) {
@@ -2907,13 +2826,15 @@ function dashboardChunks(
 		}
 		seenIdentities.add(identity);
 		const originalHunkId = originalReviewedHunkId(hunk.id);
+		const reviewItemId = hunk.reviewItemId ?? hunk.appliedAiSuggestion?.reviewItemId
+			?? hunk.sourceHunkId ?? hunk.appliedAiSuggestion?.sourceHunkId ?? originalHunkId;
 		const reviewItemHunkIds = [...new Set([
 			hunk.id,
 			originalHunkId,
+			hunk.sourceHunkId,
+			reviewItemId,
 			hunk.appliedAiSuggestion?.sourceHunkId,
 		].filter((value): value is string => Boolean(value)))];
-		seenHunkIds.add(hunk.id);
-		seenHunkIds.add(originalHunkId);
 		chunks.push({
 			hunkId: hunk.id,
 			kind: hunk.kind,
@@ -2930,26 +2851,6 @@ function dashboardChunks(
 			canAccept: false,
 			canReject: false,
 			canUndo: !mutationDisabled,
-		});
-	}
-	for (const item of [...(findingsByFile.get(uri) ?? []), ...(suggestionsByFile.get(uri) ?? [])]) {
-		if (seenHunkIds.has(item.hunkId)) {
-			continue;
-		}
-		seenHunkIds.add(item.hunkId);
-		chunks.push({
-			hunkId: item.hunkId,
-			kind: 'reviewed',
-			line: item.line,
-			oldLines: 0,
-			newLines: 0,
-			findings: findingsByChunk.get(`${uri}#${item.hunkId}`) ?? [],
-			suggestions: suggestionsByChunk.get(`${uri}#${item.hunkId}`) ?? [],
-			appliedSuggestion: dashboardAppliedSuggestion(appliedByHunk.get(item.hunkId)),
-			reviewStatus: 'reviewed',
-			canAccept: false,
-			canReject: false,
-			canUndo: false,
 		});
 	}
 	return chunks.sort((left, right) => left.line - right.line || left.hunkId.localeCompare(right.hunkId));
