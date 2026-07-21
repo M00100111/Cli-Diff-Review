@@ -106,7 +106,7 @@ interface SuggestionMappingDiagnostics {
 }
 
 type SuggestionMappingResult =
-	| { ok: true; members: GitReviewHunk[]; undoText: string }
+	| { ok: true; effect: 'git-hunks' | 'resolved-to-index'; members: GitReviewHunk[]; undoText: string }
 	| { ok: false; reason: SuggestionMappingFailureReason; diagnostics: SuggestionMappingDiagnostics };
 
 export class ReviewController implements vscode.Disposable {
@@ -1847,7 +1847,15 @@ export class ReviewController implements vscode.Disposable {
 		const hunk = file?.hunks.find((item) => item.id === hunkId);
 		const reviewed = hunk ? undefined : file ? [...file.acceptedHunks, ...file.rejectedHunks]
 			.find((item) => item.id === hunkId || item.id.endsWith(`-${hunkId}`)) : undefined;
-		if (!file || (!hunk && !reviewed)) {
+		const resolvedSuggestion = !hunk && !reviewed
+			? file?.appliedAiSuggestions.find((item) => item.resolvedToIndex && item.currentHunkId === hunkId)
+			: undefined;
+		if (!file || (!hunk && !reviewed && !resolvedSuggestion)) {
+			return;
+		}
+		if (resolvedSuggestion) {
+			const line = Math.max(0, resolvedSuggestion.appliedHunk.newStart);
+			await this.openResolvedLocation(file.uri, new vscode.Range(line, 0, line, 0));
 			return;
 		}
 
@@ -2512,7 +2520,15 @@ export class ReviewController implements vscode.Disposable {
 			const otherHunks = file.hunks.filter((candidate) => candidate.id !== hunk.id).map((candidate) => ({ ...candidate }));
 			await this.writeCurrentFileText(file.uri, currentText);
 			await this.refreshGitReviewFile(file.uri, { refreshUi: false });
-			const refreshedFile = this.resolveFile(uriString);
+			let refreshedFile = this.resolveFile(uriString);
+			if (!refreshedFile) {
+				const actual = await this.readCurrentText(file.uri, { preferDisk: true });
+				const expected = replaceLineBlock(current.text, hunk.newStart, hunk.newLines, hunk.oldText);
+				if (actual.exists && actual.text === expected) {
+					refreshedFile = this.createResolvedSuggestionFileState(file, actual.text);
+					this.activeSession.files.set(uriKey(file.uri), refreshedFile);
+				}
+			}
 			const appliedResolution: SuggestionMappingResult = refreshedFile
 				? this.findRegeneratedSuggestionHunks(refreshedFile, hunk, otherHunks, current.text)
 				: {
@@ -2536,12 +2552,17 @@ export class ReviewController implements vscode.Disposable {
 			}
 			const appliedMembers = appliedResolution.members;
 			const reviewItemId = hunk.reviewItemId ?? hunk.sourceHunkId ?? hunk.id;
-			const appliedHunk = this.createLogicalSuggestionHunk(refreshedFile, hunk, appliedMembers, reviewItemId);
-			const memberIds = new Set(appliedMembers.map((member) => member.id));
-			refreshedFile.hunks = [
-				...refreshedFile.hunks.filter((candidate) => !memberIds.has(candidate.id)),
-				appliedHunk,
-			].sort((left, right) => left.newStart - right.newStart || left.id.localeCompare(right.id));
+			const resolvedToIndex = appliedResolution.effect === 'resolved-to-index';
+			const appliedHunk = resolvedToIndex
+				? this.createResolvedSuggestionHunk(hunk, replacementText, reviewItemId)
+				: this.createLogicalSuggestionHunk(refreshedFile, hunk, appliedMembers, reviewItemId);
+			if (!resolvedToIndex) {
+				const memberIds = new Set(appliedMembers.map((member) => member.id));
+				refreshedFile.hunks = [
+					...refreshedFile.hunks.filter((candidate) => !memberIds.has(candidate.id)),
+					appliedHunk,
+				].sort((left, right) => left.newStart - right.newStart || left.id.localeCompare(right.id));
+			}
 			refreshedFile.appliedAiSuggestions = [
 				...refreshedFile.appliedAiSuggestions.filter((item) => item.suggestionId !== suggestionId),
 				{
@@ -2556,6 +2577,7 @@ export class ReviewController implements vscode.Disposable {
 					appliedText: appliedHunk.newText,
 					appliedWorkingText: refreshedFile.newText,
 					undoWorkingText: appliedResolution.undoText,
+					resolvedToIndex,
 					appliedAt: Date.now(),
 				},
 			];
@@ -2579,8 +2601,7 @@ export class ReviewController implements vscode.Disposable {
 			}
 			const file = this.resolveFile(uriString);
 			const applied = file?.appliedAiSuggestions.find((item) => item.suggestionId === suggestionId && item.currentHunkId === hunkId);
-			const hunk = file?.hunks.find((item) => item.id === hunkId);
-			if (!file || !applied || !hunk) {
+			if (!file || !applied) {
 				vscode.window.showInformationMessage('No applied AI suggestion selected.');
 				return;
 			}
@@ -2830,12 +2851,18 @@ export class ReviewController implements vscode.Disposable {
 		}
 		const failures: string[] = [];
 		for (const project of session.projects ?? []) {
-			const files = [...session.files.values()].filter((file) => file.projectId === project.id
-				&& (file.acceptedHunks.length > 0 || file.rejectedHunks.length > 0));
+			const projectFiles = [...session.files.values()].filter((file) => file.projectId === project.id);
+			const files = projectFiles.filter((file) => file.acceptedHunks.length > 0 || file.rejectedHunks.length > 0);
+			const resolvedFiles = projectFiles.filter((file) => file.appliedAiSuggestions.some((suggestion) => suggestion.resolvedToIndex));
 			if (files.length === 0) {
+				if (resolvedFiles.some((file) => this.isOpenDocumentDirty(file.uri))) {
+					failures.push(`${project.name}: save or revert reviewed files before Refresh.`);
+					continue;
+				}
+				this.clearResolvedSuggestionRecords(projectFiles);
 				continue;
 			}
-			if (files.some((file) => this.isOpenDocumentDirty(file.uri))) {
+			if ([...files, ...resolvedFiles].some((file) => this.isOpenDocumentDirty(file.uri))) {
 				failures.push(`${project.name}: save or revert reviewed files before Refresh.`);
 				continue;
 			}
@@ -2861,12 +2888,19 @@ export class ReviewController implements vscode.Disposable {
 					}
 				}
 				await this.gitReviewJournal.clear(project, headOid);
+				this.clearResolvedSuggestionRecords(projectFiles);
 			} catch (error) {
 				failures.push(`${project.name}: ${error instanceof Error ? error.message : String(error)}`);
 			}
 		}
 		if (failures.length > 0) {
 			void vscode.window.showWarningMessage(`Some reviewed changes could not be staged:\n${failures.join('\n')}`);
+		}
+	}
+
+	private clearResolvedSuggestionRecords(files: ReviewFileState[]): void {
+		for (const file of files) {
+			file.appliedAiSuggestions = file.appliedAiSuggestions.filter((suggestion) => !suggestion.resolvedToIndex);
 		}
 	}
 
@@ -2903,6 +2937,16 @@ export class ReviewController implements vscode.Disposable {
 			}
 		}
 		await this.attachRejectedJournals(nextFiles, projects);
+		for (const [key, previous] of previousFiles) {
+			if (nextFiles.has(key) || !previous.appliedAiSuggestions.some((suggestion) => suggestion.resolvedToIndex)) {
+				continue;
+			}
+			const project = projects.find((candidate) => candidate.id === previous.projectId);
+			const retained = project ? await this.retainResolvedSuggestionFile(previous, project) : undefined;
+			if (retained) {
+				nextFiles.set(key, retained);
+			}
+		}
 		for (const [key, file] of nextFiles) {
 			const previous = previousFiles.get(key);
 			if (previous) {
@@ -2947,7 +2991,10 @@ export class ReviewController implements vscode.Disposable {
 			}
 		}
 		await this.attachRejectedJournals(refreshed, [project], uri);
-		const file = refreshed.get(key);
+		let file = refreshed.get(key);
+		if (!file && previous?.appliedAiSuggestions.some((suggestion) => suggestion.resolvedToIndex)) {
+			file = await this.retainResolvedSuggestionFile(previous, project);
+		}
 		if (!file) {
 			session.files.delete(key);
 		} else {
@@ -3015,6 +3062,17 @@ export class ReviewController implements vscode.Disposable {
 	private restoreAppliedSuggestionGroups(file: ReviewFileState, previous: ReviewFileState): void {
 		const restored: AppliedAiSuggestion[] = [];
 		for (const applied of previous.appliedAiSuggestions) {
+			if (applied.resolvedToIndex) {
+				if (this.lineBlockAtCoordinateMatches(
+					file.newText,
+					applied.appliedHunk.newStart,
+					applied.appliedHunk.newLines,
+					applied.appliedHunk.newText,
+				)) {
+					restored.push(applied);
+				}
+				continue;
+			}
 			const members: GitReviewHunk[] = [];
 			const used = new Set<string>();
 			for (const saved of this.appliedSuggestionMembers(applied)) {
@@ -3105,6 +3163,7 @@ export class ReviewController implements vscode.Disposable {
 			file.hunks.length > 0
 			|| file.acceptedHunks.length > 0
 			|| file.rejectedHunks.length > 0
+			|| file.appliedAiSuggestions.some((suggestion) => suggestion.resolvedToIndex)
 			|| file.skippedReason
 		));
 	}
@@ -3454,6 +3513,9 @@ export class ReviewController implements vscode.Disposable {
 			targetResidualRanges: [],
 			otherResidualRanges: [],
 		};
+		if (diagnostics.resolvedToIndex) {
+			return { ok: true, effect: 'resolved-to-index', members: [], undoText: beforeText };
+		}
 		if (candidates.length === 0) {
 			return { ok: false, reason: 'no-candidate', diagnostics };
 		}
@@ -3511,7 +3573,7 @@ export class ReviewController implements vscode.Disposable {
 		const smallestSize = Math.min(...validGroups.map((group) => group.members.length));
 		const smallestGroups = validGroups.filter((group) => group.members.length === smallestSize);
 		if (smallestGroups.length === 1) {
-			return { ok: true, ...smallestGroups[0] };
+			return { ok: true, effect: 'git-hunks', ...smallestGroups[0] };
 		}
 		const reason: SuggestionMappingFailureReason = smallestGroups.length > 1
 			? 'ambiguous'
@@ -3624,8 +3686,78 @@ export class ReviewController implements vscode.Disposable {
 		};
 	}
 
+	private createResolvedSuggestionHunk(
+		originalHunk: ReviewHunk,
+		replacementText: string,
+		reviewItemId: string,
+	): ReviewHunk {
+		return {
+			...originalHunk,
+			id: `suggestion-resolved-${reviewItemId}`,
+			newLines: splitLines(replacementText).length,
+			newText: replacementText,
+			layer: 'pending',
+			patch: undefined,
+			patchHeader: undefined,
+			rawHunk: undefined,
+			operable: false,
+			sourceHunkId: originalHunk.sourceHunkId ?? originalHunk.id,
+			reviewItemId,
+			memberHunks: [],
+		};
+	}
+
+	private createResolvedSuggestionFileState(previous: ReviewFileState, workingText: string): ReviewFileState {
+		return {
+			...previous,
+			newText: workingText,
+			hunks: [],
+			acceptedHunks: [],
+			rejectedHunks: [],
+			appliedAiSuggestions: [],
+			currentExists: true,
+			gitSnapshot: previous.gitSnapshot ? {
+				...previous.gitSnapshot,
+				workingText,
+				workingExists: true,
+			} : undefined,
+		};
+	}
+
+	private async retainResolvedSuggestionFile(
+		previous: ReviewFileState,
+		project: ReviewProject,
+	): Promise<ReviewFileState | undefined> {
+		if (!previous.gitSnapshot || (previous.headOid !== undefined && project.headOid !== previous.headOid)) {
+			return undefined;
+		}
+		const folder = reviewProjectFolder(project);
+		const [current, index] = await Promise.all([
+			this.readCurrentText(previous.uri, { preferDisk: true }),
+			this.gitService.readIndexEntry(folder, previous.relativePath),
+		]);
+		if (index.exists !== previous.gitSnapshot.indexExists || index.text !== previous.gitSnapshot.indexText) {
+			return undefined;
+		}
+		const retainedSuggestions = previous.appliedAiSuggestions.filter((applied) => applied.resolvedToIndex
+			&& current.exists
+			&& this.lineBlockAtCoordinateMatches(
+				current.text,
+				applied.appliedHunk.newStart,
+				applied.appliedHunk.newLines,
+				applied.appliedHunk.newText,
+			));
+		if (retainedSuggestions.length === 0) {
+			return undefined;
+		}
+		const retained = this.createResolvedSuggestionFileState(previous, current.text);
+		retained.appliedAiSuggestions = retainedSuggestions;
+		retained.headOid = project.headOid;
+		return retained;
+	}
+
 	private appliedSuggestionMembers(applied: AppliedAiSuggestion): ReviewHunk[] {
-		return applied.appliedHunks?.length ? applied.appliedHunks : [applied.appliedHunk];
+		return applied.appliedHunks !== undefined ? applied.appliedHunks : [applied.appliedHunk];
 	}
 
 	private retainAppliedAiSuggestions(file: ReviewFileState, suggestions: Array<AppliedAiSuggestion | undefined>): void {

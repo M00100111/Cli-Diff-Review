@@ -66,7 +66,7 @@ export interface ReviewDashboardChunk {
 		suggestionId: string;
 		replacementText: string;
 	};
-	reviewStatus?: 'pending' | 'reviewed';
+	reviewStatus?: 'pending' | 'reviewed' | 'resolved';
 	reviewDecision?: 'accepted' | 'rejected';
 	canAccept: boolean;
 	canReject: boolean;
@@ -1995,7 +1995,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			title.className = 'wiki-run-title';
 			const decisionLabel = chunk.reviewDecision === 'accepted'
 				? 'Accepted'
-				: chunk.reviewDecision === 'rejected' ? 'Rejected' : chunk.reviewStatus === 'pending' ? 'Pending' : '';
+				: chunk.reviewDecision === 'rejected'
+					? 'Rejected'
+					: chunk.reviewStatus === 'pending' ? 'Pending' : '';
 			title.textContent = (decisionLabel ? decisionLabel + ' · ' : '') + chunk.kind + ' ' + chunk.oldLines + '->' + chunk.newLines + ' lines';
 			const meta = document.createElement('span');
 			meta.className = 'wiki-run-meta';
@@ -2008,7 +2010,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			actions.className = 'review-chunk-actions';
 			if (chunk.reviewStatus === 'reviewed') {
 				actions.appendChild(chunkActionButton('undoChunk', file.uri, chunk.hunkId, file.revision, !chunk.canUndo, 'Undo chunk', 'undo'));
-			} else {
+			} else if (chunk.reviewStatus === 'pending') {
 				actions.appendChild(chunkActionButton('rejectChunk', file.uri, chunk.hunkId, file.revision, !chunk.canReject, 'Reject chunk', 'reject'));
 				actions.appendChild(chunkActionButton('acceptChunk', file.uri, chunk.hunkId, file.revision, !chunk.canAccept, 'Accept chunk', 'accept'));
 			}
@@ -2062,7 +2064,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					});
 				});
 				header.appendChild(action);
-			} else if (applied && chunk.reviewStatus === 'pending') {
+			} else if (applied && (chunk.reviewStatus === 'pending' || chunk.reviewStatus === 'resolved')) {
 				const action = document.createElement('button');
 				action.type = 'button';
 				action.className = 'review-suggestion-action';
@@ -2644,7 +2646,11 @@ export function buildReviewDashboardPayload(
 	const aggregate = hasAggregateReviewTarget(session) && session?.trackingTarget?.kind === 'aggregate';
 	const files = session
 		? visibleReviewFiles(session)
-			.filter((file) => file.hunks.length > 0 || file.acceptedHunks.length > 0 || file.rejectedHunks.length > 0 || file.skippedReason)
+			.filter((file) => file.hunks.length > 0
+				|| file.acceptedHunks.length > 0
+				|| file.rejectedHunks.length > 0
+				|| file.appliedAiSuggestions.some((suggestion) => suggestion.resolvedToIndex)
+				|| file.skippedReason)
 			.sort((left, right) => (left.projectName ?? '').localeCompare(right.projectName ?? '')
 				|| left.relativePath.localeCompare(right.relativePath))
 			.map((file) => {
@@ -2771,6 +2777,17 @@ function dashboardHunkLinks(session: ReviewSession | undefined): Map<string, Rev
 				addDashboardHunkLink(links, original, { ...link, hunkId: original });
 			}
 		}
+		for (const applied of file.appliedAiSuggestions.filter((suggestion) => suggestion.resolvedToIndex)) {
+			const link = {
+				uri: file.uri.toString(),
+				hunkId: applied.currentHunkId,
+				relativePath: file.relativePath,
+				line: applied.appliedHunk.newStart,
+			};
+			addDashboardHunkLink(links, applied.currentHunkId, link);
+			addDashboardHunkLink(links, applied.reviewItemId ?? applied.sourceHunkId, link);
+			addDashboardHunkLink(links, applied.sourceHunkId, link);
+		}
 	}
 	return links;
 }
@@ -2851,6 +2868,29 @@ function dashboardChunks(
 			canAccept: false,
 			canReject: false,
 			canUndo: !mutationDisabled,
+		});
+	}
+	const representedSuggestionIds = new Set(chunks.flatMap((chunk) => chunk.appliedSuggestion?.suggestionId ? [chunk.appliedSuggestion.suggestionId] : []));
+	for (const applied of file.appliedAiSuggestions.filter((suggestion) => suggestion.resolvedToIndex
+		&& !representedSuggestionIds.has(suggestion.suggestionId))) {
+		const sourceIds = [...new Set([
+			applied.currentHunkId,
+			applied.sourceHunkId,
+			applied.reviewItemId,
+		].filter((value): value is string => Boolean(value)))];
+		chunks.push({
+			hunkId: applied.currentHunkId,
+			kind: applied.originalHunk.kind,
+			line: applied.appliedHunk.newStart,
+			oldLines: applied.originalHunk.oldLines,
+			newLines: applied.appliedHunk.newLines,
+			findings: reviewItemsByHunkIds(findingsByChunk, uri, sourceIds),
+			suggestions: reviewItemsByHunkIds(suggestionsByChunk, uri, sourceIds),
+			appliedSuggestion: dashboardAppliedSuggestion(applied),
+			reviewStatus: 'resolved',
+			canAccept: false,
+			canReject: false,
+			canUndo: false,
 		});
 	}
 	return chunks.sort((left, right) => left.line - right.line || left.hunkId.localeCompare(right.hunkId));
@@ -2946,7 +2986,12 @@ function dashboardStatus(file: ReviewFileState): { label: string; kind: ReviewDa
 	}
 
 	const changeKinds = new Set(
-		[...file.hunks, ...file.acceptedHunks, ...file.rejectedHunks]
+		[
+			...file.hunks,
+			...file.acceptedHunks,
+			...file.rejectedHunks,
+			...file.appliedAiSuggestions.filter((suggestion) => suggestion.resolvedToIndex).map((suggestion) => suggestion.originalHunk),
+		]
 			.map((hunk) => hunk.kind)
 			.filter((kind) => kind === 'add' || kind === 'delete' || kind === 'modify'),
 	);

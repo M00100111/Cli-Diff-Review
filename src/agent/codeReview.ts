@@ -1151,6 +1151,14 @@ export function reviewChangeSignature(session: ReviewSession): string {
 		hunks: [...file.hunks, ...file.acceptedHunks, ...file.rejectedHunks]
 			.map(stableReviewHunkSignature)
 			.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
+		resolvedSuggestions: file.appliedAiSuggestions
+			.filter((suggestion) => suggestion.resolvedToIndex)
+			.map((suggestion) => ({
+				suggestionId: suggestion.suggestionId,
+				sourceHunkId: suggestion.sourceHunkId,
+				original: stableReviewHunkSignature(suggestion.originalHunk),
+			}))
+			.sort((left, right) => left.suggestionId.localeCompare(right.suggestionId)),
 	}));
 	return createHash('sha256').update(JSON.stringify({
 		rootUri: session.rootUri.toString(),
@@ -1169,6 +1177,7 @@ function sourceReviewFiles(session: ReviewSession): ReviewFileState[] {
 			file.hunks.length > 0
 			|| file.acceptedHunks.length > 0
 			|| file.rejectedHunks.length > 0
+			|| file.appliedAiSuggestions.some((suggestion) => suggestion.resolvedToIndex)
 		) && !isWikiPath(file.relativePath))
 		.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
 }

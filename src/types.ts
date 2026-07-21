@@ -82,6 +82,7 @@ export interface AppliedAiSuggestion {
 	appliedText?: string;
 	appliedWorkingText?: string;
 	undoWorkingText?: string;
+	resolvedToIndex?: boolean;
 	appliedAt: number;
 }
 
