@@ -51,13 +51,12 @@ export class GitService {
 
 	public async createFilePairs(root: vscode.WorkspaceFolder): Promise<FilePair[]> {
 		const projectId = uriKey(root.uri);
-		const maxFileBytes = vscode.workspace.getConfiguration('cliDiff').get<number>('maxFileBytes', 2097152);
 		const [pendingBlocks, statusOutput, headOid] = await Promise.all([
-			this.gitPatchBlocks(root, ['diff', ...diffOptions], maxFileBytes, [0, 1]),
+			this.gitPatchBlocks(root, ['diff', ...diffOptions], [0, 1]),
 			this.gitBuffer(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=no']),
 			this.headOid(root),
 		]);
-		const pending = pendingBlocks.flatMap((block) => parseGitPatch(block, projectId, 'pending', maxFileBytes));
+		const pending = pendingBlocks.flatMap((block) => parseGitPatch(block, projectId, 'pending'));
 		const status = parsePorcelainStatus(statusOutput);
 		const untrackedPaths = status.untrackedPaths.map(normalizeReviewPath).filter(Boolean);
 		const untrackedPatches = await mapWithConcurrency(
@@ -66,13 +65,13 @@ export class GitService {
 			async (relativePath) => {
 				const blocks = await this.gitPatchBlocks(root, [
 					'diff', '--no-index', '--full-index', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames', '--unified=3', '--relative', '--', '/dev/null', relativePath,
-				], maxFileBytes, [0, 1]);
-				return blocks.flatMap((block) => parseGitPatch(block, projectId, 'pending', maxFileBytes));
+				], [0, 1]);
+				return blocks.flatMap((block) => parseGitPatch(block, projectId, 'pending'));
 			},
 		);
 		pending.push(...untrackedPatches.flat());
 
-		return this.buildFilePairs(root, pending, new Set(status.conflictPaths.map(normalizeReviewPath)), headOid, maxFileBytes);
+		return this.buildFilePairs(root, pending, new Set(status.conflictPaths.map(normalizeReviewPath)), headOid);
 	}
 
 	private async buildFilePairs(
@@ -80,7 +79,6 @@ export class GitService {
 		pending: ParsedGitFilePatch[],
 		conflicts: Set<string>,
 		headOid: string,
-		maxFileBytes: number,
 	): Promise<FilePair[]> {
 		const byPath = new Map<string, { pending?: ParsedGitFilePatch }>();
 		for (const file of pending) {
@@ -105,15 +103,7 @@ export class GitService {
 					: layers.pending?.unsupportedReason,
 			};
 		});
-		const workingStates = await Promise.all(entries.map((entry) => readCurrentText(entry.uri, {
-			preferDisk: true,
-			maxFileBytes: entry.skippedReason ? 0 : maxFileBytes,
-		})));
-		for (const [index, working] of workingStates.entries()) {
-			if (working.tooLarge && !entries[index].skippedReason) {
-				entries[index].skippedReason = 'File exceeds cliDiff.maxFileBytes.';
-			}
-		}
+		const workingStates = await Promise.all(entries.map((entry) => readCurrentText(entry.uri, { preferDisk: true })));
 		const blobOids = entries.flatMap((entry) => entry.skippedReason
 			? []
 			: [entry.indexBlobOid].filter((oid): oid is string => Boolean(oid)));
@@ -170,27 +160,25 @@ export class GitService {
 		}
 		void options;
 		const projectId = uriKey(folder.uri);
-		const maxFileBytes = vscode.workspace.getConfiguration('cliDiff').get<number>('maxFileBytes', 2097152);
 		const pathDiffOptions = [...diffOptions.slice(0, -1), '--', relativePath];
 		const [pendingBlocks, statusOutput, headOid] = await Promise.all([
-			this.gitPatchBlocks(folder, ['diff', ...pathDiffOptions], maxFileBytes, [0, 1]),
+			this.gitPatchBlocks(folder, ['diff', ...pathDiffOptions], [0, 1]),
 			this.gitBuffer(folder, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=no', '--', relativePath]),
 			this.headOid(folder),
 		]);
-		const pending = pendingBlocks.flatMap((block) => parseGitPatch(block, projectId, 'pending', maxFileBytes));
+		const pending = pendingBlocks.flatMap((block) => parseGitPatch(block, projectId, 'pending'));
 		const status = parsePorcelainStatus(statusOutput);
 		if (status.untrackedPaths.map(normalizeReviewPath).includes(relativePath)) {
 			const blocks = await this.gitPatchBlocks(folder, [
 				'diff', '--no-index', '--full-index', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames', '--unified=3', '--relative', '--', '/dev/null', relativePath,
-			], maxFileBytes, [0, 1]);
-			pending.push(...blocks.flatMap((block) => parseGitPatch(block, projectId, 'pending', maxFileBytes)));
+			], [0, 1]);
+			pending.push(...blocks.flatMap((block) => parseGitPatch(block, projectId, 'pending')));
 		}
 		const pairs = await this.buildFilePairs(
 			folder,
 			pending,
 			new Set(status.conflictPaths.map(normalizeReviewPath)),
 			headOid,
-			maxFileBytes,
 		);
 		return pairs.find((pair) => pair.relativePath === relativePath);
 	}
@@ -314,34 +302,25 @@ export class GitService {
 		return this.runGit(root.uri.fsPath, args, {}).then((result) => result.stdout);
 	}
 
-	private gitPatchBlocks(root: vscode.WorkspaceFolder, args: string[], maxFileBytes: number, allowedExitCodes = [0]): Promise<string[]> {
+	private gitPatchBlocks(root: vscode.WorkspaceFolder, args: string[], allowedExitCodes = [0]): Promise<string[]> {
 		return new Promise((resolve, reject) => {
 			const child = spawn('git', ['-C', root.uri.fsPath, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
 			const blocks: string[] = [];
 			let block = '';
-			let blockBytes = 0;
 			let remainder = '';
 			const decoder = new StringDecoder('utf8');
 			const stderr: Buffer[] = [];
-			const limit = maxFileBytes + 1;
 			const appendLine = (line: string) => {
 				if (line.startsWith('diff --git ')) {
 					if (block) {
 						blocks.push(block);
 					}
 					block = '';
-					blockBytes = 0;
 				}
 				if (!block && !line.startsWith('diff --git ')) {
 					return;
 				}
-				if (blockBytes >= limit) {
-					return;
-				}
-				const data = Buffer.from(line, 'utf8');
-				const slice = data.subarray(0, Math.max(0, limit - blockBytes));
-				block += slice.toString('utf8');
-				blockBytes += slice.length;
+				block += line;
 			};
 			child.stdout.on('data', (chunk: Buffer) => {
 				remainder += decoder.write(chunk);
@@ -489,20 +468,14 @@ function assignFileOccurrences(hunks: GitReviewHunk[]): void {
 
 async function readCurrentText(
 	uri: vscode.Uri,
-	options: { preferDisk?: boolean; maxFileBytes?: number } = {},
-): Promise<{ exists: boolean; text: string; tooLarge?: boolean }> {
+	options: { preferDisk?: boolean } = {},
+): Promise<{ exists: boolean; text: string }> {
 	const openDocument = vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri.toString());
 	if (openDocument && !options.preferDisk) {
 		const text = openDocument.getText();
-		return options.maxFileBytes !== undefined && Buffer.byteLength(text, 'utf8') > options.maxFileBytes
-			? { exists: true, text: '', tooLarge: true }
-			: { exists: true, text };
+		return { exists: true, text };
 	}
 	try {
-		const stat = await vscode.workspace.fs.stat(uri);
-		if (options.maxFileBytes !== undefined && stat.size > options.maxFileBytes) {
-			return { exists: true, text: '', tooLarge: true };
-		}
 		const data = await vscode.workspace.fs.readFile(uri);
 		if (isProbablyBinary(data)) {
 			return { exists: true, text: '' };

@@ -3,6 +3,11 @@
   "displayName": "Cli Diff Review",
   "description": "Cli Diff Review brings lightweight code change review for CLI-assisted edits to VS Code.",
   "version": "0.0.1",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/M00100111/Cli-Diff-Review.git"
+  },
   "icon": "resources/icon.png",
   "publisher": "local",
   "engines": {
@@ -224,24 +229,28 @@
     "configuration": {
       "title": "Cli Diff Review",
       "properties": {
-        "cliDiff.maxFileBytes": {
-          "type": "number",
-          "default": 2097152,
-          "minimum": 1024,
-          "description": "Maximum file size, in bytes, included in Cli Diff Review baselines and reviews."
-        },
         "cliDiff.autoStartGitReview": {
           "type": "boolean",
+          "order": 1,
           "default": true,
           "description": "Automatically start a lightweight Git review session so changed files appear in the Cli Diff Review view."
         },
+        "cliDiff.refreshDebounceMs": {
+          "type": "number",
+          "order": 2,
+          "default": 500,
+          "minimum": 0,
+          "description": "Debounce delay, in milliseconds, for file, Git metadata, Git extension state, and AI/Wiki Dashboard refresh events. Editor text changes still refresh only after save."
+        },
         "cliDiff.reviewWikiChanges": {
           "type": "boolean",
+          "order": 3,
           "default": true,
-          "description": "Include generated LLM Code Wiki skill Markdown changes in Cli Diff Review."
+          "description": "Include Git-detected changes under .agents/skills/llm-code-wiki in Cli Diff Review. Disable to ignore that directory."
         },
         "cliDiff.reviewEditorMode": {
           "type": "string",
+          "order": 4,
           "enum": [
             "nativeEditor",
             "reviewPage"
@@ -253,50 +262,40 @@
           "default": "nativeEditor",
           "description": "Controls whether review files open in the VS Code/Cursor native inline diff editor or the Cli Diff Review page."
         },
-        "cliDiff.nativeDiffInline": {
-          "type": "boolean",
-          "default": true,
-          "description": "Use inline single-page rendering for the native diff editor by setting diffEditor.renderSideBySide to false in the workspace."
-        },
-        "cliDiff.aiReviewFindingOrder": {
+        "cliDiff.aiReviewStrategy": {
           "type": "string",
+          "order": 5,
           "enum": [
-            "chunk",
-            "severity"
+            "Auto",
+            "Multi",
+            "FileOnly"
           ],
-          "default": "chunk",
-          "description": "Ordering used for AI review findings in the Activity Bar."
+          "default": "Multi",
+          "description": "AI Review agent strategy. Auto chooses between lightweight file review and multi-agent review; Multi always runs planning and integration review; FileOnly uses only per-file review."
+        },
+        "cliDiff.aiReviewMaxRounds": {
+          "type": "number",
+          "order": 6,
+          "default": 32,
+          "minimum": 0,
+          "description": "Maximum rounds for each AI Review agent. Applies to knowledge, planning, file, and integration agents. 0 means unlimited."
+        },
+        "cliDiff.aiReviewFileConcurrency": {
+          "type": "number",
+          "order": 7,
+          "default": 3,
+          "minimum": 0,
+          "description": "Maximum number of file-level AI review agents to run concurrently. 1 runs serially; 0 runs all pending files concurrently."
         },
         "cliDiff.aiReviewLanguage": {
           "type": "string",
+          "order": 8,
           "enum": [
             "zh-CN",
             "en"
           ],
           "default": "zh-CN",
           "description": "AI review findings language."
-        },
-        "cliDiff.aiReviewStrategy": {
-          "type": "string",
-          "enum": [
-            "Auto",
-            "Multi",
-            "FileOnly"
-          ],
-          "default": "Auto",
-          "description": "AI Review agent strategy. Auto chooses between lightweight file review and multi-agent review; Multi always runs planning and integration review; FileOnly uses only per-file review."
-        },
-        "cliDiff.aiReviewMaxRounds": {
-          "type": "number",
-          "default": 64,
-          "minimum": 0,
-          "description": "Maximum rounds for each AI Review agent. Applies to knowledge, planning, file, and integration agents. 0 means unlimited."
-        },
-        "cliDiff.aiReviewFileConcurrency": {
-          "type": "number",
-          "default": 1,
-          "minimum": 0,
-          "description": "Maximum number of file-level AI review agents to run concurrently. 1 runs serially; 0 runs all pending files concurrently."
         }
       }
     }

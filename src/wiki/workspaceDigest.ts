@@ -1,6 +1,6 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { gitIgnoredReviewPaths, normalizeReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
+import { gitIgnoredReviewPaths, isDotReviewPath, normalizeReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
 import { decodeUtf8, isProbablyBinary, relativePath } from '../text';
 import { throwIfAborted } from './cancellation';
 import { isGeneratedAgentsGuidancePath } from './paths';
@@ -65,7 +65,7 @@ export async function buildWorkspaceDigest(root: vscode.WorkspaceFolder, signal?
 }
 
 function shouldSkipDigestPath(relativePath: string): boolean {
-	if (!relativePath || isGeneratedAgentsGuidancePath(relativePath) || shouldSkipReviewPath(relativePath)) {
+	if (!relativePath || isGeneratedAgentsGuidancePath(relativePath) || isDotReviewPath(relativePath) || shouldSkipReviewPath(relativePath)) {
 		return true;
 	}
 	const segments = relativePath.split('/');

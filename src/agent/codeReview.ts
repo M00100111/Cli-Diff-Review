@@ -164,7 +164,6 @@ export interface CodeReviewAgentOptions {
 }
 
 const severities = new Set<AiReviewSeverity>(['error', 'warning', 'suggestion', 'info']);
-const severityOrder: Record<AiReviewSeverity, number> = { error: 0, warning: 1, suggestion: 2, info: 3 };
 
 export class AiReviewPartialError extends Error {
 	public constructor(message: string, public readonly review: StoredAiReview, public readonly cause?: unknown) {
@@ -1346,7 +1345,6 @@ export function normalizeAiSuggestionReplacementText(replacementText: string, hu
 export function sortFindings(
 	findings: AiReviewFinding[],
 	files: Iterable<ReviewFileState>,
-	order: 'chunk' | 'severity',
 ): AiReviewFinding[] {
 	const hunkPositions = new Map<string, number>();
 	for (const file of files) {
@@ -1355,9 +1353,8 @@ export function sortFindings(
 		}
 	}
 	return [...findings].sort((left, right) => (
-		order === 'severity' ? severityOrder[left.severity] - severityOrder[right.severity] : 0
-	) || (hunkPositions.get(`${left.uri}#${left.hunkId}`) ?? left.line) - (hunkPositions.get(`${right.uri}#${right.hunkId}`) ?? right.line)
-		|| left.generationOrder - right.generationOrder);
+		(hunkPositions.get(`${left.uri}#${left.hunkId}`) ?? left.line) - (hunkPositions.get(`${right.uri}#${right.hunkId}`) ?? right.line)
+		|| left.generationOrder - right.generationOrder));
 }
 
 function knowledgeRetrievalSystemPrompt(): string {

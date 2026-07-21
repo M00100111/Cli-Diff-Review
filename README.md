@@ -29,7 +29,7 @@ Cli Diff Review brings Cursor-style code change review to VS Code for files modi
 ## Settings
 
 - `cliDiff.autoStartGitReview`: automatically start a Git review session for changed files.
-- `cliDiff.maxFileBytes`: maximum file size included in review.
+- `cliDiff.refreshDebounceMs`: debounce file, Git, and AI/Wiki Dashboard refresh events; defaults to `500` milliseconds. Editor changes still refresh after save.
 - `cliDiff.aiReviewMaxRounds`: maximum rounds for each Knowledge, Planning, File, and Integration AI Review agent; `0` means unlimited.
 
 ## Notes

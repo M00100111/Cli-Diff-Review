@@ -12,7 +12,6 @@ export interface AgentToolOptions {
 	root: vscode.WorkspaceFolder;
 	generatedFiles?: Set<string>;
 	maxFiles?: number;
-	maxFileBytes?: number;
 	maxReadChars?: number;
 	reviewSession?: ReviewSession;
 	includeWikiTools?: boolean;
@@ -227,8 +226,8 @@ async function readWorkspaceFile(options: AgentToolOptions, candidate: string, s
 async function readTextFile(options: AgentToolOptions, uri: vscode.Uri, signal?: AbortSignal): Promise<{ path: string; content: string; truncated: boolean }> {
 	throwIfAborted(signal);
 	const data = await vscode.workspace.fs.readFile(uri);
-	if (data.length > (options.maxFileBytes ?? 300000) || isProbablyBinary(data)) {
-		throw new Error('File is binary or exceeds the agent file size limit.');
+	if (isProbablyBinary(data)) {
+		throw new Error('File is binary.');
 	}
 	const text = decodeUtf8(data);
 	const maxChars = options.maxReadChars ?? 50000;

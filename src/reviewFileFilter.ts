@@ -1,6 +1,6 @@
 import { spawn } from 'child_process';
 import * as vscode from 'vscode';
-import { isWikiPath, isWikiStatePath } from './wiki/paths';
+import { isWikiPath } from './wiki/paths';
 
 export function normalizeReviewPath(relativePath: string): string {
 	return relativePath.replace(/\\/g, '/');
@@ -21,13 +21,7 @@ export function shouldSkipReviewPath(
 	reviewWikiChanges = vscode.workspace.getConfiguration('cliDiff').get<boolean>('reviewWikiChanges', true),
 ): boolean {
 	const normalized = normalizeReviewPath(relativePath);
-	if (isWikiStatePath(normalized)) {
-		return true;
-	}
-	if (isWikiPath(normalized)) {
-		return !reviewWikiChanges || !normalized.endsWith('.md');
-	}
-	return isDotReviewPath(normalized);
+	return isWikiPath(normalized) && !reviewWikiChanges;
 }
 
 export async function gitIgnoredReviewPaths(root: vscode.WorkspaceFolder, relativePaths: string[]): Promise<Set<string>> {

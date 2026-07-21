@@ -308,6 +308,42 @@ suite('Review webview compatibility', () => {
 });
 
 suite('Extension configuration', () => {
+	test('declares settings in the intended display order', () => {
+		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+			contributes?: { configuration?: { properties?: Record<string, { order?: number }> } };
+		};
+		const expected = [
+			'cliDiff.autoStartGitReview',
+			'cliDiff.refreshDebounceMs',
+			'cliDiff.reviewWikiChanges',
+			'cliDiff.reviewEditorMode',
+			'cliDiff.aiReviewStrategy',
+			'cliDiff.aiReviewMaxRounds',
+			'cliDiff.aiReviewFileConcurrency',
+			'cliDiff.aiReviewLanguage',
+		];
+		const properties = manifest.contributes?.configuration?.properties ?? {};
+		assert.deepStrictEqual(Object.keys(properties), expected);
+		assert.deepStrictEqual(expected.map((key) => properties[key]?.order), [1, 2, 3, 4, 5, 6, 7, 8]);
+	});
+
+	test('declares one refresh debounce setting for background synchronization', () => {
+		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
+			contributes?: { configuration?: { properties?: Record<string, unknown> } };
+		};
+		const setting = manifest.contributes?.configuration?.properties?.['cliDiff.refreshDebounceMs'] as {
+			type?: unknown;
+			default?: unknown;
+			minimum?: unknown;
+			description?: unknown;
+		} | undefined;
+		assert.ok(setting);
+		assert.strictEqual(setting.type, 'number');
+		assert.strictEqual(setting.default, 500);
+		assert.strictEqual(setting.minimum, 0);
+		assert.match(String(setting.description), /Editor text changes still refresh only after save/);
+	});
+
 	test('removes snapshot commands and quadratic diff configuration', () => {
 		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
 			activationEvents?: string[];
@@ -318,7 +354,7 @@ suite('Extension configuration', () => {
 		assert.strictEqual(commands.has('cli-diff.captureBaseline'), false);
 		assert.strictEqual(commands.has('cli-diff.startSnapshotReview'), false);
 		assert.strictEqual(manifest.activationEvents?.some((event) => event.includes('Snapshot') || event.includes('captureBaseline')), false);
-		for (const key of ['cliDiff.maxFiles', 'cliDiff.maxDiffLines', 'cliDiff.maxDiffCells', 'cliDiff.exclude']) {
+		for (const key of ['cliDiff.maxFiles', 'cliDiff.maxDiffLines', 'cliDiff.maxDiffCells', 'cliDiff.maxFileBytes', 'cliDiff.exclude', 'cliDiff.nativeDiffInline', 'cliDiff.aiReviewFindingOrder']) {
 			assert.strictEqual(Object.prototype.hasOwnProperty.call(properties, key), false);
 		}
 	});
@@ -377,7 +413,7 @@ suite('Extension configuration', () => {
 		} | undefined;
 
 		assert.ok(setting);
-		assert.strictEqual(setting.default, 64);
+		assert.strictEqual(setting.default, 32);
 		assert.strictEqual(setting.minimum, 0);
 		assert.strictEqual(Object.prototype.hasOwnProperty.call(setting, 'maximum'), false);
 		assert.match(String(setting.description), /0 means unlimited/);
@@ -395,7 +431,7 @@ suite('Extension configuration', () => {
 
 		assert.ok(setting);
 		assert.strictEqual(setting.type, 'string');
-		assert.strictEqual(setting.default, 'Auto');
+		assert.strictEqual(setting.default, 'Multi');
 		assert.deepStrictEqual(setting.enum, ['Auto', 'Multi', 'FileOnly']);
 	});
 
@@ -413,7 +449,7 @@ suite('Extension configuration', () => {
 
 		assert.ok(setting);
 		assert.strictEqual(setting.type, 'number');
-		assert.strictEqual(setting.default, 1);
+		assert.strictEqual(setting.default, 3);
 		assert.strictEqual(setting.minimum, 0);
 		assert.match(String(setting.description), /0 runs all pending files concurrently/);
 	});
@@ -433,15 +469,6 @@ suite('Extension configuration', () => {
 		assert.deepStrictEqual(setting.enum, ['nativeEditor', 'reviewPage']);
 		assert.deepStrictEqual(setting.enumItemLabels, ['Native inline diff editor', 'Review page']);
 
-		const inlineSetting = manifest.contributes?.configuration?.properties?.['cliDiff.nativeDiffInline'] as {
-			default?: unknown;
-			type?: unknown;
-			description?: unknown;
-		} | undefined;
-		assert.ok(inlineSetting);
-		assert.strictEqual(inlineSetting.type, 'boolean');
-		assert.strictEqual(inlineSetting.default, true);
-		assert.match(String(inlineSetting.description), /diffEditor\.renderSideBySide/);
 	});
 });
 
@@ -481,9 +508,10 @@ suite('Review controller bulk actions', () => {
 		assert.ok(source.includes("event.affectsConfiguration('cliDiff.aiReviewMaxRounds')"));
 		assert.ok(source.includes("event.affectsConfiguration('cliDiff.aiReviewStrategy')"));
 		assert.ok(source.includes("event.affectsConfiguration('cliDiff.aiReviewFileConcurrency')"));
-		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewMaxRounds', 64)"));
-		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<string>('aiReviewStrategy', 'Auto')"));
-		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewFileConcurrency', 1)"));
+		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewMaxRounds', 32)"));
+		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<string>('aiReviewStrategy', 'Multi')"));
+		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewFileConcurrency', 3)"));
+		assert.strictEqual(source.includes('aiReviewFindingOrder'), false);
 		assert.ok(source.includes('const strategy = this.aiReviewStrategy();'));
 		assert.ok(source.includes('const fileConcurrency = this.aiReviewFileConcurrency();'));
 		assert.ok(source.includes('strategy,'));
@@ -510,6 +538,14 @@ suite('Review controller bulk actions', () => {
 		assert.ok(source.includes('await this.saveAiReviewWithCurrentSignature(storedReview'));
 		assert.ok(source.includes('this.findRegeneratedSuggestionHunk'));
 		assert.ok(source.includes('await this.refreshGitReviewFile(file.uri)'));
+	});
+
+	test('uses one configured debounce for file, Git, and AI dashboard refreshes', () => {
+		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
+		assert.ok(source.includes("get<number>('refreshDebounceMs', 500)"));
+		assert.strictEqual((source.match(/this\.refreshDebounceMs\(\)/g) ?? []).length, 3);
+		assert.ok(source.includes('if (!event.document.isDirty)'));
+		assert.ok(source.includes('await this.flushHumanEdits(document)'));
 	});
 
 	test('wires review editor mode through native editor and review page presenters', () => {
@@ -555,8 +591,9 @@ suite('Review controller bulk actions', () => {
 		assert.ok(nativeSource.includes("'original' in input"));
 		assert.ok(nativeSource.includes("'modified' in input"));
 		assert.ok(nativeSource.includes('private isUriLike(value: unknown): value is vscode.Uri'));
-		assert.ok(nativeSource.includes("get<boolean>('nativeDiffInline', true)"));
-		assert.ok(nativeSource.includes("diffConfig.update('renderSideBySide', false, vscode.ConfigurationTarget.Workspace)"));
+		assert.strictEqual(nativeSource.includes('nativeDiffInline'), false);
+		assert.strictEqual(nativeSource.includes('ensureInlineDiffMode'), false);
+		assert.strictEqual(nativeSource.includes('renderSideBySide'), false);
 		assert.strictEqual(nativeSource.includes('registerCodeLensProvider'), false);
 		assert.strictEqual(nativeSource.includes('provideReviewCodeLenses'), false);
 		assert.strictEqual(nativeSource.includes("diffConfig.update('codeLens'"), false);
@@ -635,21 +672,25 @@ suite('Review controller bulk actions', () => {
 });
 
 suite('Review state', () => {
-	test('skips dot files and dot folders in review file discovery', () => {
+	test('uses only the Wiki setting as a plugin-owned review path filter', () => {
 		assert.strictEqual(isDotReviewPath('.env'), true);
 		assert.strictEqual(isDotReviewPath('.github/workflows/release.yml'), true);
 		assert.strictEqual(isDotReviewPath('src/.cache/output.txt'), true);
+		assert.strictEqual(shouldSkipReviewPath('.env'), false);
+		assert.strictEqual(shouldSkipReviewPath('.github/workflows/release.yml'), false);
+		assert.strictEqual(shouldSkipReviewPath('src/.cache/output.txt'), false);
 		assert.strictEqual(shouldSkipReviewPath('src/app.ts'), false);
 		assert.strictEqual(shouldSkipReviewPath('src/file.name.ts'), false);
 		assert.strictEqual(shouldSkipReviewPath('.agents/skills/llm-code-wiki/SKILL.md', true), false);
 		assert.strictEqual(shouldSkipReviewPath('.agents/skills/llm-code-wiki/references/overview.md', true), false);
 		assert.strictEqual(shouldSkipReviewPath('.agents/skills/llm-code-wiki/references/overview.md', false), true);
-		assert.strictEqual(shouldSkipReviewPath('.agents/skills/llm-code-wiki/.state.json', true), true);
-		assert.strictEqual(shouldSkipReviewPath('.agents/skills/llm-code-wiki/private.json', true), true);
-		assert.strictEqual(shouldSkipReviewPath('.skills/llm-code-wiki/SKILL.md', true), true);
-		assert.strictEqual(shouldSkipReviewPath('.agents/skills/other-skill/SKILL.md', true), true);
-		assert.strictEqual(shouldSkipReviewPath('.skills/other-skill/SKILL.md', true), true);
-		assert.strictEqual(shouldSkipReviewPath('.wiki/overview.md', true), true);
+		assert.strictEqual(shouldSkipReviewPath('.agents/skills/llm-code-wiki/.state.json', true), false);
+		assert.strictEqual(shouldSkipReviewPath('.agents/skills/llm-code-wiki/private.json', true), false);
+		assert.strictEqual(shouldSkipReviewPath('.agents/skills/llm-code-wiki/.state.json', false), true);
+		assert.strictEqual(shouldSkipReviewPath('.skills/llm-code-wiki/SKILL.md', true), false);
+		assert.strictEqual(shouldSkipReviewPath('.agents/skills/other-skill/SKILL.md', true), false);
+		assert.strictEqual(shouldSkipReviewPath('.skills/other-skill/SKILL.md', true), false);
+		assert.strictEqual(shouldSkipReviewPath('.wiki/overview.md', true), false);
 	});
 
 	test('treats mismatched expected revisions as stale', () => {
@@ -1367,6 +1408,21 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('function renderReviewFileDetail'));
 		assert.ok(view.webview.html.includes('function restoreScrollTop'));
 		assert.ok(view.webview.html.includes('const pendingScrollTops = new WeakMap()'));
+		assert.ok(view.webview.html.includes('const suggestionScrollPositions = new Map()'));
+		assert.ok(view.webview.html.includes('function captureSuggestionScrollPositions'));
+		assert.ok(view.webview.html.includes('function pruneSuggestionScrollPositions'));
+		assert.ok(view.webview.html.includes('function restoreSuggestionScrollPosition'));
+		assert.ok(view.webview.html.includes('function reviewFileDetailSignature'));
+		assert.ok(view.webview.html.includes('let renderedReviewDetailSignature'));
+		assert.ok(view.webview.html.includes('renderedReviewDetailSignature === nextSignature'));
+		assert.ok(view.webview.html.includes('renderedReviewDetailSignature = nextSignature'));
+		assert.ok(view.webview.html.includes('pre.dataset.suggestionScrollKey = scrollKey'));
+		assert.ok(view.webview.html.includes('top: pre.scrollTop'));
+		assert.ok(view.webview.html.includes('left: pre.scrollLeft'));
+		assert.ok(view.webview.html.includes('pre.scrollTop = Math.min(position.top'));
+		assert.ok(view.webview.html.includes('pre.scrollLeft = Math.min(position.left'));
+		assert.strictEqual(view.webview.html.includes("pre.addEventListener('scroll'"), false);
+		assert.ok(view.webview.html.includes('overscroll-behavior: contain'));
 		assert.ok(view.webview.html.includes('const pendingScrollTop = pendingScrollTops.get(container)'));
 		assert.ok(view.webview.html.includes('pendingScrollTops.delete(container)'));
 		assert.ok(view.webview.html.includes('const listScrollTop = list.scrollTop'));
@@ -3306,7 +3362,7 @@ suite('AI review findings', () => {
 		assert.ok(filtered.diagnostics.dropped.some((item) => item.reason.includes('severity')));
 	});
 
-	test('sorts findings by chunk by default and severity when configured', () => {
+	test('sorts findings by chunk position', () => {
 		const uri = vscode.Uri.file('/repo/src/app.ts');
 		const hunks = computeLineDiff(uri.toString(), 'a\nold\nc\nold2\n', 'a\nnew\nc\nnew2\n');
 		const file = reviewFileState(uri, 'src/app.ts', { hunks });
@@ -3317,8 +3373,7 @@ suite('AI review findings', () => {
 			],
 		}, file);
 
-		assert.deepStrictEqual(sortFindings(findings, [file], 'chunk').map((item) => item.title), ['Earlier', 'Later']);
-		assert.deepStrictEqual(sortFindings(findings, [file], 'severity').map((item) => item.title), ['Later', 'Earlier']);
+		assert.deepStrictEqual(sortFindings(findings, [file]).map((item) => item.title), ['Earlier', 'Later']);
 	});
 
 	test('keeps review signature stable across review-only transitions and skips Wiki files', async () => {
@@ -3886,6 +3941,27 @@ suite('Git service', () => {
 		}
 	});
 
+	test('reviews untracked files larger than the former file-size limit', async function (this: Mocha.Context) {
+		this.timeout(30000);
+		const root = createTempGitRepo();
+		try {
+			writeRepoFile(root, 'tracked.txt', 'base\n');
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+			const contents = `${'x'.repeat(2_200_000)}\n`;
+			writeRepoFile(root, 'large.txt', contents);
+
+			const service = new GitService();
+			const pair = filePairsByPath(await service.createFilePairs(workspaceFolder(root))).get('large.txt');
+			assert.ok(pair);
+			assert.strictEqual(pair.skippedReason, undefined);
+			assert.strictEqual(pair.newText, contents);
+			assert.strictEqual(pair.pendingHunks?.length, 1);
+		} finally {
+			removeTempRepo(root);
+		}
+	});
+
 	test('rejects an added block by removing it from the working file', async function (this: Mocha.Context) {
 		this.timeout(30000);
 		const root = createTempGitRepo();
@@ -3971,15 +4047,15 @@ suite('Git service', () => {
 			writeRepoFile(root, '.skills/llm-code-wiki/SKILL.md', '# Old Skill\n');
 			pairs = await service.createFilePairs(folder);
 			byPath = filePairsByPath(pairs);
-			assert.strictEqual(byPath.has('.env'), false);
-			assert.strictEqual(byPath.has('.cache/output.txt'), false);
-			assert.strictEqual(byPath.has('.gitignore'), false);
+			assert.strictEqual(byPath.has('.env'), true);
+			assert.strictEqual(byPath.has('.cache/output.txt'), true);
+			assert.strictEqual(byPath.has('.gitignore'), true);
 			assert.strictEqual(byPath.has('ignored.txt'), false);
 			assert.strictEqual(byPath.has('.agents/skills/llm-code-wiki/SKILL.md'), true);
 			assert.strictEqual(byPath.has('.agents/skills/llm-code-wiki/references/overview.md'), true);
-			assert.strictEqual(byPath.has('.agents/skills/llm-code-wiki/.state.json'), false);
-			assert.strictEqual(byPath.has('.agents/skills/other-skill/SKILL.md'), false);
-			assert.strictEqual(byPath.has('.skills/llm-code-wiki/SKILL.md'), false);
+			assert.strictEqual(byPath.has('.agents/skills/llm-code-wiki/.state.json'), true);
+			assert.strictEqual(byPath.has('.agents/skills/other-skill/SKILL.md'), true);
+			assert.strictEqual(byPath.has('.skills/llm-code-wiki/SKILL.md'), true);
 		} finally {
 			removeTempRepo(root);
 		}
@@ -4058,7 +4134,7 @@ suite('Git service', () => {
 	});
 
 	test('changes the index signature only for index or HEAD changes', async function (this: Mocha.Context) {
-		this.timeout(10000);
+		this.timeout(30000);
 		const root = createTempGitRepo();
 		try {
 			writeRepoFile(root, 'tracked.txt', 'base\n');

@@ -1,6 +1,6 @@
 import { createHash } from 'crypto';
 import * as vscode from 'vscode';
-import { gitIgnoredReviewPaths, normalizeReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
+import { gitIgnoredReviewPaths, isDotReviewPath, normalizeReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
 import { decodeUtf8, encodeUtf8, isProbablyBinary, relativePath } from '../text';
 import { isAbortError, throwIfAborted } from './cancellation';
 import {
@@ -219,7 +219,7 @@ export class WikiStateService {
 		for (const uri of uris) {
 			throwIfAborted(signal);
 			const currentPath = paths.get(uri.toString()) ?? normalizeReviewPath(relativePath(root.uri, uri));
-			if (isGeneratedAgentsGuidancePath(currentPath) || shouldSkipReviewPath(currentPath, false) || ignored.has(currentPath)) {
+			if (isGeneratedAgentsGuidancePath(currentPath) || isDotReviewPath(currentPath) || shouldSkipReviewPath(currentPath, false) || ignored.has(currentPath)) {
 				continue;
 			}
 			try {

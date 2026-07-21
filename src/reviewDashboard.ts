@@ -1048,6 +1048,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			margin: 0;
 			padding: 6px;
 			overflow: auto;
+			overscroll-behavior: contain;
 			white-space: pre-wrap;
 			overflow-wrap: anywhere;
 			font-family: var(--vscode-editor-font-family);
@@ -1505,7 +1506,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		let lastFiles = [];
 		let reviewDetailUri;
 		let renderedReviewDetailUri;
+		let renderedReviewDetailSignature;
 		const pendingScrollTops = new WeakMap();
+		const suggestionScrollPositions = new Map();
 		toggle.addEventListener('click', () => setExpanded(!expanded));
 		toggle.addEventListener('keydown', (event) => {
 			if (event.key === 'Enter' || event.key === ' ') {
@@ -1542,6 +1545,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		function render(payload) {
 			const files = payload.files || [];
 			const listScrollTop = list.scrollTop;
+			captureSuggestionScrollPositions();
+			pruneSuggestionScrollPositions(files);
 			tree.style.removeProperty('--file-extension-column-width');
 			lastFiles = files;
 			renderTrackingTarget(payload.trackingTarget);
@@ -1591,6 +1596,63 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
 				container.scrollTop = Math.min(targetScrollTop, maxScrollTop);
 				pendingScrollTops.delete(container);
+			});
+		}
+
+		function suggestionScrollKey(file, suggestion) {
+			return file.uri + '::' + suggestion.id;
+		}
+
+		function captureSuggestionScrollPositions() {
+			for (const pre of reviewFileDetail.querySelectorAll('.review-suggestion-pre[data-suggestion-scroll-key]')) {
+				suggestionScrollPositions.set(pre.dataset.suggestionScrollKey, {
+					top: pre.scrollTop,
+					left: pre.scrollLeft,
+				});
+			}
+		}
+
+		function pruneSuggestionScrollPositions(files) {
+			const validKeys = new Set();
+			for (const file of files) {
+				for (const chunk of file.chunks || []) {
+					for (const suggestion of chunk.suggestions || []) {
+						validKeys.add(suggestionScrollKey(file, suggestion));
+					}
+				}
+			}
+			for (const key of suggestionScrollPositions.keys()) {
+				if (!validKeys.has(key)) {
+					suggestionScrollPositions.delete(key);
+				}
+			}
+		}
+
+		function restoreSuggestionScrollPosition(pre, key) {
+			const position = suggestionScrollPositions.get(key);
+			if (!position) {
+				return;
+			}
+			requestAnimationFrame(() => {
+				if (!pre.isConnected || pre.dataset.suggestionScrollKey !== key) {
+					return;
+				}
+				pre.scrollTop = Math.min(position.top, Math.max(0, pre.scrollHeight - pre.clientHeight));
+				pre.scrollLeft = Math.min(position.left, Math.max(0, pre.scrollWidth - pre.clientWidth));
+			});
+		}
+
+		function reviewFileDetailSignature(file) {
+			if (!file) {
+				return '';
+			}
+			return JSON.stringify({
+				uri: file.uri,
+				revision: file.revision,
+				relativePath: file.relativePath,
+				dirty: file.dirty,
+				chunks: file.chunks || [],
+				aiReviewResult: file.aiReviewResult,
 			});
 		}
 
@@ -1914,6 +1976,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 
 		function renderReviewFileDetail(file) {
+			const nextSignature = reviewFileDetailSignature(file);
+			if (renderedReviewDetailUri === file?.uri && renderedReviewDetailSignature === nextSignature) {
+				reviewFileDetail.hidden = !file;
+				return;
+			}
+			captureSuggestionScrollPositions();
 			const shouldRestoreScroll = Boolean(file) && renderedReviewDetailUri === file.uri;
 			const pendingDetailScrollTop = pendingScrollTops.get(reviewFileDetail);
 			const detailScrollTop = shouldRestoreScroll
@@ -1923,6 +1991,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				pendingScrollTops.delete(reviewFileDetail);
 			}
 			renderedReviewDetailUri = file?.uri;
+			renderedReviewDetailSignature = nextSignature;
 			reviewFileDetail.replaceChildren();
 			reviewFileDetail.hidden = !file;
 			if (!file) {
@@ -2086,7 +2155,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			wrapper.appendChild(header);
 			const pre = document.createElement('pre');
 			pre.className = 'review-suggestion-pre';
+			const scrollKey = suggestionScrollKey(file, suggestion);
+			pre.dataset.suggestionScrollKey = scrollKey;
 			pre.textContent = suggestion.replacementText;
+			restoreSuggestionScrollPosition(pre, scrollKey);
 			wrapper.appendChild(pre);
 			if (suggestion.rationale) {
 				const rationale = document.createElement('div');

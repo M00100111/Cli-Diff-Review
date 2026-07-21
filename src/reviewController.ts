@@ -205,8 +205,7 @@ export class ReviewController implements vscode.Disposable {
 					void this.refreshAll();
 				} else if (event.affectsConfiguration('cliDiff.reviewEditorMode')) {
 					this.refreshReviewPresentation();
-				} else if (event.affectsConfiguration('cliDiff.aiReviewFindingOrder')
-					|| event.affectsConfiguration('cliDiff.aiReviewLanguage')
+				} else if (event.affectsConfiguration('cliDiff.aiReviewLanguage')
 					|| event.affectsConfiguration('cliDiff.aiReviewMaxRounds')
 					|| event.affectsConfiguration('cliDiff.aiReviewFileConcurrency')
 					|| event.affectsConfiguration('cliDiff.aiReviewStrategy')) {
@@ -2780,17 +2779,17 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private aiReviewStrategy(): AiReviewStrategy {
-		const configured = vscode.workspace.getConfiguration('cliDiff').get<string>('aiReviewStrategy', 'Auto');
-		return configured === 'Multi' || configured === 'FileOnly' ? configured : 'Auto';
+		const configured = vscode.workspace.getConfiguration('cliDiff').get<string>('aiReviewStrategy', 'Multi');
+		return configured === 'Auto' || configured === 'FileOnly' ? configured : 'Multi';
 	}
 	private aiReviewFileConcurrency(): number {
-		const configured = vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewFileConcurrency', 1);
+		const configured = vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewFileConcurrency', 3);
 		return typeof configured === 'number' && Number.isFinite(configured)
 			? Math.max(0, Math.floor(configured))
-			: 1;
+			: 3;
 	}
 	private aiReviewMaxRounds(): number | 'unlimited' {
-		const configured = vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewMaxRounds', 64);
+		const configured = vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewMaxRounds', 32);
 		if (configured === 0) {
 			return 'unlimited';
 		}
@@ -3203,6 +3202,13 @@ export class ReviewController implements vscode.Disposable {
 		this.scheduleLlmWikiDashboardRefresh();
 	}
 
+	private refreshDebounceMs(): number {
+		const configured = vscode.workspace.getConfiguration('cliDiff').get<number>('refreshDebounceMs', 500);
+		return typeof configured === 'number' && Number.isFinite(configured)
+			? Math.max(0, Math.floor(configured))
+			: 500;
+	}
+
 	private scheduleLlmWikiDashboardRefresh(): void {
 		if (this.llmDashboardRefreshTimer) {
 			clearTimeout(this.llmDashboardRefreshTimer);
@@ -3210,7 +3216,7 @@ export class ReviewController implements vscode.Disposable {
 		this.llmDashboardRefreshTimer = setTimeout(() => {
 			this.llmDashboardRefreshTimer = undefined;
 			void this.refreshLlmWikiDashboardState();
-		}, 500);
+		}, this.refreshDebounceMs());
 	}
 
 	private refreshReviewPresentation(uri?: vscode.Uri): void {
@@ -3310,9 +3316,8 @@ export class ReviewController implements vscode.Disposable {
 		const aiReviewStatus = storedReview?.status ?? 'none';
 		const aiReviewCompletedFileCount = storedReview?.completedFiles.length ?? 0;
 		const aiReviewTotalFileCount = pendingSourceFiles.length;
-		const findingOrder = vscode.workspace.getConfiguration('cliDiff').get<'chunk' | 'severity'>('aiReviewFindingOrder', 'chunk');
 		const reviewFindings = storedReview && visibleSession
-			? sortFindings(storedReview.findings, visibleSession.files.values(), findingOrder)
+			? sortFindings(storedReview.findings, visibleSession.files.values())
 			: [];
 		const reviewSuggestions = storedReview
 			? [...storedReview.suggestions].sort((left, right) => left.relativePath.localeCompare(right.relativePath)
@@ -3326,7 +3331,6 @@ export class ReviewController implements vscode.Disposable {
 			? sortFindings(
 				reviewFindings.filter((finding) => uriKey(vscode.Uri.parse(finding.uri)) === uriKey(this.currentReviewUri as vscode.Uri)),
 				visibleSession.files.values(),
-				findingOrder,
 			)
 			: [];
 		let wikiNeedsUpdate = Boolean(this.llmConfigState.configured && root && wikiState?.status === 'ready' && !hasPending && !this.currentWikiTask
@@ -3464,7 +3468,7 @@ export class ReviewController implements vscode.Disposable {
 		this.gitRefreshTimer = setTimeout(() => {
 			this.gitRefreshTimer = undefined;
 			void this.refreshGitSessionFiles({ source: 'gitIndexChanged' });
-		}, 250);
+		}, this.refreshDebounceMs());
 	}
 
 	private touchFileRevision(file: ReviewFileState): void {
@@ -4016,7 +4020,7 @@ export class ReviewController implements vscode.Disposable {
 		this.refreshTimers.set(key, setTimeout(() => {
 			this.refreshTimers.delete(key);
 			void this.refreshFile(uri, { preferDisk: options.preferDisk });
-		}, 250));
+		}, this.refreshDebounceMs()));
 	}
 
 	private async ensureVisibleEditorsReviewed(): Promise<void> {

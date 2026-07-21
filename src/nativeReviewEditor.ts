@@ -70,7 +70,6 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 		}
 
 		try {
-			await this.ensureInlineDiffMode();
 			await vscode.commands.executeCommand(
 				'vscode.diff',
 				this.reviewDocumentUri(file, 'before'),
@@ -267,17 +266,6 @@ export class NativeReviewEditorManager implements vscode.Disposable {
 			} catch {
 				return undefined;
 			}
-		}
-	}
-
-	private async ensureInlineDiffMode(): Promise<void> {
-		if (!vscode.workspace.getConfiguration('cliDiff').get<boolean>('nativeDiffInline', true)) {
-			return;
-		}
-
-		const diffConfig = vscode.workspace.getConfiguration('diffEditor');
-		if (diffConfig.get<boolean>('renderSideBySide') !== false) {
-			await diffConfig.update('renderSideBySide', false, vscode.ConfigurationTarget.Workspace);
 		}
 	}
 

@@ -26,11 +26,10 @@ export function parseGitPatch(
 	patch: string,
 	projectId: string,
 	layer: 'pending' | 'accepted',
-	maxFileBytes = Number.POSITIVE_INFINITY,
 ): ParsedGitFilePatch[] {
 	const blocks = splitFileBlocks(patch);
 	const occurrences = new Map<string, number>();
-	return blocks.map((block) => parseFileBlock(block, projectId, layer, maxFileBytes, occurrences));
+	return blocks.map((block) => parseFileBlock(block, projectId, layer, occurrences));
 }
 
 export function combineGitHunkPatches(hunks: Array<Pick<GitReviewHunk, 'patchHeader' | 'rawHunk' | 'patch'>>): string {
@@ -128,7 +127,6 @@ function parseFileBlock(
 	block: string,
 	projectId: string,
 	layer: 'pending' | 'accepted',
-	maxFileBytes: number,
 	occurrences: Map<string, number>,
 ): ParsedGitFilePatch {
 	const lines = splitPreservingEndings(block);
@@ -144,9 +142,7 @@ function parseFileBlock(
 	const relativePath = newPath ?? oldPath ?? fallbackPaths.newPath ?? fallbackPaths.oldPath ?? 'unknown';
 	const byteLength = Buffer.byteLength(block, 'utf8');
 	let unsupportedReason: string | undefined;
-	if (byteLength > maxFileBytes) {
-		unsupportedReason = 'File exceeds cliDiff.maxFileBytes.';
-	} else if (/^(?:GIT binary patch|Binary files .* differ)$/m.test(block)) {
+	if (/^(?:GIT binary patch|Binary files .* differ)$/m.test(block)) {
 		unsupportedReason = 'Unsupported Git change: binary file.';
 	} else if (/^[+-]Subproject commit /m.test(block) || /(?:^|\s)160000(?:\s|$)/m.test(block)) {
 		unsupportedReason = 'Unsupported Git change: submodule.';
