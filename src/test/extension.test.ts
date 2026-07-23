@@ -1405,7 +1405,22 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('function runLogEntryKey'));
 		assert.ok(view.webview.html.includes('const runLogScrollTop = wikiRunList.scrollTop'));
 		assert.ok(view.webview.html.includes('restoreScrollTop(wikiRunList, runLogScrollTop)'));
+		assert.ok(view.webview.html.includes('const runLogDetailScrollPositions = new Map()'));
+		assert.ok(view.webview.html.includes('function captureRunLogDetailScrollPositions'));
+		assert.ok(view.webview.html.includes('function pruneRunLogDetailScrollPositions'));
+		assert.ok(view.webview.html.includes('function restoreRunLogDetailScrollPosition'));
+		assert.ok(view.webview.html.includes('let renderedRunLogSignature'));
+		assert.ok(view.webview.html.includes('renderedRunLogSignature === nextSignature'));
+		assert.ok(view.webview.html.includes('pre.dataset.runLogDetailScrollKey = scrollKey'));
 		assert.ok(view.webview.html.includes('function renderReviewFileDetail'));
+		assert.ok(view.webview.html.includes('function shouldNavigateReviewCard'));
+		assert.ok(view.webview.html.includes("target?.closest('button, a')"));
+		assert.ok(view.webview.html.includes('selection.toString().length === 0'));
+		assert.ok(view.webview.html.includes('container.contains(selection.anchorNode)'));
+		assert.ok(view.webview.html.includes("wrapper.addEventListener('click'"));
+		assert.ok(view.webview.html.includes("vscode.postMessage({ type: 'openChunk', uri: file.uri, hunkId: chunk.hunkId })"));
+		assert.strictEqual(view.webview.html.includes("container.addEventListener('click', openPrimary)"), false);
+		assert.ok(view.webview.html.includes('if (shouldNavigateReviewCard(event, container))'));
 		assert.ok(view.webview.html.includes('function restoreScrollTop'));
 		assert.ok(view.webview.html.includes('const pendingScrollTops = new WeakMap()'));
 		assert.ok(view.webview.html.includes('const suggestionScrollPositions = new Map()'));
@@ -1423,6 +1438,7 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('pre.scrollLeft = Math.min(position.left'));
 		assert.strictEqual(view.webview.html.includes("pre.addEventListener('scroll'"), false);
 		assert.ok(view.webview.html.includes('overscroll-behavior: contain'));
+		assert.ok(view.webview.html.includes('user-select: text'));
 		assert.ok(view.webview.html.includes('const pendingScrollTop = pendingScrollTops.get(container)'));
 		assert.ok(view.webview.html.includes('pendingScrollTops.delete(container)'));
 		assert.ok(view.webview.html.includes('const listScrollTop = list.scrollTop'));
@@ -2712,6 +2728,7 @@ suite('Agent runtime', () => {
 		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'read_wiki_file'), true);
 		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'search_wiki_files'), true);
 		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'search_workspace'), true);
+		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'list_workspace_directory'), true);
 		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'read_workspace_file'), true);
 		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'read_pending_change'), true);
 		assert.strictEqual(toolsWithWiki.some((tool) => tool.name === 'write_wiki_file'), false);
@@ -2720,7 +2737,15 @@ suite('Agent runtime', () => {
 			content: string;
 			currentExists: boolean;
 			contentSource: string;
+			startLine: number;
+			endLine: number;
+			totalLines: number;
 		};
+		const readTool = tools.find((tool) => tool.name === 'read_workspace_file');
+		if (!readTool) {
+			throw new Error('read_workspace_file tool is unavailable');
+		}
+		const readSchema = readTool.parameters as { required?: string[]; properties?: Record<string, unknown>; additionalProperties?: boolean };
 		const searchTool = tools.find((tool) => tool.name === 'search_workspace');
 		if (!searchTool) {
 			throw new Error('search_workspace tool is unavailable');
@@ -2739,6 +2764,13 @@ suite('Agent runtime', () => {
 		assert.strictEqual(read.content, 'export const removed = true;\n');
 		assert.strictEqual(read.currentExists, false);
 		assert.strictEqual(read.contentSource, 'reviewOldText');
+		assert.strictEqual(read.startLine, 1);
+		assert.strictEqual(read.endLine, 1);
+		assert.strictEqual(read.totalLines, 1);
+		assert.deepStrictEqual(readSchema.required, ['path', 'offset', 'limit']);
+		assert.ok(readSchema.properties?.offset);
+		assert.ok(readSchema.properties?.limit);
+		assert.strictEqual(readSchema.additionalProperties, false);
 		assert.strictEqual(search.matches[0].path, 'src/deleted.ts');
 		assert.ok(search.matches[0].text.includes('removed'));
 		assert.strictEqual(fuzzy.matches[0].path, 'src/deleted.ts');
@@ -2747,6 +2779,74 @@ suite('Agent runtime', () => {
 			() => searchTool.execute({ query: '[', mode: 'regex', limit: 10 }, undefined),
 			/SyntaxError/,
 		);
+	});
+
+	test('reads workspace files by line range and distinguishes files from directories', async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-agent-tools-'));
+		try {
+			writeRepoFile(root, 'src/app.go', 'first\r\nsecond\r\nthird');
+			writeRepoFile(root, 'src/nested/helper.go', 'package nested\n');
+			writeRepoFile(root, 'src/.hidden.go', 'package hidden\n');
+			writeRepoFile(root, 'node_modules/package/index.js', 'module.exports = {};\n');
+			const tools = createReadOnlyAgentTools({ root: workspaceFolder(root) });
+			const read = tools.find((tool) => tool.name === 'read_workspace_file');
+			const list = tools.find((tool) => tool.name === 'list_workspace_directory');
+			assert.ok(read);
+			assert.ok(list);
+
+			const range = await read.execute({ path: 'src/app.go', offset: 2, limit: 2 }, undefined) as {
+				content: string;
+				truncated: boolean;
+				startLine: number;
+				endLine: number;
+				totalLines: number;
+				contentSource: string;
+			};
+			assert.deepStrictEqual(range, {
+				path: 'src/app.go',
+				content: 'second\r\nthird',
+				truncated: true,
+				currentExists: true,
+				contentSource: 'workspace',
+				startLine: 2,
+				endLine: 3,
+				totalLines: 3,
+			});
+			const complete = await read.execute({ path: 'src/app.go', offset: 1, limit: 0 }, undefined) as { content: string; truncated: boolean };
+			assert.strictEqual(complete.content, 'first\r\nsecond\r\nthird');
+			assert.strictEqual(complete.truncated, false);
+
+			const beyondEnd = await read.execute({ path: 'src/app.go', offset: 20, limit: 5 }, undefined) as {
+				content: string;
+				startLine: number;
+				endLine: number;
+				totalLines: number;
+			};
+			assert.strictEqual(beyondEnd.content, '');
+			assert.strictEqual(beyondEnd.startLine, 20);
+			assert.strictEqual(beyondEnd.endLine, 19);
+			assert.strictEqual(beyondEnd.totalLines, 3);
+
+			assert.deepStrictEqual(await list.execute({ path: 'src' }, undefined), {
+				path: 'src',
+				entries: [
+					{ name: 'nested', path: 'src/nested', type: 'directory' },
+					{ name: 'app.go', path: 'src/app.go', type: 'file' },
+				],
+			});
+			const rootListing = await list.execute({ path: '.' }, undefined) as { entries: Array<{ path: string }> };
+			assert.deepStrictEqual(rootListing.entries.map((entry) => entry.path), ['src']);
+
+			await assert.rejects(() => read.execute({ path: 'src' }, undefined), /is a directory, not a file.*list_workspace_directory/);
+			await assert.rejects(() => read.execute({ path: 'missing.go' }, undefined), /does not exist or cannot be accessed/);
+			await assert.rejects(() => read.execute({ path: 'src/app.go', offset: 0 }, undefined), /offset must be a positive integer/);
+			await assert.rejects(() => read.execute({ path: 'src/app.go', limit: 1.5 }, undefined), /limit must be a non-negative integer/);
+			await assert.rejects(() => list.execute({ path: 'src/app.go' }, undefined), /is a file.*read_workspace_file/);
+			await assert.rejects(() => list.execute({ path: 'missing' }, undefined), /does not exist or cannot be accessed/);
+			await assert.rejects(() => list.execute({ path: '../outside' }, undefined), /Invalid relative path/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	test('protects Wiki template and state files from Agent writes', async () => {

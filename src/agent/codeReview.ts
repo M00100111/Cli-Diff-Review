@@ -464,7 +464,7 @@ export class CodeReviewAgentService {
 			systemPrompt: knowledgeRetrievalSystemPrompt(),
 			userPrompt: knowledgeRetrievalUserPrompt(files, options.knowledgeFreshness),
 			tools: createReadOnlyAgentTools({ root: options.root, reviewSession: options.session, includeWikiTools: true })
-				.filter((tool) => ['list_wiki_files', 'read_wiki_file', 'search_wiki_files', 'search_workspace', 'read_workspace_file', 'read_pending_change', 'list_pending_changes'].includes(tool.name)),
+				.filter((tool) => ['list_wiki_files', 'read_wiki_file', 'search_wiki_files', 'search_workspace', 'list_workspace_directory', 'read_workspace_file', 'read_pending_change', 'list_pending_changes'].includes(tool.name)),
 			signal: options.signal,
 			onProgress: (progress) => options.onProgress?.(`Knowledge: ${progress.message}`),
 			onTrace: (event) => options.onTrace?.(event, context),

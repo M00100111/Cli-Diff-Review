@@ -825,6 +825,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			max-height: 220px;
 			margin: 0;
 			overflow: auto;
+			overscroll-behavior: contain;
 			white-space: pre-wrap;
 			overflow-wrap: anywhere;
 			padding: 5px;
@@ -974,6 +975,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			font-size: 12px;
 			font-weight: 600;
 			overflow-wrap: anywhere;
+			user-select: text;
+			cursor: text;
 		}
 		.review-finding-text {
 			display: block;
@@ -982,6 +985,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			font-size: 11px;
 			line-height: 1.35;
 			overflow-wrap: anywhere;
+			user-select: text;
+			cursor: text;
 		}
 		.review-related-chunks { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
 		.review-related-chunk { border: 1px solid var(--tree-border); border-radius: 3px; background: transparent; color: var(--accent); font-size: 10px; line-height: 16px; padding: 0 5px; cursor: pointer; }
@@ -1054,10 +1059,14 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			font-family: var(--vscode-editor-font-family);
 			font-size: 11px;
 			line-height: 1.35;
+			user-select: text;
+			cursor: text;
 		}
 		.review-suggestion-rationale {
 			padding: 0 6px 6px;
 			color: var(--muted);
+			user-select: text;
+			cursor: text;
 			font-size: 11px;
 			line-height: 1.35;
 			overflow-wrap: anywhere;
@@ -1507,8 +1516,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		let reviewDetailUri;
 		let renderedReviewDetailUri;
 		let renderedReviewDetailSignature;
+		let renderedRunLogSignature;
 		const pendingScrollTops = new WeakMap();
 		const suggestionScrollPositions = new Map();
+		const runLogDetailScrollPositions = new Map();
 		toggle.addEventListener('click', () => setExpanded(!expanded));
 		toggle.addEventListener('keydown', (event) => {
 			if (event.key === 'Enter' || event.key === ' ') {
@@ -2037,6 +2048,18 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			}
 		}
 
+		function shouldNavigateReviewCard(event, container) {
+			const target = event.target instanceof Element ? event.target : undefined;
+			if (target?.closest('button, a')) {
+				return false;
+			}
+			const selection = window.getSelection();
+			if (!selection || selection.isCollapsed || selection.toString().length === 0) {
+				return true;
+			}
+			return !container.contains(selection.anchorNode) && !container.contains(selection.focusNode);
+		}
+
 		function renderReviewChunk(file, chunk) {
 			const findings = chunk.findings || [];
 			const suggestions = chunk.suggestions || [];
@@ -2109,6 +2132,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const canApply = chunk.reviewStatus === 'pending' && !applied;
 			const wrapper = document.createElement('div');
 			wrapper.className = 'review-suggestion' + (applied ? ' applied' : '');
+			wrapper.addEventListener('click', (event) => {
+				if (!shouldNavigateReviewCard(event, wrapper)) {
+					return;
+				}
+				vscode.postMessage({ type: 'openChunk', uri: file.uri, hunkId: chunk.hunkId });
+			});
 			const header = document.createElement('div');
 			header.className = 'review-suggestion-header';
 			const title = document.createElement('div');
@@ -2176,7 +2205,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			container.setAttribute('role', 'button');
 			container.tabIndex = 0;
 			const openPrimary = () => vscode.postMessage({ type: 'openFinding', uri: file.uri, hunkId: finding.hunkId });
-			container.addEventListener('click', openPrimary);
+			container.addEventListener('click', (event) => {
+				if (shouldNavigateReviewCard(event, container)) {
+					openPrimary();
+				}
+			});
 			container.addEventListener('keydown', (event) => {
 				if (event.target !== container || (event.key !== 'Enter' && event.key !== ' ')) {
 					return;
@@ -2220,6 +2253,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 
 		function renderRunLog(items, source) {
+			const nextSignature = runLogSignature(items, source);
+			if (renderedRunLogSignature === nextSignature) {
+				wikiRunList.hidden = items.length === 0;
+				return;
+			}
+			captureRunLogDetailScrollPositions();
 			const openRunLogKeys = new Set();
 			for (const details of wikiRunList.querySelectorAll('details[data-run-log-key][open]')) {
 				openRunLogKeys.add(details.dataset.runLogKey);
@@ -2227,6 +2266,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const runLogScrollTop = wikiRunList.scrollTop;
 			wikiRunList.replaceChildren();
 			wikiRunList.hidden = items.length === 0;
+			renderedRunLogSignature = nextSignature;
 			const blocks = source === 'review' || items.some((item) => item.source === 'review' || item.fileUri)
 				? groupRunLogByFile(items)
 				: groupRunLog(items);
@@ -2237,7 +2277,45 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 						? renderRunLogFile(block, openRunLogKeys)
 					: renderRunLogEntry(block.item, openRunLogKeys));
 			}
+			pruneRunLogDetailScrollPositions();
 			restoreScrollTop(wikiRunList, runLogScrollTop);
+		}
+
+		function runLogSignature(items, source) {
+			return JSON.stringify({ source: source || '', items });
+		}
+
+		function captureRunLogDetailScrollPositions() {
+			for (const pre of wikiRunList.querySelectorAll('.wiki-run-detail pre[data-run-log-detail-scroll-key]')) {
+				runLogDetailScrollPositions.set(pre.dataset.runLogDetailScrollKey, {
+					top: pre.scrollTop,
+					left: pre.scrollLeft,
+				});
+			}
+		}
+
+		function pruneRunLogDetailScrollPositions() {
+			const validKeys = new Set([...wikiRunList.querySelectorAll('.wiki-run-detail pre[data-run-log-detail-scroll-key]')]
+				.map((pre) => pre.dataset.runLogDetailScrollKey));
+			for (const key of runLogDetailScrollPositions.keys()) {
+				if (!validKeys.has(key)) {
+					runLogDetailScrollPositions.delete(key);
+				}
+			}
+		}
+
+		function restoreRunLogDetailScrollPosition(pre, key) {
+			const position = runLogDetailScrollPositions.get(key);
+			if (!position) {
+				return;
+			}
+			requestAnimationFrame(() => {
+				if (!pre.isConnected || pre.dataset.runLogDetailScrollKey !== key) {
+					return;
+				}
+				pre.scrollTop = Math.min(position.top, Math.max(0, pre.scrollHeight - pre.clientHeight));
+				pre.scrollLeft = Math.min(position.left, Math.max(0, pre.scrollWidth - pre.clientWidth));
+			});
 		}
 
 		function groupRunLog(items) {
@@ -2389,7 +2467,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const details = document.createElement('details');
 			details.className = 'wiki-run-item ' + (item.status || 'info');
 			details.id = item.id || '';
-			applyRunLogDetailsState(details, runLogEntryKey(item, parentKey), openRunLogKeys);
+			const entryKey = runLogEntryKey(item, parentKey);
+			applyRunLogDetailsState(details, entryKey, openRunLogKeys);
 
 			const summary = document.createElement('summary');
 			summary.className = 'wiki-run-summary';
@@ -2410,15 +2489,18 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 
 			const body = document.createElement('div');
 			body.className = 'wiki-run-details';
-			for (const detail of item.details || []) {
+			for (const [detailIndex, detail] of (item.details || []).entries()) {
 				const block = document.createElement('div');
 				block.className = 'wiki-run-detail';
 				const label = document.createElement('span');
 				label.className = 'wiki-run-detail-label';
 				label.textContent = detail.label || detail.format || 'Detail';
 				const pre = document.createElement('pre');
+				const scrollKey = entryKey + '/detail:' + detailIndex;
 				pre.dataset.format = detail.format || 'text';
+				pre.dataset.runLogDetailScrollKey = scrollKey;
 				pre.textContent = detail.content || '';
+				restoreRunLogDetailScrollPosition(pre, scrollKey);
 				block.append(label, pre);
 				body.appendChild(block);
 			}
@@ -2426,7 +2508,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				const block = document.createElement('div');
 				block.className = 'wiki-run-detail';
 				const pre = document.createElement('pre');
+				const scrollKey = entryKey + '/detail:0';
+				pre.dataset.runLogDetailScrollKey = scrollKey;
 				pre.textContent = item.summary || '';
+				restoreRunLogDetailScrollPosition(pre, scrollKey);
 				block.appendChild(pre);
 				body.appendChild(block);
 			}

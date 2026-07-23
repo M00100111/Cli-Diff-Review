@@ -1,7 +1,7 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { gitIgnoredReviewPaths, normalizeReviewPath } from '../reviewFileFilter';
-import { decodeUtf8, encodeUtf8, isProbablyBinary, relativePath } from '../text';
+import { decodeUtf8, encodeUtf8, isProbablyBinary, relativePath, splitLines } from '../text';
 import { ReviewFileState, ReviewSession } from '../types';
 import { writeManagedAgentsGuidance } from '../wiki/agentsGuidance';
 import { throwIfAborted } from '../wiki/cancellation';
@@ -34,14 +34,47 @@ const searchModes = ['literal', 'fuzzy', 'regex'] as const;
 
 type SearchMode = typeof searchModes[number];
 type SearchMatch = { path: string; line: number; text: string };
+type WorkspaceFileRead = {
+	path: string;
+	content: string;
+	truncated: boolean;
+	currentExists: boolean;
+	contentSource: 'workspace' | 'reviewNewText' | 'reviewOldText';
+	startLine: number;
+	endLine: number;
+	totalLines: number;
+};
+
+type WorkspaceDirectoryEntry = {
+	name: string;
+	path: string;
+	type: 'file' | 'directory';
+};
+
+const excludedSourceDirectoryNames = new Set(['.git', '.agents', '.skills', 'node_modules', 'dist', 'out', '.vscode-test']);
 
 export function createReadOnlyAgentTools(options: AgentToolOptions): AgentTool[] {
 	const tools = [
 		tool('list_workspace_files', 'List readable source files in the workspace. Arguments: {}.', objectSchema({}), async (_args, signal) => {
 			return { files: await listWorkspaceFiles(options, signal) };
 		}),
-		tool('read_workspace_file', 'Read one source file. Arguments: {"path":"src/app.ts"}.', objectSchema({ path: stringSchema('Repository-relative source path.') }), async (args, signal) => {
-			return readWorkspaceFile(options, stringArgument(args, 'path'), signal);
+		tool('list_workspace_directory', 'List the direct files and directories under one source directory. Arguments: {"path":"src"}; use "." for the workspace root.', objectSchema({
+			path: stringSchema('Repository-relative source directory path, or "." for the workspace root.'),
+		}), async (args, signal) => {
+			return listWorkspaceDirectory(options, stringArgument(args, 'path'), signal);
+		}),
+		tool('read_workspace_file', 'Read one source file, optionally by line range. Arguments: {"path":"src/app.ts","offset":120,"limit":50}; offset is a 1-based line number and limit 0 means no line-count limit.', objectSchema({
+			path: stringSchema('Repository-relative source file path.'),
+			offset: { type: 'integer', description: '1-based starting line. Use 1 to start at the beginning.', minimum: 1, default: 1 },
+			limit: { type: 'integer', description: 'Maximum number of lines to return. Use 0 for no line-count limit.', minimum: 0, default: 0 },
+		}), async (args, signal) => {
+			return readWorkspaceFile(
+				options,
+				stringArgument(args, 'path'),
+				optionalPositiveIntegerArgument(args, 'offset') ?? 1,
+				optionalLineLimitArgument(args, 'limit'),
+				signal,
+			);
 		}),
 		tool('search_workspace', 'Search readable source files. Arguments: {"query":"symbol","mode":"literal","limit":50}. Modes: literal (case-sensitive substring), fuzzy (case-insensitive ordered characters), regex (JavaScript regular expression per line).', objectSchema({
 			query: stringSchema('Search text or regular expression.'),
@@ -166,6 +199,47 @@ async function listWorkspaceFiles(options: AgentToolOptions, signal?: AbortSigna
 	return files.sort();
 }
 
+async function listWorkspaceDirectory(
+	options: AgentToolOptions,
+	candidate: string,
+	signal?: AbortSignal,
+): Promise<{ path: string; entries: WorkspaceDirectoryEntry[] }> {
+	throwIfAborted(signal);
+	const normalized = normalizeSafeDirectoryPath(candidate);
+	const uri = normalized ? containedUri(options.root.uri, normalized) : options.root.uri;
+	const displayPath = normalized || '.';
+	const stat = await statWorkspacePath(uri, displayPath, 'directory');
+	if ((stat.type & vscode.FileType.Directory) === 0) {
+		if ((stat.type & vscode.FileType.File) !== 0) {
+			throw new Error(`Workspace path "${displayPath}" is a file. Use read_workspace_file to read it.`);
+		}
+		throw new Error(`Workspace path "${displayPath}" is not a directory.`);
+	}
+
+	const rawEntries = await vscode.workspace.fs.readDirectory(uri);
+	const candidates = rawEntries
+		.filter(([name]) => !name.startsWith('.') && !excludedSourceDirectoryNames.has(name))
+		.map(([name, type]) => ({
+			name,
+			path: normalized ? `${normalized}/${name}` : name,
+			type,
+		}));
+	const ignored = await gitIgnoredReviewPaths(options.root, candidates.map((entry) => entry.path));
+	const entries = candidates
+		.filter((entry) => !ignored.has(entry.path) && !isGeneratedAgentsGuidancePath(entry.path))
+		.flatMap((entry): WorkspaceDirectoryEntry[] => {
+			if ((entry.type & vscode.FileType.Directory) !== 0) {
+				return [{ name: entry.name, path: entry.path, type: 'directory' }];
+			}
+			if ((entry.type & vscode.FileType.File) !== 0) {
+				return [{ name: entry.name, path: entry.path, type: 'file' }];
+			}
+			return [];
+		})
+		.sort((left, right) => left.type.localeCompare(right.type) || left.name.localeCompare(right.name));
+	return { path: displayPath, entries };
+}
+
 async function listWikiFiles(rootUri: vscode.Uri, signal?: AbortSignal): Promise<string[]> {
 	throwIfAborted(signal);
 	const wikiUri = wikiReferencesUri(rootUri);
@@ -196,13 +270,13 @@ async function listWikiEntries(
 	return files.sort();
 }
 
-async function readWorkspaceFile(options: AgentToolOptions, candidate: string, signal?: AbortSignal): Promise<{
-	path: string;
-	content: string;
-	truncated: boolean;
-	currentExists: boolean;
-	contentSource: 'workspace' | 'reviewNewText' | 'reviewOldText';
-}> {
+async function readWorkspaceFile(
+	options: AgentToolOptions,
+	candidate: string,
+	offset: number,
+	limit?: number,
+	signal?: AbortSignal,
+): Promise<WorkspaceFileRead> {
 	const normalized = normalizeSafeRelativePath(candidate);
 	if (normalized.split('/').some((segment) => segment.startsWith('.'))) {
 		throw new Error('Source tools cannot read dot-path files.');
@@ -210,26 +284,32 @@ async function readWorkspaceFile(options: AgentToolOptions, candidate: string, s
 	const reviewFile = reviewSnapshotFiles(options).find((file) => file.relativePath === normalized);
 	if (reviewFile) {
 		const text = reviewFile.currentExists ? reviewFile.newText : reviewFile.oldText;
-		const maxChars = options.maxReadChars ?? 50000;
 		return {
 			path: reviewFile.relativePath,
-			content: text.slice(0, maxChars),
-			truncated: text.length > maxChars,
+			...sliceWorkspaceFileText(text, offset, limit, options.maxReadChars ?? 50000),
 			currentExists: reviewFile.currentExists,
 			contentSource: reviewFile.currentExists ? 'reviewNewText' : 'reviewOldText',
 		};
 	}
-	const result = await readTextFile(options, workspaceFileUri(options.root.uri, normalized), signal);
-	return { ...result, currentExists: true, contentSource: 'workspace' };
+	const uri = workspaceFileUri(options.root.uri, normalized);
+	const stat = await statWorkspacePath(uri, normalized, 'file');
+	if ((stat.type & vscode.FileType.Directory) !== 0) {
+		throw new Error(`Workspace path "${normalized}" is a directory, not a file. Use list_workspace_directory to inspect it.`);
+	}
+	if ((stat.type & vscode.FileType.File) === 0) {
+		throw new Error(`Workspace path "${normalized}" is not a regular file.`);
+	}
+	const text = await readUtf8TextFile(uri, signal);
+	return {
+		path: normalized,
+		...sliceWorkspaceFileText(text, offset, limit, options.maxReadChars ?? 50000),
+		currentExists: true,
+		contentSource: 'workspace',
+	};
 }
 
 async function readTextFile(options: AgentToolOptions, uri: vscode.Uri, signal?: AbortSignal): Promise<{ path: string; content: string; truncated: boolean }> {
-	throwIfAborted(signal);
-	const data = await vscode.workspace.fs.readFile(uri);
-	if (isProbablyBinary(data)) {
-		throw new Error('File is binary.');
-	}
-	const text = decodeUtf8(data);
+	const text = await readUtf8TextFile(uri, signal);
 	const maxChars = options.maxReadChars ?? 50000;
 	return {
 		path: normalizeReviewPath(relativePath(options.root.uri, uri)),
@@ -238,10 +318,45 @@ async function readTextFile(options: AgentToolOptions, uri: vscode.Uri, signal?:
 	};
 }
 
+async function readUtf8TextFile(uri: vscode.Uri, signal?: AbortSignal): Promise<string> {
+	throwIfAborted(signal);
+	const data = await vscode.workspace.fs.readFile(uri);
+	if (isProbablyBinary(data)) {
+		throw new Error('File is binary.');
+	}
+	return decodeUtf8(data);
+}
+
+function sliceWorkspaceFileText(text: string, offset: number, limit: number | undefined, maxChars: number): Pick<WorkspaceFileRead, 'content' | 'truncated' | 'startLine' | 'endLine' | 'totalLines'> {
+	const lines = splitLines(text);
+	const startIndex = Math.min(offset - 1, lines.length);
+	const requestedEndIndex = limit === undefined
+		? lines.length
+		: Math.min(lines.length, startIndex + limit);
+	const selected = lines.slice(startIndex, requestedEndIndex).join('');
+	const content = selected.slice(0, maxChars);
+	const returnedLineCount = splitLines(content).length;
+	return {
+		content,
+		truncated: startIndex > 0 || requestedEndIndex < lines.length || content.length < selected.length,
+		startLine: offset,
+		endLine: returnedLineCount > 0 ? offset + returnedLineCount - 1 : offset - 1,
+		totalLines: lines.length,
+	};
+}
+
+async function statWorkspacePath(uri: vscode.Uri, displayPath: string, expected: 'file' | 'directory'): Promise<vscode.FileStat> {
+	try {
+		return await vscode.workspace.fs.stat(uri);
+	} catch {
+		throw new Error(`Workspace ${expected} "${displayPath}" does not exist or cannot be accessed.`);
+	}
+}
+
 async function searchWorkspace(options: AgentToolOptions, query: string, mode: SearchMode, limit: number, signal?: AbortSignal): Promise<{ matches: SearchMatch[] }> {
 	return searchFiles(
 		await listWorkspaceFiles(options, signal),
-		async (candidate) => (await readWorkspaceFile(options, candidate, signal)).content,
+		async (candidate) => (await readWorkspaceFile(options, candidate, 1, undefined, signal)).content,
 		query,
 		mode,
 		limit,
@@ -403,6 +518,28 @@ function numberArgument(args: Record<string, unknown>, name: string, fallback: n
 	return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+function optionalPositiveIntegerArgument(args: Record<string, unknown>, name: string): number | undefined {
+	const value = args[name];
+	if (value === undefined) {
+		return undefined;
+	}
+	if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+		throw new Error(`Tool argument ${name} must be a positive integer.`);
+	}
+	return value;
+}
+
+function optionalLineLimitArgument(args: Record<string, unknown>, name: string): number | undefined {
+	const value = args[name];
+	if (value === undefined || value === 0) {
+		return undefined;
+	}
+	if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+		throw new Error(`Tool argument ${name} must be a non-negative integer.`);
+	}
+	return value;
+}
+
 function searchModeArgument(args: Record<string, unknown>): SearchMode {
 	const value = args.mode;
 	if (typeof value === 'string' && (searchModes as readonly string[]).includes(value)) {
@@ -417,6 +554,14 @@ function workspaceFileUri(rootUri: vscode.Uri, candidate: string): vscode.Uri {
 		throw new Error('Source tools cannot read dot-path files.');
 	}
 	return containedUri(rootUri, normalized);
+}
+
+function normalizeSafeDirectoryPath(candidate: string): string {
+	const trimmed = candidate.trim().replace(/\\/g, '/');
+	if (trimmed === '.') {
+		return '';
+	}
+	return normalizeSafeRelativePath(trimmed);
 }
 
 function wikiFileUri(rootUri: vscode.Uri, candidate: string, allowProtected: boolean): vscode.Uri {
