@@ -1,6 +1,7 @@
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { AiReviewChunkSuggestion, AiReviewFileResult, AiReviewFinding } from './agent/codeReview';
+import type { ProjectAgentLifecycle, ProjectAgentTaskKind } from './agentRunStore';
 import type { AgentTraceDetail, AgentTraceEventKind, AgentTraceStatus } from './agent/runtime';
 import type { LlmConfigProfile, LlmProvider, LlmThinkingMode } from './llm/config';
 import type { WikiFreshnessAssessment } from './wiki/state';
@@ -21,6 +22,7 @@ type DashboardMessage =
 	| { type: 'rejectAll' }
 	| { type: 'undoAll' }
 	| { type: 'selectTrackingTarget' }
+	| { type: 'selectTrackingProject'; projectId: string }
 	| {
 		type: 'saveLlmConfig';
 		profileId?: string;
@@ -128,6 +130,18 @@ export interface LlmWikiRunLogEntry {
 	details: AgentTraceDetail[];
 }
 
+export interface ProjectAgentSummary {
+	projectId: string;
+	projectName: string;
+	rootUri: string;
+	taskKind?: ProjectAgentTaskKind;
+	lifecycle: ProjectAgentLifecycle | 'idle';
+	progress?: string;
+	error?: string;
+	running: boolean;
+	hasRunLog: boolean;
+}
+
 export interface LlmWikiDashboardState {
 	configured: boolean;
 	provider: LlmProvider;
@@ -160,6 +174,9 @@ export interface LlmWikiDashboardState {
 	aiReviewTotalFileCount: number;
 	aiReviewError?: string;
 	aiReviewKnowledgeFreshness?: WikiFreshnessAssessment;
+	agentProjectKey?: string;
+	aggregateProjectView?: boolean;
+	projectAgents?: ProjectAgentSummary[];
 }
 
 export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vscode.Disposable {
@@ -267,6 +284,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 		if (message.type === 'selectTrackingTarget') {
 			await this.executeCommand('cli-diff.selectTrackingTarget');
+			this.postState();
+			return;
+		}
+		if (message.type === 'selectTrackingProject') {
+			await this.executeCommand('cli-diff.selectTrackingTarget', message.projectId);
 			this.postState();
 			return;
 		}
@@ -504,7 +526,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			color: var(--vscode-sideBar-foreground);
 		}
 		.wiki-panel.has-run-log,
-		.wiki-panel.has-review-detail {
+		.wiki-panel.has-review-detail,
+		.wiki-panel.has-project-agents {
 			min-height: 0;
 			align-items: stretch;
 			justify-content: stretch;
@@ -589,7 +612,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			gap: 7px;
 		}
 		.wiki-main.has-run-log,
-		.wiki-main.has-review-detail {
+		.wiki-main.has-review-detail,
+		.wiki-main.has-project-agents {
 			flex: 1 1 auto;
 			width: 100%;
 			max-width: none;
@@ -606,6 +630,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		.wiki-logo[hidden],
 		.wiki-action[hidden],
 		.wiki-run-list[hidden],
+		.project-agent-list[hidden],
 		.review-file-detail[hidden] { display: none; }
 		.wiki-field {
 			display: flex;
@@ -668,7 +693,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			border-color: var(--tree-border);
 		}
 		.wiki-main.has-run-log .wiki-action,
-		.wiki-main.has-review-detail .wiki-action {
+		.wiki-main.has-review-detail .wiki-action,
+		.wiki-main.has-project-agents .wiki-action {
 			flex: 0 0 auto;
 		}
 		.wiki-logo {
@@ -694,13 +720,67 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			overflow: auto;
 		}
 		.wiki-main.has-run-log .wiki-run-list,
-		.wiki-main.has-review-detail .review-file-detail {
+		.wiki-main.has-review-detail .review-file-detail,
+		.wiki-main.has-project-agents .project-agent-list {
 			flex: 1 1 auto;
 			width: 100%;
 			min-height: 0;
 			max-height: none;
 			overflow: auto;
 		}
+		.project-agent-list {
+			display: flex;
+			flex-direction: column;
+			gap: 5px;
+			max-height: min(46vh, 380px);
+			overflow: auto;
+		}
+		.project-agent-card {
+			display: grid;
+			grid-template-columns: minmax(0, 1fr) auto;
+			gap: 7px;
+			align-items: center;
+			padding: 7px 8px;
+			border: 1px solid var(--tree-border);
+			border-radius: 4px;
+			color: var(--vscode-sideBar-foreground);
+			background: var(--vscode-sideBar-background);
+			text-align: left;
+			cursor: pointer;
+		}
+		.project-agent-card:hover {
+			background: var(--vscode-list-hoverBackground, var(--vscode-sideBar-background));
+		}
+		.project-agent-main {
+			min-width: 0;
+			display: flex;
+			flex-direction: column;
+			gap: 2px;
+		}
+		.project-agent-name {
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+			font-size: 12px;
+			font-weight: 600;
+		}
+		.project-agent-progress {
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+			color: var(--muted);
+			font-size: 10px;
+		}
+		.project-agent-state {
+			color: var(--muted);
+			font-size: 10px;
+			font-weight: 600;
+			white-space: nowrap;
+		}
+		.project-agent-card.running .project-agent-state { color: var(--accent); }
+		.project-agent-card.completed .project-agent-state { color: var(--untracked); }
+		.project-agent-card.failed .project-agent-state,
+		.project-agent-card.interrupted .project-agent-state { color: var(--vscode-errorForeground); }
 		.wiki-run-item {
 			border: 1px solid var(--tree-border);
 			border-radius: 4px;
@@ -1355,6 +1435,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				<img class="wiki-logo" id="wikiLogo" src="${iconUri}" alt="">
 				<div class="review-file-detail" id="reviewFileDetail" hidden></div>
 				<div class="wiki-run-list" id="wikiRunList" hidden></div>
+				<div class="project-agent-list" id="projectAgentList" hidden></div>
 				<div class="wiki-status" id="wikiStatus"></div>
 				<button class="wiki-action" id="wikiAction" type="button">Initialize LLM Code Wiki</button>
 			</div>
@@ -1406,6 +1487,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const wikiLogo = document.getElementById('wikiLogo');
 		const reviewFileDetail = document.getElementById('reviewFileDetail');
 		const wikiRunList = document.getElementById('wikiRunList');
+		const projectAgentList = document.getElementById('projectAgentList');
 		const wikiStatus = document.getElementById('wikiStatus');
 		const wikiAction = document.getElementById('wikiAction');
 		const llmProvider = document.getElementById('llmProvider');
@@ -1503,7 +1585,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				openNewConfig();
 				return;
 			}
-			if (isAgentRunning(lastWikiState?.status)) {
+			if (isAgentRunning(lastWikiState?.status) && !lastWikiState?.aggregateProjectView) {
 				vscode.postMessage({ type: 'cancelAgent' });
 				return;
 			}
@@ -1520,6 +1602,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const pendingScrollTops = new WeakMap();
 		const suggestionScrollPositions = new Map();
 		const runLogDetailScrollPositions = new Map();
+		const runLogListScrollPositions = new Map();
+		let renderedRunLogProjectKey;
 		toggle.addEventListener('click', () => setExpanded(!expanded));
 		toggle.addEventListener('keydown', (event) => {
 			if (event.key === 'Enter' || event.key === ' ') {
@@ -1692,14 +1776,19 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			wikiConfig.hidden = wikiMode !== 'configEditor';
 			wikiMain.hidden = wikiMode !== 'main';
 			const runLog = wiki.runLog || [];
+			const projectAgents = wiki.projectAgents || [];
 			const reviewDetailFile = reviewDetailUri ? lastFiles.find((file) => file.uri === reviewDetailUri) : undefined;
 			const hasRunLog = runLog.length > 0 && Boolean(wiki.configured) && wikiMode === 'main';
 			const hasReviewDetail = Boolean(reviewDetailFile) && wikiMode === 'main';
+			const hasProjectAgents = Boolean(wiki.aggregateProjectView) && projectAgents.length > 0 && wikiMode === 'main' && !hasReviewDetail;
 			wikiPanel?.classList.toggle('has-run-log', hasRunLog);
 			wikiPanel?.classList.toggle('has-review-detail', hasReviewDetail);
+			wikiPanel?.classList.toggle('has-project-agents', hasProjectAgents);
 			wikiMain.classList.toggle('has-run-log', hasRunLog);
 			wikiMain.classList.toggle('has-review-detail', hasReviewDetail);
+			wikiMain.classList.toggle('has-project-agents', hasProjectAgents);
 			homeButton.hidden = !hasReviewDetail;
+			renderProjectAgents(hasProjectAgents ? projectAgents : []);
 			renderSettingsMenu(wiki);
 			if (wikiMode === 'modelPicker') {
 				renderModelPicker(wiki);
@@ -1711,8 +1800,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			}
 			if (!wiki.configured) {
 				renderReviewFileDetail(reviewDetailFile);
-				renderRunLog([], wiki.runLogSource);
-				wikiLogo.hidden = hasReviewDetail;
+				renderRunLog([], wiki.runLogSource, wiki.agentProjectKey);
+				wikiLogo.hidden = hasReviewDetail || hasProjectAgents;
 				wikiAction.classList.remove('secondary');
 				wikiAction.hidden = hasReviewDetail;
 				wikiAction.disabled = false;
@@ -1725,17 +1814,17 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const initialized = wiki.status === 'initialized';
 			const running = isAgentRunning(wiki.status);
 			renderReviewFileDetail(reviewDetailFile);
-			renderRunLog(hasReviewDetail ? [] : runLog, wiki.runLogSource);
-			wikiLogo.hidden = running || hasRunLog || hasReviewDetail;
+			renderRunLog(hasReviewDetail || hasProjectAgents ? [] : runLog, wiki.runLogSource, wiki.agentProjectKey);
+			wikiLogo.hidden = running || hasRunLog || hasReviewDetail || hasProjectAgents;
 			wikiAction.classList.toggle('secondary', running);
 			wikiAction.hidden = false;
 			wikiAction.disabled = !wiki.workspaceAvailable && !running;
-			if (running) {
+			if (running && !wiki.aggregateProjectView) {
 				wikiAction.dataset.action = 'cancelAgent';
 				wikiAction.textContent = 'Cancel Agent';
 			} else if ((wiki.pendingSourceCount || 0) > 0) {
 				wikiAction.dataset.action = 'generateAiReview';
-				wikiAction.textContent = aiReviewActionLabel(wiki);
+				wikiAction.textContent = wiki.aggregateProjectView ? 'Start project AI review' : aiReviewActionLabel(wiki);
 			} else if (wiki.wikiNeedsUpdate) {
 				wikiAction.dataset.action = 'updateWiki';
 				wikiAction.textContent = 'Update LLM Code Wiki';
@@ -1748,8 +1837,42 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			wikiStatus.textContent = wikiStatusText(wiki, initialized, running);
 		}
 
+		function renderProjectAgents(items) {
+			projectAgentList.replaceChildren();
+			projectAgentList.hidden = items.length === 0;
+			for (const item of items) {
+				const card = document.createElement('button');
+				card.type = 'button';
+				card.className = 'project-agent-card ' + item.lifecycle;
+				card.title = 'Show Agent flow for ' + item.projectName;
+				card.addEventListener('click', () => vscode.postMessage({ type: 'selectTrackingProject', projectId: item.projectId }));
+				const main = document.createElement('span');
+				main.className = 'project-agent-main';
+				const name = document.createElement('span');
+				name.className = 'project-agent-name';
+				name.textContent = item.projectName;
+				const progress = document.createElement('span');
+				progress.className = 'project-agent-progress';
+				progress.textContent = item.error || item.progress || (item.hasRunLog ? 'Agent flow available' : 'No Agent run');
+				main.append(name, progress);
+				const state = document.createElement('span');
+				state.className = 'project-agent-state';
+				state.textContent = projectAgentStateLabel(item);
+				card.append(main, state);
+				projectAgentList.appendChild(card);
+			}
+		}
+
+		function projectAgentStateLabel(item) {
+			const kind = item.taskKind === 'review' ? 'AI Review' : item.taskKind === 'update' ? 'Wiki Update' : item.taskKind === 'initialize' ? 'Wiki Init' : '';
+			const lifecycle = item.lifecycle === 'idle'
+				? 'Idle'
+				: item.lifecycle.charAt(0).toUpperCase() + item.lifecycle.slice(1);
+			return kind ? kind + ' · ' + lifecycle : lifecycle;
+		}
+
 		function renderSettingsMenu(wiki) {
-			const running = isAgentRunning(wiki.status);
+			const running = isAgentRunning(wiki.status) && !wiki.aggregateProjectView;
 			const initialized = wiki.status === 'initialized';
 			const initializeLabel = wiki.status === 'paused'
 				? 'Resume Wiki Initialization'
@@ -1768,7 +1891,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					: !wiki.configured ? 'Configure LLM first'
 						: !wiki.workspaceAvailable ? 'Open a workspace folder'
 							: !wiki.wikiExists ? 'Initialize Code Wiki first' : 'Code Wiki is up to date');
-			setMenuAction('generateAiReview', aiReviewActionLabel(wiki),
+			setMenuAction('generateAiReview', wiki.aggregateProjectView ? 'Start project AI review' : aiReviewActionLabel(wiki),
 				running || !wiki.configured || !wiki.workspaceAvailable || (wiki.pendingSourceCount || 0) === 0,
 				running ? 'Agent is running'
 					: !wiki.configured ? 'Configure LLM first'
@@ -1953,6 +2076,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		function wikiStatusText(wiki, initialized, running) {
 			if (!wiki.workspaceAvailable && !running) {
 				return 'Open a workspace folder';
+			}
+			if (wiki.aggregateProjectView) {
+				const runningProjects = (wiki.projectAgents || []).filter((item) => item.running).length;
+				return runningProjects > 0
+					? runningProjects + ' project Agent task' + (runningProjects === 1 ? '' : 's') + ' running'
+					: 'Select a project to view its Agent flow';
 			}
 			if (running) {
 				return wiki.progress || 'Agent running';
@@ -2252,21 +2381,25 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			return container;
 		}
 
-		function renderRunLog(items, source) {
-			const nextSignature = runLogSignature(items, source);
+		function renderRunLog(items, source, projectKey) {
+			const nextSignature = runLogSignature(items, source, projectKey);
 			if (renderedRunLogSignature === nextSignature) {
 				wikiRunList.hidden = items.length === 0;
 				return;
+			}
+			if (renderedRunLogProjectKey) {
+				runLogListScrollPositions.set(renderedRunLogProjectKey, wikiRunList.scrollTop);
 			}
 			captureRunLogDetailScrollPositions();
 			const openRunLogKeys = new Set();
 			for (const details of wikiRunList.querySelectorAll('details[data-run-log-key][open]')) {
 				openRunLogKeys.add(details.dataset.runLogKey);
 			}
-			const runLogScrollTop = wikiRunList.scrollTop;
+			const runLogScrollTop = projectKey ? runLogListScrollPositions.get(projectKey) || 0 : 0;
 			wikiRunList.replaceChildren();
 			wikiRunList.hidden = items.length === 0;
 			renderedRunLogSignature = nextSignature;
+			renderedRunLogProjectKey = projectKey;
 			const blocks = source === 'review' || items.some((item) => item.source === 'review' || item.fileUri)
 				? groupRunLogByFile(items)
 				: groupRunLog(items);
@@ -2281,8 +2414,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			restoreScrollTop(wikiRunList, runLogScrollTop);
 		}
 
-		function runLogSignature(items, source) {
-			return JSON.stringify({ source: source || '', items });
+		function runLogSignature(items, source, projectKey) {
+			return JSON.stringify({ projectKey: projectKey || '', source: source || '', items });
 		}
 
 		function captureRunLogDetailScrollPositions() {
@@ -2658,6 +2791,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				aiReviewStatus: 'none',
 				aiReviewCompletedFileCount: 0,
 				aiReviewTotalFileCount: 0,
+				projectAgents: [],
 			};
 		}
 
@@ -2873,7 +3007,7 @@ export function buildReviewDashboardPayload(
 			label: session ? currentProject?.name ?? path.basename(session.rootUri.fsPath) : '',
 			kind: !session ? 'none' : currentProject ? 'project' : session.trackingTarget?.kind === 'aggregate' ? 'aggregate' : 'project',
 			canSwitch: hasAggregateReviewTarget(session),
-			disabled: isDashboardAgentRunning(llmWiki.status),
+			disabled: false,
 			projectCount: session?.projects?.length ?? (session ? 1 : 0),
 		},
 		llmWiki,
@@ -2908,6 +3042,7 @@ export function defaultLlmWikiDashboardState(): LlmWikiDashboardState {
 		aiReviewStatus: 'none',
 		aiReviewCompletedFileCount: 0,
 		aiReviewTotalFileCount: 0,
+		projectAgents: [],
 	};
 }
 
@@ -3127,10 +3262,6 @@ function dashboardDescription(
 
 function dashboardTitleFile(currentReviewLabel?: string): string {
 	return currentReviewLabel ?? '';
-}
-
-function isDashboardAgentRunning(status: LlmWikiStatus): boolean {
-	return status === 'initializing' || status === 'updating' || status === 'reviewing';
 }
 
 function dashboardExtension(relativePath: string): string {

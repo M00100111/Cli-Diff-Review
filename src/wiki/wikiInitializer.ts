@@ -148,6 +148,30 @@ export class WikiInitializationService {
 		return this.stateService.read(rootUri);
 	}
 
+	public async recoverInterruptedUpdate(rootUri: vscode.Uri): Promise<void> {
+		const state = await this.stateService.read(rootUri);
+		if (!state || state.status !== 'updating') {
+			return;
+		}
+		await this.stateService.write(rootUri, {
+			...state,
+			status: 'ready',
+			lastRunSummary: 'Wiki update was interrupted before synchronization completed.',
+		});
+	}
+
+	public async recoverInterruptedInitialization(rootUri: vscode.Uri): Promise<void> {
+		const state = await this.stateService.read(rootUri);
+		if (!state || state.status !== 'initializing') {
+			return;
+		}
+		await this.stateService.write(rootUri, {
+			...state,
+			status: 'paused',
+			lastRunSummary: 'Wiki initialization was interrupted before completion.',
+		});
+	}
+
 	public async wikiExists(rootUri: vscode.Uri): Promise<boolean> {
 		return this.stateService.wikiExists(rootUri);
 	}

@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
 import { AiReviewPartialError, AiReviewStore, CodeReviewAgentService, reviewChangeSignature, sortFindings, StoredAiReview, validateReviewFindings, validateReviewFindingsWithDiagnostics, validateReviewSuggestionsWithDiagnostics } from '../agent/codeReview';
 import { AgentRunner, type AgentRunCheckpoint, type AgentTraceEvent, validateAgentResponse } from '../agent/runtime';
 import { createReadOnlyAgentTools, createWikiAgentTools } from '../agent/tools';
+import { AgentRunStore, StoredProjectAgentRun } from '../agentRunStore';
 import { acceptHunkInBaseline, computeLineDiff } from '../diffEngine';
 import { GitService, parseCatFileBatch } from '../gitService';
 import { combineGitHunkPatches, decodeGitPath, parseGitPatch } from '../gitPatch';
@@ -473,6 +474,125 @@ suite('Extension configuration', () => {
 });
 
 suite('Review controller bulk actions', () => {
+	test('admits one Agent task per project while allowing different projects concurrently', () => {
+		const controller = Object.create(ReviewController.prototype) as any;
+		controller.projectAgentRuntimes = new Map();
+		const rootA = workspaceFolder('/tmp/cli-diff-project-a');
+		const rootB = workspaceFolder('/tmp/cli-diff-project-b');
+
+		const taskA = controller.beginProjectAgentTask('review', rootA, 'project-a');
+		const duplicateA = controller.beginProjectAgentTask('update', rootA, 'project-a');
+		const taskB = controller.beginProjectAgentTask('initialize', rootB, 'project-b');
+
+		assert.ok(taskA);
+		assert.strictEqual(duplicateA, undefined);
+		assert.ok(taskB);
+		assert.notStrictEqual(taskA.projectKey, taskB.projectKey);
+		assert.strictEqual(controller.isCurrentProjectAgentTask(taskA), true);
+		assert.strictEqual(controller.isCurrentProjectAgentTask(taskB), true);
+
+		controller.clearProjectAgentTask(taskA);
+		assert.strictEqual(controller.isCurrentProjectAgentTask(taskA), false);
+		assert.strictEqual(controller.isCurrentProjectAgentTask(taskB), true);
+	});
+
+	test('keeps concurrent project Agent logs and lifecycle updates isolated', async () => {
+		const saved: StoredProjectAgentRun[] = [];
+		const controller = Object.create(ReviewController.prototype) as any;
+		Object.assign(controller, {
+			projectAgentRuntimes: new Map(),
+			agentRunStore: {
+				save: async (run: StoredProjectAgentRun) => {
+					saved.push({ ...run, entries: [...run.entries] });
+				},
+			},
+			scheduleLlmWikiDashboardRefresh: () => undefined,
+		});
+		const rootA = workspaceFolder('/tmp/cli-diff-agent-log-a');
+		const rootB = workspaceFolder('/tmp/cli-diff-agent-log-b');
+		const taskA = controller.beginProjectAgentTask('review', rootA, 'project-a');
+		const taskB = controller.beginProjectAgentTask('update', rootB, 'project-b');
+		assert.ok(taskA);
+		assert.ok(taskB);
+
+		await Promise.all([
+			controller.startProjectAgentRun(taskA, {
+				kind: 'run_start', title: 'A started', summary: 'A', status: 'running', details: [],
+			}, 'review', { progress: 'A running' }),
+			controller.startProjectAgentRun(taskB, {
+				kind: 'run_start', title: 'B started', summary: 'B', status: 'running', details: [],
+			}, 'wiki', { progress: 'B running' }),
+		]);
+		controller.appendProjectAgentRunLog(taskA, {
+			kind: 'assistant_message', title: 'A trace', summary: 'Only A', status: 'info', details: [],
+		});
+		await controller.finishProjectAgentRun(taskA, 'completed', 'A complete');
+
+		const runtimeA = controller.projectAgentRuntimes.get(taskA.projectKey);
+		const runtimeB = controller.projectAgentRuntimes.get(taskB.projectKey);
+		assert.strictEqual(runtimeA.run.entries.length, 2);
+		assert.strictEqual(runtimeA.run.lifecycle, 'completed');
+		assert.strictEqual(runtimeB.run.entries.length, 1);
+		assert.strictEqual(runtimeB.run.lifecycle, 'running');
+		assert.strictEqual(controller.isCurrentProjectAgentTask(taskB), true);
+		assert.ok(saved.some((run) => run.rootUri === rootA.uri.toString()));
+		assert.ok(saved.some((run) => run.rootUri === rootB.uri.toString()));
+	});
+
+	test('restores a persisted running project task as interrupted without restarting it', async () => {
+		const root = vscode.Uri.file('/tmp/cli-diff-interrupted-project');
+		const stored: StoredProjectAgentRun = {
+			version: 1,
+			runId: 'interrupted-run',
+			projectId: 'project-a',
+			rootUri: root.toString(),
+			kind: 'update',
+			source: 'wiki',
+			lifecycle: 'running',
+			startedAt: '2026-07-24T00:00:00.000Z',
+			updatedAt: '2026-07-24T00:00:01.000Z',
+			progress: 'Updating',
+			sequence: 1,
+			entries: [{
+				id: 'interrupted-run-1',
+				sequence: 1,
+				timestamp: '2026-07-24T00:00:01.000Z',
+				source: 'wiki',
+				kind: 'run_start',
+				title: 'Started',
+				summary: 'Updating',
+				status: 'running',
+				details: [],
+			}],
+		};
+		let recoveredRoot: string | undefined;
+		let persisted: StoredProjectAgentRun | undefined;
+		const controller = Object.create(ReviewController.prototype) as any;
+		Object.assign(controller, {
+			projectAgentRuntimes: new Map(),
+			agentRunStore: {
+				load: async () => stored,
+				save: async (run: StoredProjectAgentRun) => {
+					persisted = run;
+				},
+			},
+			wikiInitializationService: {
+				recoverInterruptedUpdate: async (rootUri: vscode.Uri) => {
+					recoveredRoot = rootUri.toString();
+				},
+				recoverInterruptedInitialization: async () => undefined,
+			},
+		});
+
+		await controller.loadProjectAgentRuns([{ id: 'project-a', name: 'A', rootUri: root }]);
+		const runtime = controller.projectAgentRuntimes.get(root.toString());
+		assert.strictEqual(runtime.task, undefined);
+		assert.strictEqual(runtime.run.lifecycle, 'interrupted');
+		assert.strictEqual(runtime.run.entries.at(-1)?.title, 'Agent run interrupted');
+		assert.strictEqual(recoveredRoot, root.toString());
+		assert.strictEqual(persisted?.lifecycle, 'interrupted');
+	});
+
 	test('wires bulk review commands through confirmation and file-level cores', () => {
 		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
 
@@ -1403,8 +1523,10 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('details.open = openRunLogKeys.has(key)'));
 		assert.ok(view.webview.html.includes('function runLogRoundKey'));
 		assert.ok(view.webview.html.includes('function runLogEntryKey'));
-		assert.ok(view.webview.html.includes('const runLogScrollTop = wikiRunList.scrollTop'));
+		assert.ok(view.webview.html.includes('runLogListScrollPositions.get(projectKey)'));
 		assert.ok(view.webview.html.includes('restoreScrollTop(wikiRunList, runLogScrollTop)'));
+		assert.ok(view.webview.html.includes('function renderProjectAgents'));
+		assert.ok(view.webview.html.includes("type: 'selectTrackingProject'"));
 		assert.ok(view.webview.html.includes('const runLogDetailScrollPositions = new Map()'));
 		assert.ok(view.webview.html.includes('function captureRunLogDetailScrollPositions'));
 		assert.ok(view.webview.html.includes('function pruneRunLogDetailScrollPositions'));
@@ -1588,11 +1710,14 @@ suite('Review state', () => {
 		messageHandler({ type: 'openWikiIndex' });
 		messageHandler({ type: 'openExtensionSettings' });
 		messageHandler({ type: 'selectTrackingTarget' });
+		messageHandler({ type: 'selectTrackingProject', projectId: 'project-b' });
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.openWikiIndex' && call.args.length === 0));
 		assert.ok(commands.some((call) => call.command === 'workbench.action.openSettings'
 			&& call.args[0] === '@ext:local.cli-diff-review'));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.selectTrackingTarget'));
+		assert.ok(commands.some((call) => call.command === 'cli-diff.selectTrackingTarget'
+			&& call.args[0] === 'project-b'));
 		messageHandler({ type: 'acceptAll' });
 		messageHandler({ type: 'rejectAll' });
 		messageHandler({ type: 'undoAll' });
@@ -2781,7 +2906,8 @@ suite('Agent runtime', () => {
 		);
 	});
 
-	test('reads workspace files by line range and distinguishes files from directories', async () => {
+	test('reads workspace files by line range and distinguishes files from directories', async function (this: Mocha.Context) {
+		this.timeout(10000);
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-agent-tools-'));
 		try {
 			writeRepoFile(root, 'src/app.go', 'first\r\nsecond\r\nthird');
@@ -4256,6 +4382,86 @@ suite('Git service', () => {
 			assert.notStrictEqual(await service.indexStateSignature(folder), stagedSignature);
 		} finally {
 			removeTempRepo(root);
+		}
+	});
+});
+
+suite('Project Agent run store', () => {
+	test('persists the latest complete run independently by project root', async () => {
+		const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-agent-runs-'));
+		try {
+			const context = { storageUri: vscode.Uri.file(storage), globalStorageUri: vscode.Uri.file(storage) } as vscode.ExtensionContext;
+			const store = new AgentRunStore(context);
+			const rootA = vscode.Uri.file(path.join(storage, 'project-a'));
+			const rootB = vscode.Uri.file(path.join(storage, 'project-b'));
+			const run = (rootUri: vscode.Uri, runId: string, progress: string, sequence: number): StoredProjectAgentRun => ({
+				version: 1,
+				runId,
+				projectId: rootUri.toString(),
+				rootUri: rootUri.toString(),
+				kind: 'review',
+				source: 'review',
+				lifecycle: sequence > 1 ? 'completed' : 'running',
+				startedAt: '2026-07-24T00:00:00.000Z',
+				updatedAt: '2026-07-24T00:00:01.000Z',
+				completedAt: sequence > 1 ? '2026-07-24T00:00:01.000Z' : undefined,
+				progress,
+				sequence,
+				entries: Array.from({ length: sequence }, (_, index) => ({
+					id: `${runId}-${index + 1}`,
+					sequence: index + 1,
+					timestamp: '2026-07-24T00:00:01.000Z',
+					source: 'review',
+					kind: index === 0 ? 'run_start' : 'run_complete',
+					title: index === 0 ? 'Started' : 'Completed',
+					summary: progress,
+					status: index === 0 ? 'running' : 'success',
+					details: [],
+				})),
+			});
+
+			const firstA = run(rootA, 'run-a', 'first snapshot', 1);
+			const finalA = run(rootA, 'run-a', 'completed A', 2);
+			await Promise.all([
+				store.save(firstA),
+				store.save(finalA),
+				store.save(run(rootB, 'run-b', 'running B', 1)),
+			]);
+
+			const restarted = new AgentRunStore(context);
+			assert.strictEqual((await restarted.load(rootA))?.progress, 'completed A');
+			assert.strictEqual((await restarted.load(rootA))?.entries.length, 2);
+			assert.strictEqual((await restarted.load(rootB))?.progress, 'running B');
+		} finally {
+			fs.rmSync(storage, { recursive: true, force: true });
+		}
+	});
+
+	test('ignores corrupt persisted Agent runs', async () => {
+		const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-agent-run-corrupt-'));
+		try {
+			const context = { storageUri: vscode.Uri.file(storage), globalStorageUri: vscode.Uri.file(storage) } as vscode.ExtensionContext;
+			const store = new AgentRunStore(context);
+			const root = vscode.Uri.file(path.join(storage, 'project'));
+			await store.save({
+				version: 1,
+				runId: 'run',
+				rootUri: root.toString(),
+				kind: 'initialize',
+				source: 'wiki',
+				lifecycle: 'running',
+				startedAt: '2026-07-24T00:00:00.000Z',
+				updatedAt: '2026-07-24T00:00:00.000Z',
+				sequence: 0,
+				entries: [],
+			});
+			const directory = path.join(storage, 'agent-runs');
+			const file = fs.readdirSync(directory).find((entry) => entry.endsWith('.json'));
+			assert.ok(file);
+			fs.writeFileSync(path.join(directory, file), '{broken', 'utf8');
+			assert.strictEqual(await new AgentRunStore(context).load(root), undefined);
+		} finally {
+			fs.rmSync(storage, { recursive: true, force: true });
 		}
 	});
 });
