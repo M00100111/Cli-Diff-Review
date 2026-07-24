@@ -136,6 +136,11 @@ export interface ProjectAgentSummary {
 	rootUri: string;
 	taskKind?: ProjectAgentTaskKind;
 	lifecycle: ProjectAgentLifecycle | 'idle';
+	pendingCount: number;
+	acceptedCount: number;
+	rejectedCount: number;
+	findingCount: number;
+	suggestionCount: number;
 	progress?: string;
 	error?: string;
 	running: boolean;
@@ -739,7 +744,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			display: grid;
 			grid-template-columns: minmax(0, 1fr) auto;
 			gap: 7px;
-			align-items: center;
+			align-items: start;
 			padding: 7px 8px;
 			border: 1px solid var(--tree-border);
 			border-radius: 4px;
@@ -765,6 +770,13 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			font-weight: 600;
 		}
 		.project-agent-progress {
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+			color: var(--muted);
+			font-size: 10px;
+		}
+		.project-agent-detail {
 			overflow: hidden;
 			text-overflow: ellipsis;
 			white-space: nowrap;
@@ -1851,16 +1863,45 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				const name = document.createElement('span');
 				name.className = 'project-agent-name';
 				name.textContent = item.projectName;
-				const progress = document.createElement('span');
-				progress.className = 'project-agent-progress';
-				progress.textContent = item.error || item.progress || (item.hasRunLog ? 'Agent flow available' : 'No Agent run');
-				main.append(name, progress);
+				const reviewSummary = document.createElement('span');
+				reviewSummary.className = 'project-agent-progress';
+				reviewSummary.textContent = projectReviewSummary(item);
+				main.append(name, reviewSummary);
+				const detailText = item.running || item.lifecycle === 'failed' || item.lifecycle === 'interrupted'
+					? item.error || item.progress
+					: undefined;
+				if (detailText) {
+					const detail = document.createElement('span');
+					detail.className = 'project-agent-detail';
+					detail.textContent = detailText;
+					main.append(detail);
+				}
 				const state = document.createElement('span');
 				state.className = 'project-agent-state';
 				state.textContent = projectAgentStateLabel(item);
 				card.append(main, state);
 				projectAgentList.appendChild(card);
 			}
+		}
+
+		function projectReviewSummary(item) {
+			const parts = [];
+			if (item.pendingCount > 0) {
+				parts.push(item.pendingCount + ' Pending');
+			}
+			if (item.acceptedCount > 0) {
+				parts.push(item.acceptedCount + ' Accepted');
+			}
+			if (item.rejectedCount > 0) {
+				parts.push(item.rejectedCount + ' Rejected');
+			}
+			if (item.findingCount > 0) {
+				parts.push(item.findingCount + ' Findings');
+			}
+			if (item.suggestionCount > 0) {
+				parts.push(item.suggestionCount + ' Suggestions');
+			}
+			return parts.length > 0 ? parts.join(' · ') : 'No pending changes';
 		}
 
 		function projectAgentStateLabel(item) {

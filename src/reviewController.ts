@@ -3662,7 +3662,9 @@ export class ReviewController implements vscode.Disposable {
 			status = 'idle';
 		}
 
-		const projectAgents = this.projectAgentSummaries(aggregateProjects);
+		const visibleReviewFindings = update.reviewFindings ?? reviewFindings;
+		const visibleReviewSuggestions = update.reviewSuggestions ?? reviewSuggestions;
+		const projectAgents = this.projectAgentSummaries(aggregateProjects, visibleReviewFindings, visibleReviewSuggestions);
 		if (generation !== this.llmDashboardRefreshGeneration) {
 			return;
 		}
@@ -3692,8 +3694,8 @@ export class ReviewController implements vscode.Disposable {
 			profiles: this.llmConfigState.profiles,
 			runLog: runtime?.run?.entries ?? [],
 			runLogSource: runtime?.run?.source,
-			reviewFindings: update.reviewFindings ?? reviewFindings,
-			reviewSuggestions: update.reviewSuggestions ?? reviewSuggestions,
+			reviewFindings: visibleReviewFindings,
+			reviewSuggestions: visibleReviewSuggestions,
 			aiReviewFileResults: update.aiReviewFileResults ?? aiReviewFileResults,
 			aiReviewStatus: update.aiReviewStatus ?? aiReviewStatus,
 			aiReviewCompletedFileCount: update.aiReviewCompletedFileCount ?? aiReviewCompletedFileCount,
@@ -3707,16 +3709,39 @@ export class ReviewController implements vscode.Disposable {
 		this.dashboardProvider.refresh();
 	}
 
-	private projectAgentSummaries(projects: ReviewProject[]): ProjectAgentSummary[] {
+	private projectAgentSummaries(
+		projects: ReviewProject[],
+		findings: StoredAiReview['findings'],
+		suggestions: StoredAiReview['suggestions'],
+	): ProjectAgentSummary[] {
 		return projects.map((project) => {
 			const runtime = this.projectAgentRuntimes.get(this.agentProjectKey(project.rootUri));
 			const lifecycle: ProjectAgentSummary['lifecycle'] = runtime?.task ? 'running' : runtime?.run?.lifecycle ?? 'idle';
+			const files = this.projectSession(project)?.files.values() ?? [];
+			let pendingCount = 0;
+			let acceptedCount = 0;
+			let rejectedCount = 0;
+			const fileUris = new Set<string>();
+			for (const file of files) {
+				fileUris.add(uriKey(file.uri));
+				const reviewedIdentities = new Set([...file.acceptedHunks, ...file.rejectedHunks].map(reviewHunkIdentity));
+				pendingCount += file.hunks.filter((hunk) => !reviewedIdentities.has(reviewHunkIdentity(hunk))).length;
+				acceptedCount += file.acceptedHunks.length;
+				rejectedCount += file.rejectedHunks.length;
+			}
+			const findingCount = findings.filter((finding) => fileUris.has(uriKey(vscode.Uri.parse(finding.uri)))).length;
+			const suggestionCount = suggestions.filter((suggestion) => fileUris.has(uriKey(vscode.Uri.parse(suggestion.uri)))).length;
 			return {
 				projectId: project.id,
 				projectName: project.name,
 				rootUri: project.rootUri.toString(),
 				taskKind: runtime?.task?.kind ?? runtime?.run?.kind,
 				lifecycle,
+				pendingCount,
+				acceptedCount,
+				rejectedCount,
+				findingCount,
+				suggestionCount,
 				progress: runtime?.run?.progress,
 				error: runtime?.run?.error,
 				running: Boolean(runtime?.task),
