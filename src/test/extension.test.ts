@@ -20,7 +20,7 @@ import { buildReviewDashboardPayload, defaultLlmWikiDashboardState, ReviewDashbo
 import { ReviewController } from '../reviewController';
 import { isDotReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
 import { ReviewTreeProvider } from '../reviewTree';
-import { normalizeMonacoThemeColor, ReviewWebviewManager } from '../reviewWebview';
+import { languageIdFromPath, normalizeMonacoThemeColor, ReviewWebviewManager } from '../reviewWebview';
 import {
 	captureLineBlockContext,
 	firstReviewRevealPosition,
@@ -173,6 +173,32 @@ suite('Diff engine', () => {
 });
 
 suite('Review webview compatibility', () => {
+	test('uses the dedicated Vue language for Vue single-file components', () => {
+		assert.strictEqual(languageIdFromPath('src/App.vue'), 'vue');
+		assert.strictEqual(languageIdFromPath('src/App.VUE'), 'vue');
+	});
+
+	test('emits syntactically valid Review Webview JavaScript with Vue tokenizers', () => {
+		const manager = Object.create(ReviewWebviewManager.prototype) as ReviewWebviewManager;
+		Object.assign(manager as unknown as Record<string, unknown>, {
+			context: { extensionUri: vscode.Uri.file('/extension') },
+		});
+		const webview = {
+			cspSource: 'vscode-webview:',
+			asWebviewUri: (uri: vscode.Uri) => uri,
+		} as vscode.Webview;
+		const html = (manager as unknown as { renderShell(webview: vscode.Webview): string }).renderShell(webview);
+		const inlineScript = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)?.[1];
+
+		assert.ok(inlineScript);
+		assert.doesNotThrow(() => new Function(inlineScript));
+		assert.ok(inlineScript.includes("nextEmbedded: 'typescript'"));
+		assert.ok(inlineScript.includes("nextEmbedded: 'javascript'"));
+		assert.ok(inlineScript.includes("nextEmbedded: 'scss'"));
+		assert.ok(inlineScript.includes("const editorClipboardContext = 'editorTextFocus && !findInputFocussed && !replaceInputFocussed';"));
+		assert.match(inlineScript, /KeyCode\.KeyV,[\s\S]*?pasteSelection\(\); \}, editorClipboardContext\);/);
+	});
+
 	test('normalizes VS Code and Cursor theme colors for Monaco', () => {
 		assert.strictEqual(normalizeMonacoThemeColor('#abc', '#000000'), '#aabbcc');
 		assert.strictEqual(normalizeMonacoThemeColor('#abcd', '#000000'), '#aabbccdd');
@@ -189,6 +215,11 @@ suite('Review webview compatibility', () => {
 		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewWebview.ts'), 'utf8');
 		assert.ok(source.includes('font-src ${cspSource} data:;'));
 		assert.ok(source.includes("require(['vs/editor/editor.main']"));
+		assert.ok(source.includes('function registerVueLanguage()'));
+		assert.ok(source.includes("monaco.languages.register({\n\t\t\t\tid: 'vue'"));
+		assert.ok(source.includes("nextEmbedded: 'typescript'"));
+		assert.ok(source.includes("nextEmbedded: 'javascript'"));
+		assert.ok(source.includes("nextEmbedded: 'scss'"));
 		assert.ok(source.includes('showInitializationError'));
 		assert.ok(source.includes('Review editor failed to initialize: '));
 		assert.strictEqual(source.includes("actions.appendChild(createButton(labels.undo, 'undoSuggestion', entry));"), false);

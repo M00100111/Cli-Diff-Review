@@ -982,6 +982,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 		document.addEventListener('click', onReferencesClick, true);
 
 		function createEditor() {
+			registerVueLanguage();
 			defineTheme();
 			monaco.editor.setTheme(document.body.classList.contains('vscode-light') ? 'cli-diff-light' : 'cli-diff-dark');
 
@@ -1007,10 +1008,11 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 				fontSize: parseInt(cssVar('--vscode-editor-font-size'), 10) || 13,
 			});
 
+			const editorClipboardContext = 'editorTextFocus && !findInputFocussed && !replaceInputFocussed';
 			editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveCurrent);
-			editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyC, function () { void copySelection(); });
-			editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyX, function () { void cutSelection(); });
-			editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, function () { void pasteSelection(); });
+			editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyC, function () { void copySelection(); }, editorClipboardContext);
+			editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyX, function () { void cutSelection(); }, editorClipboardContext);
+			editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, function () { void pasteSelection(); }, editorClipboardContext);
 			editor.addCommand(monaco.KeyCode.F12, function () { requestNavigation('goToDefinition'); });
 			editor.addCommand(monaco.KeyMod.Shift | monaco.KeyCode.F12, function () { requestNavigation('findReferences'); });
 			editor.addAction({
@@ -1085,6 +1087,126 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 			editor.onDidScrollChange(updateActionOffset);
 			editor.onDidLayoutChange(updateActionOffset);
 			applyState();
+		}
+
+		function registerVueLanguage() {
+			if (monaco.languages.getLanguages().some(function (language) { return language.id === 'vue'; })) {
+				return;
+			}
+			monaco.languages.register({
+				id: 'vue',
+				extensions: ['.vue'],
+				aliases: ['Vue', 'vue'],
+				mimetypes: ['text/x-vue'],
+			});
+			monaco.languages.setLanguageConfiguration('vue', {
+				comments: { blockComment: ['<!--', '-->'] },
+				brackets: [['{', '}'], ['[', ']'], ['(', ')'], ['<', '>']],
+				autoClosingPairs: [
+					{ open: '{', close: '}' },
+					{ open: '[', close: ']' },
+					{ open: '(', close: ')' },
+					{ open: '"', close: '"' },
+					{ open: "'", close: "'" },
+					{ open: '<', close: '>' },
+				],
+				surroundingPairs: [
+					{ open: '{', close: '}' },
+					{ open: '[', close: ']' },
+					{ open: '(', close: ')' },
+					{ open: '"', close: '"' },
+					{ open: "'", close: "'" },
+					{ open: '<', close: '>' },
+				],
+			});
+			monaco.languages.setMonarchTokensProvider('vue', {
+				defaultToken: '',
+				tokenPostfix: '.vue',
+				ignoreCase: true,
+				expressionKeywords: [
+					'as', 'async', 'await', 'break', 'case', 'catch', 'class', 'const', 'continue',
+					'default', 'delete', 'do', 'else', 'export', 'extends', 'false', 'finally',
+					'for', 'from', 'function', 'if', 'import', 'in', 'instanceof', 'let', 'new',
+					'null', 'of', 'return', 'static', 'super', 'switch', 'this', 'throw', 'true',
+					'try', 'typeof', 'undefined', 'var', 'void', 'while', 'with', 'yield',
+				],
+				tokenizer: {
+					root: [
+						[/<!--/, 'comment', '@comment'],
+						[/<!DOCTYPE\\b[^>]*>/, 'metatag'],
+						[/<script\\b(?=[^>]*\\blang\\s*=\\s*["'](?:ts|typescript|tsx)["'])[^>]*>/, { token: 'tag', next: '@scriptTs', nextEmbedded: 'typescript' }],
+						[/<script\\b[^>]*>/, { token: 'tag', next: '@scriptJs', nextEmbedded: 'javascript' }],
+						[/<style\\b(?=[^>]*\\blang\\s*=\\s*["'](?:scss|sass)["'])[^>]*>/, { token: 'tag', next: '@styleScss', nextEmbedded: 'scss' }],
+						[/<style\\b(?=[^>]*\\blang\\s*=\\s*["']less["'])[^>]*>/, { token: 'tag', next: '@styleLess', nextEmbedded: 'less' }],
+						[/<style\\b[^>]*>/, { token: 'tag', next: '@styleCss', nextEmbedded: 'css' }],
+						[/<\\/?[a-z][\\w:.-]*/, { token: 'tag', next: '@tag' }],
+						[/\\{\\{/, { token: 'delimiter.bracket', next: '@interpolation' }],
+						[/[^<{]+/, ''],
+						[/[<{]/, 'delimiter'],
+					],
+					comment: [
+						[/-->/, 'comment', '@pop'],
+						[/[^-]+/, 'comment'],
+						[/./, 'comment'],
+					],
+					tag: [
+						[/\\s+/, 'white'],
+						[/(?:v-[\\w-]+(?::[\\w-]+)?|[:@#][\\w:.-]+)/, 'attribute.name'],
+						[/[\\w:.-]+/, 'attribute.name'],
+						[/=/, 'delimiter'],
+						[/"[^"]*"/, 'attribute.value'],
+						[/'[^']*'/, 'attribute.value'],
+						[/\\/?>/, 'tag', '@pop'],
+					],
+					interpolation: [
+						[/\\}\\}/, 'delimiter.bracket', '@pop'],
+						{ include: '@expression' },
+					],
+					expression: [
+						[/\\s+/, 'white'],
+						[/\\/\\*/, 'comment', '@expressionComment'],
+						[/\\/\\/.*$/, 'comment'],
+						[/"(?:[^"\\\\]|\\\\.)*"/, 'string'],
+						[/'(?:[^'\\\\]|\\\\.)*'/, 'string'],
+						[/\\x60(?:[^\\x60\\\\]|\\\\.)*\\x60/, 'string'],
+						[/\\d+(?:\\.\\d+)?/, 'number'],
+						[/[a-z_$][\\w$]*/, { cases: { '@expressionKeywords': 'keyword', '@default': 'identifier' } }],
+						[/[{}()[\\]]/, '@brackets'],
+						[/[;,.]/, 'delimiter'],
+						[/[=!<>+\\-*\\/%&|?:]+/, 'operator'],
+						[/./, ''],
+					],
+					expressionComment: [
+						[/\\*\\//, 'comment', '@pop'],
+						[/./, 'comment'],
+					],
+					scriptTs: [
+						[/<\\/script\\s*>/, { token: '@rematch', next: '@pop', nextEmbedded: '@pop' }],
+						[/[^<]+/, ''],
+						[/</, ''],
+					],
+					scriptJs: [
+						[/<\\/script\\s*>/, { token: '@rematch', next: '@pop', nextEmbedded: '@pop' }],
+						[/[^<]+/, ''],
+						[/</, ''],
+					],
+					styleScss: [
+						[/<\\/style\\s*>/, { token: '@rematch', next: '@pop', nextEmbedded: '@pop' }],
+						[/[^<]+/, ''],
+						[/</, ''],
+					],
+					styleLess: [
+						[/<\\/style\\s*>/, { token: '@rematch', next: '@pop', nextEmbedded: '@pop' }],
+						[/[^<]+/, ''],
+						[/</, ''],
+					],
+					styleCss: [
+						[/<\\/style\\s*>/, { token: '@rematch', next: '@pop', nextEmbedded: '@pop' }],
+						[/[^<]+/, ''],
+						[/</, ''],
+					],
+				},
+			});
 		}
 
 		function defineTheme() {
@@ -2021,7 +2143,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 	}
 }
 
-function languageIdFromPath(relativePath: string): string {
+export function languageIdFromPath(relativePath: string): string {
 	const extension = path.extname(relativePath).toLowerCase();
 	const languages = new Map<string, string>([
 		['.c', 'c'],
@@ -2039,6 +2161,7 @@ function languageIdFromPath(relativePath: string): string {
 		['.rs', 'rust'],
 		['.ts', 'typescript'],
 		['.tsx', 'typescript'],
+		['.vue', 'vue'],
 		['.xml', 'xml'],
 		['.yaml', 'yaml'],
 		['.yml', 'yaml'],
