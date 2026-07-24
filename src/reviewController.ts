@@ -243,6 +243,7 @@ export class ReviewController implements vscode.Disposable {
 			this.registerCommand('cli-diff.previousChange', (uri?: string, hunkId?: string) => this.navigateChange(-1, uri, hunkId)),
 			this.registerCommand('cli-diff.openReviewView', (uri?: string) => this.openReviewView(uri)),
 			this.registerCommand('cli-diff.openFileAtChange', (uri: string, hunkId: string) => this.openFileAtChange(uri, hunkId)),
+			this.registerCommand('cli-diff.closeReviewEditors', () => this.closeReviewEditors()),
 			this.registerCommand('cli-diff.refresh', () => this.refreshAll()),
 			this.registerCommand('cli-diff.saveLlmWikiConfig', (input: LlmConfigInput) => this.saveLlmWikiConfig(input)),
 			this.registerCommand('cli-diff.selectLlmConfigProfile', (profileId: string) => this.selectLlmConfigProfile(profileId)),
@@ -1615,8 +1616,8 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private reviewEditorMode(): ReviewEditorMode {
-		const configured = vscode.workspace.getConfiguration('cliDiff').get<string>('reviewEditorMode', 'nativeEditor');
-		return configured === 'reviewPage' ? 'reviewPage' : 'nativeEditor';
+		const configured = vscode.workspace.getConfiguration('cliDiff').get<string>('reviewEditorMode', 'reviewPage');
+		return configured === 'nativeEditor' ? 'nativeEditor' : 'reviewPage';
 	}
 
 	private async navigateFromReview(
@@ -1930,6 +1931,11 @@ export class ReviewController implements vscode.Disposable {
 		this.closeCompletedReviewEditorsAfterManualRefresh();
 	}
 
+	private closeReviewEditors(): void {
+		this.reviewWebview.closeAll();
+		this.nativeReviewEditor.clear();
+	}
+
 	private closeCompletedReviewEditorsAfterManualRefresh(): void {
 		const closedKeys = new Set([
 			...this.reviewWebview.closeCompleted(),
@@ -2200,6 +2206,18 @@ export class ReviewController implements vscode.Disposable {
 			if ((await this.wikiInitializationService.state(root.uri))?.status === 'ready') {
 				await this.refreshLlmWikiDashboardState({ status: 'initialized', progress: undefined, error: undefined });
 				vscode.window.showInformationMessage('LLM Code Wiki is already initialized for this workspace.');
+				return;
+			}
+
+			const confirmation = await vscode.window.showWarningMessage(
+				`Initialize LLM Code Wiki for “${root.name}”?`,
+				{
+					modal: true,
+					detail: 'Token usage varies with project size and complexity.',
+				},
+				'Initialize',
+			);
+			if (confirmation !== 'Initialize') {
 				return;
 			}
 

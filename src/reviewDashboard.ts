@@ -21,6 +21,7 @@ type DashboardMessage =
 	| { type: 'acceptAll' }
 	| { type: 'rejectAll' }
 	| { type: 'undoAll' }
+	| { type: 'closeReviewEditors' }
 	| { type: 'selectTrackingTarget' }
 	| { type: 'selectTrackingProject'; projectId: string }
 	| {
@@ -285,6 +286,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		if (message.type === 'undoAll') {
 			await this.executeCommand('cli-diff.undoAll');
 			this.postState();
+			return;
+		}
+		if (message.type === 'closeReviewEditors') {
+			await this.executeCommand('cli-diff.closeReviewEditors');
 			return;
 		}
 		if (message.type === 'selectTrackingTarget') {
@@ -1369,6 +1374,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					<img src="${settingIconUri}" alt="" aria-hidden="true">
 				</button>
 				<div class="settings-menu" id="settingsMenu" role="menu" hidden>
+					<button class="settings-menu-item" type="button" role="menuitem" data-menu-action="closeReviewEditors">
+						<span class="settings-menu-title">Close all Review editors</span>
+						<span class="settings-menu-reason"></span>
+					</button>
+					<div class="settings-menu-divider" role="separator"></div>
 					<button class="settings-menu-item" type="button" role="menuitem" data-menu-action="initializeWiki">
 						<span class="settings-menu-title">Initialize LLM Code Wiki</span>
 						<span class="settings-menu-reason"></span>

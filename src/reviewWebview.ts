@@ -276,6 +276,18 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 		return closed;
 	}
 
+	public closeAll(): void {
+		for (const [key, host] of [...this.hosts]) {
+			const timer = this.refreshTimers.get(key);
+			if (timer) {
+				clearTimeout(timer);
+				this.refreshTimers.delete(key);
+			}
+			this.hosts.delete(key);
+			host.panel.dispose();
+		}
+	}
+
 	private scheduleRefresh(uri: vscode.Uri): void {
 		const key = uriKey(this.originalUriForDocumentUri(uri));
 		if (!this.hosts.has(key)) {

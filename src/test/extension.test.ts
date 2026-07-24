@@ -332,6 +332,27 @@ suite('Review webview compatibility', () => {
 		assert.deepStrictEqual(disposed, closed);
 	});
 
+	test('closes every open Review page without changing review state', () => {
+		const firstUri = vscode.Uri.file('D:/repo/src/first.ts');
+		const secondUri = vscode.Uri.file('D:/repo/src/second.ts');
+		const disposed: string[] = [];
+		const refreshTimer = setTimeout(() => undefined, 60_000);
+		const manager = Object.create(ReviewWebviewManager.prototype) as ReviewWebviewManager;
+		Object.assign(manager as unknown as Record<string, unknown>, {
+			hosts: new Map([
+				[firstUri.toString(), { uri: firstUri, panel: { dispose: () => disposed.push(firstUri.toString()) } }],
+				[secondUri.toString(), { uri: secondUri, panel: { dispose: () => disposed.push(secondUri.toString()) } }],
+			]),
+			refreshTimers: new Map([[firstUri.toString(), refreshTimer]]),
+		});
+
+		manager.closeAll();
+
+		assert.deepStrictEqual(disposed, [firstUri.toString(), secondUri.toString()]);
+		assert.strictEqual((manager as unknown as { hosts: Map<string, unknown> }).hosts.size, 0);
+		assert.strictEqual((manager as unknown as { refreshTimers: Map<string, unknown> }).refreshTimers.size, 0);
+	});
+
 	test('invokes completed Review editor cleanup only from the manual refresh flow', () => {
 		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
 		assert.match(source, /refreshGitSessionFiles\(\{ source: 'manual' \}\);\s+this\.closeCompletedReviewEditorsAfterManualRefresh\(\);/);
@@ -497,7 +518,7 @@ suite('Extension configuration', () => {
 		} | undefined;
 
 		assert.ok(setting);
-		assert.strictEqual(setting.default, 'nativeEditor');
+		assert.strictEqual(setting.default, 'reviewPage');
 		assert.deepStrictEqual(setting.enum, ['nativeEditor', 'reviewPage']);
 		assert.deepStrictEqual(setting.enumItemLabels, ['Native inline diff editor', 'Review page']);
 
@@ -653,6 +674,17 @@ suite('Review controller bulk actions', () => {
 		assert.ok(source.includes('sort((left, right) => left.file.relativePath.localeCompare(right.file.relativePath))'));
 	});
 
+	test('confirms LLM Code Wiki initialization after resolving the target project', () => {
+		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
+		const confirmationIndex = source.indexOf('`Initialize LLM Code Wiki for “${root.name}”?`');
+		const taskIndex = source.indexOf("this.beginProjectAgentTask('initialize', root, project?.id)");
+
+		assert.ok(confirmationIndex >= 0);
+		assert.ok(taskIndex > confirmationIndex);
+		assert.ok(source.includes("detail: 'Token usage varies with project size and complexity.'"));
+		assert.ok(source.includes("if (confirmation !== 'Initialize')"));
+	});
+
 	test('wires AI review partial retry and max round configuration through the controller', () => {
 		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
 
@@ -702,11 +734,14 @@ suite('Review controller bulk actions', () => {
 	test('wires review editor mode through native editor and review page presenters', () => {
 		const controllerSource = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
 		const nativeSource = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'nativeReviewEditor.ts'), 'utf8');
+		const closeMethod = controllerSource.match(/private closeReviewEditors\(\): void \{([\s\S]*?)\n\t\}/)?.[1];
 
 		assert.ok(controllerSource.includes("import { NativeReviewEditorManager"));
+		assert.ok(controllerSource.includes("this.registerCommand('cli-diff.closeReviewEditors', () => this.closeReviewEditors())"));
+		assert.strictEqual(closeMethod?.trim(), 'this.reviewWebview.closeAll();\n\t\tthis.nativeReviewEditor.clear();');
 		assert.ok(controllerSource.includes('firstReviewRevealPosition'));
-		assert.ok(controllerSource.includes("get<string>('reviewEditorMode', 'nativeEditor')"));
-		assert.ok(controllerSource.includes("configured === 'reviewPage' ? 'reviewPage' : 'nativeEditor'"));
+		assert.ok(controllerSource.includes("get<string>('reviewEditorMode', 'reviewPage')"));
+		assert.ok(controllerSource.includes("configured === 'nativeEditor' ? 'nativeEditor' : 'reviewPage'"));
 		assert.ok(controllerSource.includes("await this.openReviewPresentation(uri);"));
 		assert.ok(controllerSource.includes('const effectiveReveal = reveal ?? (file ? firstReviewRevealPosition(file) : undefined);'));
 		assert.ok(controllerSource.includes("await this.nativeReviewEditor.revealChunk(uri, effectiveReveal.hunkId)"));
@@ -1700,6 +1735,10 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('renderReviewFileDetail(reviewDetailFile);'));
 		assert.strictEqual(view.webview.html.includes('renderReviewFileDetail(undefined);'), false);
 		assert.ok(view.webview.html.includes('data-menu-action="initializeWiki"'));
+		assert.ok(view.webview.html.includes('data-menu-action="closeReviewEditors"'));
+		assert.ok(view.webview.html.indexOf('data-menu-action="closeReviewEditors"')
+			< view.webview.html.indexOf('data-menu-action="initializeWiki"'));
+		assert.ok(view.webview.html.includes('Close all Review editors'));
 		assert.ok(view.webview.html.includes('data-menu-action="updateWiki"'));
 		assert.ok(view.webview.html.includes('data-menu-action="generateAiReview"'));
 		assert.ok(view.webview.html.includes('data-menu-action="openWikiIndex"'));
@@ -1743,12 +1782,14 @@ suite('Review state', () => {
 		});
 		messageHandler({ type: 'openWikiIndex' });
 		messageHandler({ type: 'openExtensionSettings' });
+		messageHandler({ type: 'closeReviewEditors' });
 		messageHandler({ type: 'selectTrackingTarget' });
 		messageHandler({ type: 'selectTrackingProject', projectId: 'project-b' });
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.openWikiIndex' && call.args.length === 0));
 		assert.ok(commands.some((call) => call.command === 'workbench.action.openSettings'
 			&& call.args[0] === '@ext:local.cli-diff-review'));
+		assert.ok(commands.some((call) => call.command === 'cli-diff.closeReviewEditors' && call.args.length === 0));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.selectTrackingTarget'));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.selectTrackingTarget'
 			&& call.args[0] === 'project-b'));

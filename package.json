@@ -259,7 +259,7 @@
             "Native inline diff editor",
             "Review page"
           ],
-          "default": "nativeEditor",
+          "default": "reviewPage",
           "description": "Controls whether review files open in the VS Code/Cursor native inline diff editor or the Cli Diff Review page."
         },
         "cliDiff.aiReviewStrategy": {
