@@ -51,7 +51,7 @@ const apiKeySecretKey = 'cliDiff.llm.apiKey';
 const profilesKey = 'cliDiff.llm.profiles';
 const activeProfileKey = 'cliDiff.llm.activeProfileId';
 const deepSeekBaseUrl = 'https://api.deepseek.com';
-const glmBaseUrl = 'https://open.bigmodel.cn/api/paas/v4';
+const glmBaseUrl = 'https://open.bigmodel.cn/api/coding/paas/v4';
 const glmDefaultModel = 'glm-5.2';
 
 interface LlmPersistedProfile {

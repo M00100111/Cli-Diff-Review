@@ -1516,6 +1516,9 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('function groupRunLogByFile'));
 		assert.ok(view.webview.html.includes('function renderRunLogFile'));
 		assert.ok(view.webview.html.includes('function renderRunLogRound'));
+		assert.ok(view.webview.html.includes('.wiki-run-status.recovered'));
+		assert.ok(view.webview.html.includes("return 'recovered'"));
+		assert.ok(view.webview.html.includes('Recovered after error'));
 		assert.ok(view.webview.html.includes('const openRunLogKeys = new Set()'));
 		assert.ok(view.webview.html.includes('details[data-run-log-key][open]'));
 		assert.ok(view.webview.html.includes('function applyRunLogDetailsState'));
@@ -2282,7 +2285,7 @@ suite('LLM Code Wiki', () => {
 		const runtime = await store.runtimeConfig();
 
 		assert.strictEqual(saved.provider, 'glm');
-		assert.strictEqual(saved.baseUrl, 'https://open.bigmodel.cn/api/paas/v4');
+		assert.strictEqual(saved.baseUrl, 'https://open.bigmodel.cn/api/coding/paas/v4');
 		assert.strictEqual(saved.model, 'glm-5.2');
 		assert.strictEqual(saved.jsonOutputEnabled, true);
 		assert.strictEqual(saved.thinkingMode, 'xhigh');

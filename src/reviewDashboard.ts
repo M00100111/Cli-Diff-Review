@@ -840,6 +840,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 		.wiki-run-status.success { color: var(--vscode-testing-iconPassed, var(--vscode-gitDecoration-untrackedResourceForeground)); }
 		.wiki-run-status.error { color: var(--vscode-errorForeground); }
+		.wiki-run-status.recovering,
+		.wiki-run-status.recovered { color: var(--modified); }
 		.wiki-run-status.running { color: var(--vscode-progressBar-background, var(--vscode-focusBorder)); }
 		.wiki-run-status.info { color: var(--muted); }
 		.wiki-run-round {
@@ -2585,7 +2587,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const meta = document.createElement('span');
 			meta.className = 'wiki-run-meta';
 			const position = group.fileIndex && group.fileCount ? 'file ' + group.fileIndex + '/' + group.fileCount + ' | ' : '';
-			meta.textContent = position + group.items.length + ' events';
+			meta.textContent = position + group.items.length + ' events' + runLogRecoveryMeta(statusValue);
 			main.append(title, meta);
 			const status = document.createElement('span');
 			status.className = 'wiki-run-status ' + statusValue;
@@ -2620,7 +2622,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			title.textContent = 'Round ' + group.round;
 			const meta = document.createElement('span');
 			meta.className = 'wiki-run-meta';
-			meta.textContent = group.items.length + ' events';
+			meta.textContent = group.items.length + ' events' + runLogRecoveryMeta(statusValue);
 			main.append(title, meta);
 			const status = document.createElement('span');
 			status.className = 'wiki-run-status ' + statusValue;
@@ -2698,14 +2700,38 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 
 		function runLogGroupStatus(items) {
-			if (items.some((item) => item.status === 'error')) {
-				return 'error';
+			let lastErrorIndex = -1;
+			for (let index = items.length - 1; index >= 0; index -= 1) {
+				if (items[index].status === 'error') {
+					lastErrorIndex = index;
+					break;
+				}
+			}
+			if (lastErrorIndex >= 0) {
+				const laterItems = items.slice(lastErrorIndex + 1);
+				const recovered = laterItems.some((item) => item.status === 'success'
+					&& (item.kind === 'parse_success' || item.kind === 'run_complete'));
+				if (recovered) {
+					return 'recovered';
+				}
+				const recovering = laterItems.some((item) => item.status === 'running' && item.kind === 'llm_request');
+				return recovering ? 'recovering' : 'error';
 			}
 			const lastStatus = [...items].reverse().find((item) => item.status !== 'info')?.status;
 			if (lastStatus) {
 				return lastStatus;
 			}
 			return items.length > 0 ? 'info' : 'success';
+		}
+
+		function runLogRecoveryMeta(status) {
+			if (status === 'recovering') {
+				return ' · Recovering after error';
+			}
+			if (status === 'recovered') {
+				return ' · Recovered after error';
+			}
+			return '';
 		}
 
 		function runLogMeta(item) {
