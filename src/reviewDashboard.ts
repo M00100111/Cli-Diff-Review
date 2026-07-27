@@ -136,6 +136,7 @@ export interface LlmWikiRunLogEntry {
 export interface ProjectAgentSummary {
 	projectId: string;
 	projectName: string;
+	branchName?: string;
 	rootUri: string;
 	taskKind?: ProjectAgentTaskKind;
 	lifecycle: ProjectAgentLifecycle | 'idle';
@@ -774,12 +775,31 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			flex-direction: column;
 			gap: 2px;
 		}
+		.project-agent-heading {
+			min-width: 0;
+			display: flex;
+			align-items: baseline;
+			gap: 5px;
+			overflow: hidden;
+		}
 		.project-agent-name {
+			flex: 0 1 auto;
+			min-width: 0;
 			overflow: hidden;
 			text-overflow: ellipsis;
 			white-space: nowrap;
 			font-size: 12px;
 			font-weight: 600;
+		}
+		.project-agent-branch {
+			flex: 1 1 auto;
+			min-width: 0;
+			overflow: hidden;
+			color: var(--muted);
+			font-size: 10px;
+			font-weight: 500;
+			text-overflow: ellipsis;
+			white-space: nowrap;
 		}
 		.project-agent-progress {
 			overflow: hidden;
@@ -1904,13 +1924,23 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				card.addEventListener('click', () => vscode.postMessage({ type: 'selectTrackingProject', projectId: item.projectId }));
 				const main = document.createElement('span');
 				main.className = 'project-agent-main';
+				const heading = document.createElement('span');
+				heading.className = 'project-agent-heading';
 				const name = document.createElement('span');
 				name.className = 'project-agent-name';
 				name.textContent = item.projectName;
+				heading.appendChild(name);
+				if (item.branchName) {
+					const branch = document.createElement('span');
+					branch.className = 'project-agent-branch';
+					branch.textContent = item.branchName;
+					branch.title = item.branchName;
+					heading.appendChild(branch);
+				}
 				const reviewSummary = document.createElement('span');
 				reviewSummary.className = 'project-agent-progress';
 				reviewSummary.textContent = projectReviewSummary(item);
-				main.append(name, reviewSummary);
+				main.append(heading, reviewSummary);
 				const detailText = item.running || item.lifecycle === 'failed' || item.lifecycle === 'interrupted'
 					? item.error || item.progress
 					: undefined;
