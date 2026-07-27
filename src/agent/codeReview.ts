@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import { LlmClient } from '../llm/client';
 import { LlmRuntimeConfig } from '../llm/config';
 import { isJsonObject } from '../llm/json';
-import { ReviewFileState, ReviewHunk, ReviewSession } from '../types';
+import { ReviewedHunk, ReviewFileState, ReviewHunk, ReviewSession } from '../types';
 import { isAbortError } from '../wiki/cancellation';
 import { isWikiPath } from '../wiki/paths';
 import type { WikiFreshnessAssessment } from '../wiki/state';
@@ -71,6 +71,7 @@ export interface AiReviewFileResult {
 
 export interface StoredAiReview {
 	signature: string;
+	sourceSnapshot?: AiReviewSourceSnapshot;
 	findings: AiReviewFinding[];
 	suggestions: AiReviewChunkSuggestion[];
 	fileResults: AiReviewFileResult[];
@@ -89,6 +90,31 @@ export interface StoredAiReview {
 	failedFile?: string;
 	error?: string;
 	continuations?: AiReviewContinuation[];
+}
+
+export interface AiReviewSourceSnapshot {
+	version: 1;
+	rootUri: string;
+	projects: Array<{
+		id: string;
+		rootUri: string;
+		headOid?: string;
+	}>;
+	files: AiReviewSourceFileSnapshot[];
+}
+
+export interface AiReviewSourceFileSnapshot {
+	uri: string;
+	relativePath: string;
+	projectId?: string;
+	projectName?: string;
+	oldText: string;
+	newText: string;
+	baselineExists: boolean;
+	currentExists: boolean;
+	indexBlobOid?: string;
+	headOid?: string;
+	hunks: ReviewHunk[];
 }
 
 export interface AiReviewContinuation {
@@ -161,6 +187,11 @@ export interface CodeReviewAgentOptions {
 	onTrace?: (event: AgentTraceEvent, context: CodeReviewTraceContext) => void;
 	onFileComplete?: (review: StoredAiReview) => void | Promise<void>;
 	onCheckpoint?: (review: StoredAiReview) => void | Promise<void>;
+	/**
+	 * Internal immutable source used by prompts, tools, and validation. The public
+	 * session remains live so completed results can be reconciled to review state.
+	 */
+	reviewSourceSession?: ReviewSession;
 }
 
 const severities = new Set<AiReviewSeverity>(['error', 'warning', 'suggestion', 'info']);
@@ -176,11 +207,15 @@ export class CodeReviewAgentService {
 	private readonly runner = new AgentRunner();
 
 	public async review(options: CodeReviewAgentOptions): Promise<StoredAiReview> {
-		const files = sourcePendingFiles(options.session);
+		const sourceSnapshot = compatibleStoredSourceSnapshot(options.existingReview?.sourceSnapshot, options.session)
+			?? createAiReviewSourceSnapshot(options.session);
+		const reviewSourceSession = reviewSessionFromSourceSnapshot(options.session, sourceSnapshot);
+		const runOptions: CodeReviewAgentOptions = { ...options, reviewSourceSession };
+		const files = sourcePendingFiles(reviewSourceSession);
 		const signature = reviewChangeSignature(options.session);
 		const strategy = normalizeAiReviewStrategy(options.strategy);
 		let pipeline = options.existingReview?.pipeline ?? selectAiReviewPipeline(strategy, files);
-		const review = initialStoredReview(signature, files, options.existingReview);
+		const review = initialStoredReview(signature, files, options.existingReview, sourceSnapshot);
 		const limits = aiReviewRunLimits(options.maxRounds);
 		review.strategy = strategy;
 		review.pipeline = pipeline;
@@ -195,20 +230,20 @@ export class CodeReviewAgentService {
 		let plan = storedReviewPlan(review);
 		if (pipeline === 'multi' && !review.planSummary) {
 			try {
-				knowledgeContext = await this.runKnowledgeRetrieval(options, files, limits, review);
+				knowledgeContext = await this.runKnowledgeRetrieval(runOptions, files, limits, review);
 				review.knowledgeContext = knowledgeContext;
 				review.knowledgeContextSummary = knowledgeContext.summary;
 				review.knowledgeFreshness = knowledgeContext.freshness;
 				review.knowledgeClaims = knowledgeContext.claims;
-				await this.persistReviewProgress(options, review);
-				plan = await this.runPlanning(options, files, knowledgeContext, limits, review);
+				await this.persistReviewProgress(runOptions, review);
+				plan = await this.runPlanning(runOptions, files, knowledgeContext, limits, review);
 				review.reviewPlan = plan;
 				review.planSummary = plan.summary;
 				review.completedIntegration = false;
-				await this.persistReviewProgress(options, review);
+				await this.persistReviewProgress(runOptions, review);
 			} catch (error) {
 				if (strategy === 'Auto' && !isContinuationIncompatibleError(error)) {
-					emitReviewTrace(options, stageTraceContext('plan', files), {
+					emitReviewTrace(runOptions, stageTraceContext('plan', files), {
 						kind: 'run_error',
 						title: 'AI review strategy fallback',
 						summary: `Multi-agent prelude failed; falling back to FileOnly: ${errorMessage(error)}`,
@@ -236,12 +271,9 @@ export class CodeReviewAgentService {
 			}
 		}
 
-		await this.runFileReviews(options, files, review, limits, pipeline, knowledgeContext, plan);
+		await this.runFileReviews(runOptions, files, review, limits, pipeline, knowledgeContext, plan);
 		if (pipeline === 'multi' && review.completedIntegration !== true) {
-			await this.runIntegrationReview(options, files, review, limits, knowledgeContext, plan);
-		}
-		if (reviewChangeSignature(options.session) !== signature) {
-			throw new Error('Pending source chunks changed while the AI review was running. Generate the review again.');
+			await this.runIntegrationReview(runOptions, files, review, limits, knowledgeContext, plan);
 		}
 		review.status = 'complete';
 		review.completedFiles = files.map((file) => file.uri.toString());
@@ -251,6 +283,7 @@ export class CodeReviewAgentService {
 		review.pipeline = pipeline;
 		review.completedIntegration = pipeline === 'multi' ? true : undefined;
 		review.generatedAt = new Date().toISOString();
+		reconcileStoredAiReviewToSession(review, options.session);
 		return review;
 	}
 
@@ -354,7 +387,7 @@ export class CodeReviewAgentService {
 				: undefined),
 			tools: createReadOnlyAgentTools({
 				root: options.root,
-				reviewSession: options.session,
+				reviewSession: options.reviewSourceSession ?? options.session,
 				includeWikiTools: Boolean(options.includeWikiTools),
 			}),
 			signal: options.signal,
@@ -423,6 +456,7 @@ export class CodeReviewAgentService {
 			review.completedIntegration = false;
 		}
 		review.generatedAt = new Date().toISOString();
+		reconcileStoredAiReviewToSession(review, options.session);
 		await options.onFileComplete?.(cloneStoredReview(review));
 	}
 
@@ -463,7 +497,7 @@ export class CodeReviewAgentService {
 			client: options.client,
 			systemPrompt: knowledgeRetrievalSystemPrompt(),
 			userPrompt: knowledgeRetrievalUserPrompt(files, options.knowledgeFreshness),
-			tools: createReadOnlyAgentTools({ root: options.root, reviewSession: options.session, includeWikiTools: true })
+			tools: createReadOnlyAgentTools({ root: options.root, reviewSession: options.reviewSourceSession ?? options.session, includeWikiTools: true })
 				.filter((tool) => ['list_wiki_files', 'read_wiki_file', 'search_wiki_files', 'search_workspace', 'list_workspace_directory', 'read_workspace_file', 'read_pending_change', 'list_pending_changes'].includes(tool.name)),
 			signal: options.signal,
 			onProgress: (progress) => options.onProgress?.(`Knowledge: ${progress.message}`),
@@ -501,7 +535,7 @@ export class CodeReviewAgentService {
 			client: options.client,
 			systemPrompt: planningSystemPrompt(),
 			userPrompt: planningUserPrompt(files, knowledgeContext),
-			tools: createReadOnlyAgentTools({ root: options.root, reviewSession: options.session, includeWikiTools: Boolean(options.includeWikiTools) }),
+			tools: createReadOnlyAgentTools({ root: options.root, reviewSession: options.reviewSourceSession ?? options.session, includeWikiTools: Boolean(options.includeWikiTools) }),
 			signal: options.signal,
 			onProgress: (progress) => options.onProgress?.(`Plan: ${progress.message}`),
 			onTrace: (event) => options.onTrace?.(event, context),
@@ -530,7 +564,7 @@ export class CodeReviewAgentService {
 				client: options.client,
 				systemPrompt: integrationSystemPrompt(options.language),
 				userPrompt: integrationUserPrompt(files, fileFindings, knowledgeContext, plan),
-				tools: createReadOnlyAgentTools({ root: options.root, reviewSession: options.session, includeWikiTools: Boolean(options.includeWikiTools) }),
+				tools: createReadOnlyAgentTools({ root: options.root, reviewSession: options.reviewSourceSession ?? options.session, includeWikiTools: Boolean(options.includeWikiTools) }),
 				signal: options.signal,
 				onProgress: (progress) => options.onProgress?.(`Integration: ${progress.message}`),
 				onTrace: (event) => options.onTrace?.(event, context),
@@ -594,10 +628,13 @@ export class CodeReviewAgentService {
 	}
 
 	private async persistReviewProgress(options: CodeReviewAgentOptions, review: StoredAiReview): Promise<void> {
+		reconcileStoredAiReviewToSession(review, options.session);
 		await options.onCheckpoint?.(cloneStoredReview(review));
 	}
 }
 export class AiReviewStore {
+	private readonly saveQueues = new Map<string, Promise<void>>();
+
 	public constructor(private readonly workspaceState: vscode.Memento) {}
 
 	public load(session: ReviewSession | undefined): StoredAiReview | undefined {
@@ -605,12 +642,44 @@ export class AiReviewStore {
 			return undefined;
 		}
 		const stored = this.workspaceState.get<StoredAiReview>(storeKey(session.rootUri));
+		if (!stored) {
+			return undefined;
+		}
 		const signature = reviewChangeSignature(session);
-		return stored?.signature === signature ? normalizeStoredReview(stored, signature, sourcePendingFiles(session)) : undefined;
+		const normalizedSnapshot = normalizeAiReviewSourceSnapshot(stored.sourceSnapshot);
+		const sourceSnapshot = compatibleStoredSourceSnapshot(normalizedSnapshot, session);
+		if (normalizedSnapshot && !sourceSnapshot) {
+			return undefined;
+		}
+		if (stored.signature !== signature && !sourceSnapshot) {
+			return undefined;
+		}
+		const files = sourceSnapshot
+			? sourcePendingFiles(reviewSessionFromSourceSnapshot(session, sourceSnapshot))
+			: sourcePendingFiles(session);
+		const normalized = normalizeStoredReview(stored, signature, files);
+		const matched = reconcileStoredAiReviewToSession(normalized, session);
+		return sourceSnapshot && sourceSnapshot.files.some((file) => file.hunks.length > 0) && matched === 0
+			? undefined
+			: normalized;
 	}
 
 	public async save(session: ReviewSession, review: StoredAiReview): Promise<void> {
-		await this.workspaceState.update(storeKey(session.rootUri), review);
+		const key = storeKey(session.rootUri);
+		const previous = this.saveQueues.get(key) ?? Promise.resolve();
+		const next = previous.catch(() => undefined).then(async () => {
+			const stored = cloneStoredReview(review);
+			reconcileStoredAiReviewToSession(stored, session);
+			await this.workspaceState.update(key, stored);
+		});
+		this.saveQueues.set(key, next);
+		try {
+			await next;
+		} finally {
+			if (this.saveQueues.get(key) === next) {
+				this.saveQueues.delete(key);
+			}
+		}
 	}
 
 	public async clear(rootUri: vscode.Uri): Promise<void> {
@@ -618,12 +687,20 @@ export class AiReviewStore {
 	}
 }
 
-function initialStoredReview(signature: string, files: ReviewFileState[], existingReview?: StoredAiReview): StoredAiReview {
+function initialStoredReview(
+	signature: string,
+	files: ReviewFileState[],
+	existingReview?: StoredAiReview,
+	sourceSnapshot?: AiReviewSourceSnapshot,
+): StoredAiReview {
 	if (existingReview?.signature === signature && existingReview.status === 'partial') {
-		return normalizeStoredReview(existingReview, signature, files);
+		const normalized = normalizeStoredReview(existingReview, signature, files);
+		normalized.sourceSnapshot = sourceSnapshot;
+		return normalized;
 	}
 	return {
 		signature,
+		sourceSnapshot,
 		findings: [],
 		suggestions: [],
 		fileResults: [],
@@ -641,6 +718,7 @@ function normalizeStoredReview(review: StoredAiReview, signature: string, files:
 		: status === 'complete' ? allFileUris : [];
 	return {
 		signature,
+		sourceSnapshot: normalizeAiReviewSourceSnapshot(review.sourceSnapshot),
 		findings: Array.isArray(review.findings) ? review.findings : [],
 		suggestions: Array.isArray(review.suggestions) ? review.suggestions : [],
 		fileResults: Array.isArray(review.fileResults) ? review.fileResults : [],
@@ -1135,6 +1213,292 @@ function aiReviewRunLimits(maxRounds: number | 'unlimited' | undefined): {
 	};
 }
 
+function createAiReviewSourceSnapshot(session: ReviewSession): AiReviewSourceSnapshot {
+	return {
+		version: 1,
+		rootUri: session.rootUri.toString(),
+		projects: (session.projects ?? []).map((project) => ({
+			id: project.id,
+			rootUri: project.rootUri.toString(),
+			headOid: project.headOid,
+		})),
+		files: sourcePendingFiles(session).map((file) => ({
+			uri: file.uri.toString(),
+			relativePath: file.relativePath,
+			projectId: file.projectId,
+			projectName: file.projectName,
+			oldText: file.oldText,
+			newText: file.newText,
+			baselineExists: file.baselineExists,
+			currentExists: file.currentExists,
+			indexBlobOid: file.gitSnapshot?.indexBlobOid,
+			headOid: file.headOid,
+			hunks: file.hunks.map(cloneSourceReviewHunk),
+		})),
+	};
+}
+
+function cloneSourceReviewHunk(hunk: ReviewHunk): ReviewHunk {
+	const sourceHunkId = hunk.sourceHunkId ?? hunk.id;
+	return {
+		...hunk,
+		sourceHunkId,
+		reviewItemId: hunk.reviewItemId ?? sourceHunkId,
+		oldContextBefore: [...hunk.oldContextBefore],
+		oldContextAfter: [...hunk.oldContextAfter],
+		newContextBefore: [...hunk.newContextBefore],
+		newContextAfter: [...hunk.newContextAfter],
+		memberHunks: hunk.memberHunks?.map((member) => cloneSourceReviewHunk(member) as typeof member),
+	};
+}
+
+function normalizeAiReviewSourceSnapshot(value: unknown): AiReviewSourceSnapshot | undefined {
+	if (!isJsonObject(value) || value.version !== 1 || typeof value.rootUri !== 'string' || !Array.isArray(value.files)) {
+		return undefined;
+	}
+	const projects = Array.isArray(value.projects)
+		? value.projects.flatMap((candidate) => (
+			isJsonObject(candidate) && typeof candidate.id === 'string' && typeof candidate.rootUri === 'string'
+				? [{
+					id: candidate.id,
+					rootUri: candidate.rootUri,
+					headOid: typeof candidate.headOid === 'string' ? candidate.headOid : undefined,
+				}]
+				: []
+		))
+		: [];
+	const files: AiReviewSourceFileSnapshot[] = [];
+	for (const candidate of value.files) {
+		if (!isJsonObject(candidate)
+			|| typeof candidate.uri !== 'string'
+			|| typeof candidate.relativePath !== 'string'
+			|| typeof candidate.oldText !== 'string'
+			|| typeof candidate.newText !== 'string'
+			|| typeof candidate.baselineExists !== 'boolean'
+			|| typeof candidate.currentExists !== 'boolean'
+			|| !Array.isArray(candidate.hunks)) {
+			continue;
+		}
+		const hunks = candidate.hunks
+			.filter((hunk): hunk is ReviewHunk => isJsonObject(hunk)
+				&& typeof hunk.id === 'string'
+				&& typeof hunk.fileUri === 'string'
+				&& typeof hunk.oldText === 'string'
+				&& typeof hunk.newText === 'string'
+				&& (hunk.kind === 'add' || hunk.kind === 'delete' || hunk.kind === 'modify'))
+			.map(cloneSourceReviewHunk);
+		if (hunks.length === 0) {
+			continue;
+		}
+		files.push({
+			uri: candidate.uri,
+			relativePath: candidate.relativePath,
+			projectId: typeof candidate.projectId === 'string' ? candidate.projectId : undefined,
+			projectName: typeof candidate.projectName === 'string' ? candidate.projectName : undefined,
+			oldText: candidate.oldText,
+			newText: candidate.newText,
+			baselineExists: candidate.baselineExists,
+			currentExists: candidate.currentExists,
+			indexBlobOid: typeof candidate.indexBlobOid === 'string' ? candidate.indexBlobOid : undefined,
+			headOid: typeof candidate.headOid === 'string' ? candidate.headOid : undefined,
+			hunks,
+		});
+	}
+	return { version: 1, rootUri: value.rootUri, projects, files };
+}
+
+function compatibleStoredSourceSnapshot(
+	value: AiReviewSourceSnapshot | undefined,
+	session: ReviewSession,
+): AiReviewSourceSnapshot | undefined {
+	const snapshot = normalizeAiReviewSourceSnapshot(value);
+	if (!snapshot || snapshot.rootUri !== session.rootUri.toString()) {
+		return undefined;
+	}
+	const projects = new Map((session.projects ?? []).map((project) => [project.id, project]));
+	for (const sourceProject of snapshot.projects) {
+		const current = projects.get(sourceProject.id);
+		if (!current || current.rootUri.toString() !== sourceProject.rootUri) {
+			return undefined;
+		}
+		if (sourceProject.headOid && current.headOid && sourceProject.headOid !== current.headOid) {
+			return undefined;
+		}
+	}
+	return snapshot;
+}
+
+function reviewSessionFromSourceSnapshot(session: ReviewSession, snapshot: AiReviewSourceSnapshot): ReviewSession {
+	const currentProjects = new Map((session.projects ?? []).map((project) => [project.id, project]));
+	const projects = snapshot.projects.map((project) => {
+		const current = currentProjects.get(project.id);
+		return current ?? {
+			id: project.id,
+			name: vscode.Uri.parse(project.rootUri).path.split('/').filter(Boolean).at(-1) ?? project.id,
+			rootUri: vscode.Uri.parse(project.rootUri),
+			headOid: project.headOid,
+		};
+	});
+	const files = new Map<string, ReviewFileState>();
+	for (const source of snapshot.files) {
+		const uri = vscode.Uri.parse(source.uri);
+		files.set(uri.toString(), {
+			uri,
+			relativePath: source.relativePath,
+			projectId: source.projectId,
+			projectName: source.projectName,
+			oldText: source.oldText,
+			newText: source.newText,
+			hunks: source.hunks.map(cloneSourceReviewHunk),
+			acceptedHunks: [],
+			rejectedHunks: [],
+			appliedAiSuggestions: [],
+			originalText: source.oldText,
+			originalExists: source.baselineExists,
+			baselineExists: source.baselineExists,
+			currentExists: source.currentExists,
+			revision: 0,
+			gitSnapshot: {
+				headText: source.oldText,
+				indexText: source.oldText,
+				workingText: source.newText,
+				headExists: source.baselineExists,
+				indexExists: source.baselineExists,
+				workingExists: source.currentExists,
+				indexBlobOid: source.indexBlobOid,
+			},
+			headOid: source.headOid,
+		});
+	}
+	return {
+		id: `${session.id}:ai-review-source`,
+		mode: 'git',
+		rootUri: session.rootUri,
+		createdAt: session.createdAt,
+		files,
+		projects,
+		trackingTarget: session.trackingTarget,
+	};
+}
+
+/**
+ * Rebinds source-snapshot results to the same logical review items in the live
+ * session. New live hunks are deliberately absent from the source snapshot and
+ * can therefore never receive results from the running review.
+ */
+export function reconcileStoredAiReviewToSession(review: StoredAiReview, session: ReviewSession): number {
+	const snapshot = compatibleStoredSourceSnapshot(review.sourceSnapshot, session);
+	review.signature = reviewChangeSignature(session);
+	if (!snapshot) {
+		return sourcePendingFiles(session).reduce((total, file) => total + file.hunks.length, 0);
+	}
+	review.sourceSnapshot = snapshot;
+	const bindings = new Map<string, { hunkId: string; line: number }>();
+	let matchedSourceCount = 0;
+	for (const sourceFile of snapshot.files) {
+		const liveFile = [...session.files.values()].find((file) => file.uri.toString() === sourceFile.uri);
+		if (!liveFile) {
+			continue;
+		}
+		for (const sourceHunk of sourceFile.hunks) {
+			const liveHunk = findLiveSourceHunk(liveFile, sourceHunk);
+			if (!liveHunk) {
+				continue;
+			}
+			matchedSourceCount += 1;
+			const stableId = reviewHunkStableIdentity(sourceHunk);
+			const line = 'displayStart' in liveHunk && typeof liveHunk.displayStart === 'number'
+				? liveHunk.displayStart
+				: liveHunk.newStart;
+			for (const alias of reviewHunkAliases(sourceHunk)) {
+				bindings.set(`${sourceFile.uri}#${alias}`, { hunkId: stableId, line });
+			}
+			bindings.set(`${sourceFile.uri}#${stableId}`, { hunkId: stableId, line });
+		}
+	}
+	const bindingFor = (uri: string, hunkId: string): { hunkId: string; line: number } | undefined => bindings.get(`${uri}#${hunkId}`);
+	review.findings = review.findings.flatMap((finding) => {
+		const binding = bindingFor(finding.uri, finding.hunkId);
+		if (!binding) {
+			return [];
+		}
+		const relatedHunkIds = (finding.relatedHunkIds ?? [])
+			.flatMap((hunkId) => {
+				for (const sourceFile of snapshot.files) {
+					const related = bindingFor(sourceFile.uri, hunkId);
+					if (related) {
+						return [related.hunkId];
+					}
+				}
+				return [];
+			});
+		return [{
+			...finding,
+			hunkId: binding.hunkId,
+			line: binding.line,
+			relatedHunkIds: [...new Set(relatedHunkIds)],
+		}];
+	});
+	review.suggestions = review.suggestions.flatMap((suggestion) => {
+		const binding = bindingFor(suggestion.uri, suggestion.hunkId);
+		return binding ? [{ ...suggestion, hunkId: binding.hunkId, line: binding.line }] : [];
+	});
+	return matchedSourceCount;
+}
+
+function findLiveSourceHunk(file: ReviewFileState, source: ReviewHunk): ReviewHunk | undefined {
+	const candidates: ReviewHunk[] = [...file.hunks, ...file.acceptedHunks, ...file.rejectedHunks];
+	const sourceAliases = new Set(reviewHunkAliases(source));
+	const explicit = candidates.filter((candidate) => (
+		reviewHunkAliases(candidate).some((alias) => sourceAliases.has(alias))
+		&& liveHunkRepresentsSource(file, candidate, source)
+	));
+	if (explicit.length === 1) {
+		return explicit[0];
+	}
+	const contentMatches = candidates.filter((candidate) => sameReviewHunkContent(candidate, source));
+	if (contentMatches.length === 1) {
+		return contentMatches[0];
+	}
+	const occurrenceMatches = contentMatches.filter((candidate) => candidate.occurrence === source.occurrence);
+	return occurrenceMatches.length === 1 ? occurrenceMatches[0] : undefined;
+}
+
+function liveHunkRepresentsSource(file: ReviewFileState, candidate: ReviewHunk, source: ReviewHunk): boolean {
+	if (sameReviewHunkContent(candidate, source)) {
+		return true;
+	}
+	const reviewedSuggestion = (candidate as Partial<ReviewedHunk>).appliedAiSuggestion;
+	if (reviewedSuggestion && sameReviewHunkContent(reviewedSuggestion.originalHunk, source)) {
+		return true;
+	}
+	const sourceAliases = new Set(reviewHunkAliases(source));
+	return file.appliedAiSuggestions.some((suggestion) => (
+		(sourceAliases.has(suggestion.sourceHunkId)
+			|| Boolean(suggestion.reviewItemId && sourceAliases.has(suggestion.reviewItemId)))
+		&& sameReviewHunkContent(suggestion.originalHunk, source)
+		&& (candidate.id === suggestion.currentHunkId
+			|| reviewHunkAliases(candidate).includes(suggestion.reviewItemId ?? suggestion.sourceHunkId))
+	));
+}
+
+function sameReviewHunkContent(left: ReviewHunk, right: ReviewHunk): boolean {
+	return left.kind === right.kind && left.oldText === right.oldText && left.newText === right.newText;
+}
+
+function reviewHunkStableIdentity(hunk: ReviewHunk): string {
+	return hunk.reviewItemId ?? hunk.sourceHunkId ?? hunk.id;
+}
+
+function reviewHunkAliases(hunk: ReviewHunk): string[] {
+	return [...new Set([
+		hunk.id,
+		hunk.sourceHunkId,
+		hunk.reviewItemId,
+		originalReviewedHunkId(hunk.id),
+	].filter((value): value is string => Boolean(value)))];
+}
+
 export function sourcePendingFiles(session: ReviewSession | undefined): ReviewFileState[] {
 	return session
 		? [...session.files.values()]
@@ -1243,11 +1607,12 @@ export function validateReviewFindingsWithDiagnostics(result: Record<string, unk
 			? candidate.evidence.filter((item): item is string => typeof item === 'string')
 			: [];
 		const generationOrder = startOrder + findings.length;
+		const hunkId = reviewHunkStableIdentity(hunk);
 		findings.push({
-			id: `${file.uri.toString()}#${hunk.id}#${generationOrder}`,
+			id: `${file.uri.toString()}#${hunkId}#${generationOrder}`,
 			uri: file.uri.toString(),
 			relativePath: file.relativePath,
-			hunkId: hunk.id,
+			hunkId,
 			line: hunk.newStart,
 			severity: candidate.severity,
 			title: candidate.title,
@@ -1313,11 +1678,12 @@ export function validateReviewSuggestionsWithDiagnostics(result: Record<string, 
 		}
 		seenHunks.add(hunk.id);
 		const generationOrder = startOrder + suggestions.length;
+		const hunkId = reviewHunkStableIdentity(hunk);
 		suggestions.push({
-			id: `${file.uri.toString()}#${hunk.id}#suggestion#${generationOrder}`,
+			id: `${file.uri.toString()}#${hunkId}#suggestion#${generationOrder}`,
 			uri: file.uri.toString(),
 			relativePath: file.relativePath,
-			hunkId: hunk.id,
+			hunkId,
 			line: hunk.newStart,
 			replacementText: normalizeAiSuggestionReplacementText(candidate.replacementText, hunk),
 			rationale: typeof candidate.rationale === 'string' ? candidate.rationale : '',
@@ -1572,6 +1938,14 @@ function upsertFileResult(results: AiReviewFileResult[], result: AiReviewFileRes
 function cloneStoredReview(review: StoredAiReview): StoredAiReview {
 	return {
 		...review,
+		sourceSnapshot: review.sourceSnapshot ? {
+			...review.sourceSnapshot,
+			projects: review.sourceSnapshot.projects.map((project) => ({ ...project })),
+			files: review.sourceSnapshot.files.map((file) => ({
+				...file,
+				hunks: file.hunks.map(cloneSourceReviewHunk),
+			})),
+		} : undefined,
 		findings: [...review.findings],
 		suggestions: [...review.suggestions],
 		fileResults: [...review.fileResults],

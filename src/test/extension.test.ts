@@ -700,7 +700,9 @@ suite('Review controller bulk actions', () => {
 		assert.ok(source.includes('strategy,'));
 		assert.ok(source.includes('fileConcurrency,'));
 		assert.ok(source.includes("return 'unlimited';"));
-		assert.ok(source.includes('const existingReview = storedReview?.status === \'partial\' ? storedReview : undefined;'));
+		assert.ok(source.includes("const existingReview = mode === 'regenerate'"));
+		assert.ok(source.includes("'Regenerate AI review?'"));
+		assert.ok(source.includes("'Current AI review progress and partial results will be discarded.'"));
 		assert.ok(source.includes('existingReview,'));
 		assert.ok(source.includes('maxRounds,'));
 		assert.ok(source.includes('onFileComplete: async (review) =>'));
@@ -723,12 +725,25 @@ suite('Review controller bulk actions', () => {
 		assert.ok(source.includes('await this.refreshGitReviewFile(file.uri)'));
 	});
 
-	test('uses one configured debounce for file, Git, and AI dashboard refreshes', () => {
+	test('uses one configured interval while throttling continuous AI dashboard events', () => {
 		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
+		const dashboardScheduler = source.slice(
+			source.indexOf('private scheduleLlmWikiDashboardRefresh(): void'),
+			source.indexOf('private refreshReviewPresentation(', source.indexOf('private scheduleLlmWikiDashboardRefresh(): void')),
+		);
 		assert.ok(source.includes("get<number>('refreshDebounceMs', 500)"));
 		assert.strictEqual((source.match(/this\.refreshDebounceMs\(\)/g) ?? []).length, 3);
 		assert.ok(source.includes('if (!event.document.isDirty)'));
 		assert.ok(source.includes('await this.flushHumanEdits(document)'));
+		assert.ok(dashboardScheduler.includes('this.llmDashboardRefreshPending = true;'));
+		assert.ok(dashboardScheduler.includes('if (this.llmDashboardRefreshTimer) {\n\t\t\treturn;'));
+		assert.strictEqual(dashboardScheduler.includes('clearTimeout(this.llmDashboardRefreshTimer)'), false);
+		assert.ok(dashboardScheduler.includes('await this.refreshLlmWikiDashboardState();'));
+		assert.ok(dashboardScheduler.includes('if (this.llmDashboardRefreshPending)'));
+		assert.ok(source.includes('await this.aiReviewStore.save(session, review);\n\t\t\t\t\t\t\tthis.scheduleLlmWikiDashboardRefresh();'));
+		const wikiInitializer = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'wiki', 'wikiInitializer.ts'), 'utf8');
+		assert.ok(wikiInitializer.includes('onCheckpoint?: () => void;'));
+		assert.ok(wikiInitializer.includes('onCheckpoint: () => options.onCheckpoint?.()'));
 	});
 
 	test('wires review editor mode through native editor and review page presenters', () => {
@@ -1050,8 +1065,8 @@ suite('Review state', () => {
 	test('groups aggregate Git review files by project and filters selected projects', () => {
 		const parent = vscode.Uri.file('D:/projects');
 		const projects: ReviewProject[] = [
-			{ id: 'api', name: 'api', rootUri: vscode.Uri.joinPath(parent, 'api') },
-			{ id: 'web', name: 'web', rootUri: vscode.Uri.joinPath(parent, 'web') },
+			{ id: 'api', name: 'api', rootUri: vscode.Uri.joinPath(parent, 'api'), branchName: 'main' },
+			{ id: 'web', name: 'web', rootUri: vscode.Uri.joinPath(parent, 'web'), branchName: 'master' },
 		];
 		const apiFile = reviewFileState(vscode.Uri.joinPath(projects[0].rootUri, 'src/app.ts'), 'src/app.ts', {
 			projectId: 'api',
@@ -1077,7 +1092,7 @@ suite('Review state', () => {
 			suggestions: [aiReviewSuggestion(apiFile.uri, apiFile.relativePath, apiFile.hunks[0])],
 		}));
 		const groups = provider.getChildren();
-		assert.deepStrictEqual(groups.map((group) => provider.getTreeItem(group).label), ['api', 'web']);
+		assert.deepStrictEqual(groups.map((group) => provider.getTreeItem(group).label), ['api  main', 'web  master']);
 		assert.strictEqual(provider.getTreeItem(groups[0]).description, '1 Pending');
 		assert.strictEqual(provider.getChildren(groups[0]).length, 1);
 		assert.strictEqual(provider.getChildren(groups[1]).length, 1);
@@ -1093,6 +1108,7 @@ suite('Review state', () => {
 		const selected = buildReviewDashboardPayload(session, undefined, () => false);
 		assert.deepStrictEqual(selected.files.map((file) => file.relativePath), ['src/app.ts']);
 		assert.strictEqual(selected.trackingTarget?.label, 'web');
+		assert.strictEqual(selected.trackingTarget?.branchName, 'master');
 		assert.strictEqual(provider.getChildren().length, 1);
 
 		const singleChildParent: ReviewSession = {
@@ -1113,6 +1129,8 @@ suite('Review state', () => {
 		};
 		const rootProjectPayload = buildReviewDashboardPayload(rootProject, undefined, () => false);
 		assert.strictEqual(rootProjectPayload.trackingTarget?.canSwitch, false);
+		assert.strictEqual(rootProjectPayload.trackingTarget?.label, 'api');
+		assert.strictEqual(rootProjectPayload.trackingTarget?.branchName, 'main');
 		assert.strictEqual(rootProjectPayload.files[0].relativePath, 'src/app.ts');
 	});
 
@@ -1572,6 +1590,11 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('home.svg'));
 		assert.ok(view.webview.html.includes('id="settingsButton"'));
 		assert.ok(view.webview.html.includes('id="settingsMenu"'));
+		assert.ok(view.webview.html.includes('id="trackingTarget"'));
+		assert.ok(view.webview.html.includes('id="trackingBranch"'));
+		assert.ok(view.webview.html.includes("trackingTarget.textContent = tracking.label || '';"));
+		assert.ok(view.webview.html.includes("trackingBranch.textContent = tracking.branchName || '';"));
+		assert.match(view.webview.html, /\.tracking-branch\s*{[\s\S]*?flex: 1 1 auto;[\s\S]*?pointer-events: none;/);
 		assert.ok(view.webview.html.includes('id="acceptAll"'));
 		assert.ok(view.webview.html.includes('id="rejectAll"'));
 		assert.ok(view.webview.html.includes('id="undoAll"'));
@@ -1582,6 +1605,10 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('function groupRunLogByFile'));
 		assert.ok(view.webview.html.includes('function renderRunLogFile'));
 		assert.ok(view.webview.html.includes('function renderRunLogRound'));
+		assert.ok(view.webview.html.includes('function runLogCountsMeta'));
+		assert.ok(view.webview.html.includes("roundCount === 1 ? 'round' : 'rounds'"));
+		assert.ok(view.webview.html.includes("eventCount === 1 ? 'event' : 'events'"));
+		assert.ok(view.webview.html.includes('position + runLogCountsMeta(group.items)'));
 		assert.ok(view.webview.html.includes('.wiki-run-status.recovered'));
 		assert.ok(view.webview.html.includes("return 'recovered'"));
 		assert.ok(view.webview.html.includes('Recovered after error'));
@@ -1741,6 +1768,8 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('Close all Review editors'));
 		assert.ok(view.webview.html.includes('data-menu-action="updateWiki"'));
 		assert.ok(view.webview.html.includes('data-menu-action="generateAiReview"'));
+		assert.ok(view.webview.html.includes('data-menu-action="regenerateAiReview"'));
+		assert.ok(view.webview.html.includes("setMenuActionVisible('regenerateAiReview', !wiki.aggregateProjectView && wiki.aiReviewStatus === 'partial')"));
 		assert.ok(view.webview.html.includes('data-menu-action="openWikiIndex"'));
 		assert.ok(view.webview.html.includes('data-menu-action="openExtensionSettings"'));
 		assert.ok(view.webview.html.includes('Code Wiki is up to date'));
@@ -1785,6 +1814,7 @@ suite('Review state', () => {
 		messageHandler({ type: 'closeReviewEditors' });
 		messageHandler({ type: 'selectTrackingTarget' });
 		messageHandler({ type: 'selectTrackingProject', projectId: 'project-b' });
+		messageHandler({ type: 'regenerateAiReview' });
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.openWikiIndex' && call.args.length === 0));
 		assert.ok(commands.some((call) => call.command === 'workbench.action.openSettings'
@@ -1793,6 +1823,8 @@ suite('Review state', () => {
 		assert.ok(commands.some((call) => call.command === 'cli-diff.selectTrackingTarget'));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.selectTrackingTarget'
 			&& call.args[0] === 'project-b'));
+		assert.ok(commands.some((call) => call.command === 'cli-diff.generateAiReview'
+			&& call.args[0] === 'regenerate'));
 		messageHandler({ type: 'acceptAll' });
 		messageHandler({ type: 'rejectAll' });
 		messageHandler({ type: 'undoAll' });
@@ -3611,6 +3643,151 @@ suite('AI review findings', () => {
 		assert.ok(result.fileResults[0].summary.includes('Model returned 0 findings.'));
 	});
 
+	test('keeps in-flight AI findings bound when the source chunk is accepted', async () => {
+		const uri = vscode.Uri.file('/repo/src/accepted-during-review.ts');
+		const hunk = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
+		const file = reviewFileState(uri, 'src/accepted-during-review.ts', { hunks: [hunk] });
+		const session: ReviewSession = {
+			id: 'accept-during-ai-review',
+			mode: 'git',
+			rootUri: vscode.Uri.file('/repo'),
+			createdAt: 1,
+			files: new Map([[uri.toString(), file]]),
+		};
+		const result = await new CodeReviewAgentService().review({
+			session,
+			root: workspaceFolder('/repo'),
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: {
+				completeJson: async () => {
+					file.hunks = [];
+					file.acceptedHunks = [{
+						...reviewedHunkFrom(hunk, 'accept'),
+						sourceHunkId: hunk.id,
+						reviewItemId: hunk.id,
+					}];
+					return `{"type":"final","result":{"findings":[{"hunkId":"${hunk.id}","severity":"warning","title":"Bound","explanation":"Risk","recommendation":"Fix","evidence":[]}],"suggestions":[]}}`;
+				},
+			},
+			language: 'en',
+		});
+
+		assert.strictEqual(result.findings.length, 1);
+		assert.strictEqual(result.findings[0].hunkId, hunk.id);
+		assert.ok(result.sourceSnapshot);
+	});
+
+	test('keeps in-flight AI findings bound when the source chunk is rejected', async () => {
+		const uri = vscode.Uri.file('/repo/src/rejected-during-review.ts');
+		const hunk = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
+		const file = reviewFileState(uri, 'src/rejected-during-review.ts', { hunks: [hunk] });
+		const session: ReviewSession = {
+			id: 'reject-during-ai-review',
+			mode: 'git',
+			rootUri: vscode.Uri.file('/repo'),
+			createdAt: 1,
+			files: new Map([[uri.toString(), file]]),
+		};
+		const result = await new CodeReviewAgentService().review({
+			session,
+			root: workspaceFolder('/repo'),
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: {
+				completeJson: async () => {
+					file.hunks = [];
+					file.rejectedHunks = [{
+						...reviewedHunkFrom(hunk, 'reject'),
+						sourceHunkId: hunk.id,
+						reviewItemId: hunk.id,
+					}];
+					return `{"type":"final","result":{"findings":[{"hunkId":"${hunk.id}","severity":"warning","title":"Rejected binding","explanation":"Risk","recommendation":"Fix","evidence":[]}],"suggestions":[]}}`;
+				},
+			},
+			language: 'en',
+		});
+
+		assert.strictEqual(result.findings.length, 1);
+		assert.strictEqual(result.findings[0].hunkId, hunk.id);
+	});
+
+	test('does not add chunks created during an AI review to the immutable source set', async () => {
+		const uri = vscode.Uri.file('/repo/src/live-edit.ts');
+		const initialHunk = computeLineDiff(uri.toString(), 'one\nkeep\n', 'ONE\nkeep\n')[0];
+		const file = reviewFileState(uri, 'src/live-edit.ts', {
+			oldText: 'one\nkeep\n',
+			newText: 'ONE\nkeep\n',
+			hunks: [initialHunk],
+		});
+		const session: ReviewSession = {
+			id: 'new-hunk-during-ai-review',
+			mode: 'git',
+			rootUri: vscode.Uri.file('/repo'),
+			createdAt: 1,
+			files: new Map([[uri.toString(), file]]),
+		};
+		let addedHunkId = '';
+		const result = await new CodeReviewAgentService().review({
+			session,
+			root: workspaceFolder('/repo'),
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: {
+				completeJson: async () => {
+					const currentHunks = computeLineDiff(uri.toString(), 'one\nkeep\nlast\n', 'ONE\nkeep\nLAST\n');
+					const addedHunk = currentHunks.find((candidate) => candidate.id !== initialHunk.id && candidate.newText.includes('LAST'))
+						?? currentHunks[currentHunks.length - 1];
+					addedHunkId = addedHunk.id;
+					file.oldText = 'one\nkeep\nlast\n';
+					file.newText = 'ONE\nkeep\nLAST\n';
+					file.hunks = [
+						{ ...currentHunks[0], sourceHunkId: initialHunk.id, reviewItemId: initialHunk.id },
+						addedHunk,
+					];
+					return `{"type":"final","result":{"findings":[{"hunkId":"${initialHunk.id}","severity":"warning","title":"Original","explanation":"Risk","recommendation":"Fix","evidence":[]},{"hunkId":"${addedHunk.id}","severity":"warning","title":"Late","explanation":"Risk","recommendation":"Fix","evidence":[]}],"suggestions":[]}}`;
+				},
+			},
+			language: 'en',
+		});
+
+		assert.strictEqual(result.sourceSnapshot?.files[0].hunks.length, 1);
+		assert.deepStrictEqual(result.findings.map((finding) => finding.title), ['Original']);
+		assert.ok(!result.findings.some((finding) => finding.hunkId === addedHunkId));
+	});
+
+	test('loads snapshot review results across new chunks but invalidates an edited source chunk', async () => {
+		const uri = vscode.Uri.file('/repo/src/store-reconcile.ts');
+		const original = computeLineDiff(uri.toString(), 'one\nkeep\n', 'ONE\nkeep\n')[0];
+		const file = reviewFileState(uri, 'src/store-reconcile.ts', {
+			oldText: 'one\nkeep\n',
+			newText: 'ONE\nkeep\n',
+			hunks: [original],
+		});
+		const session: ReviewSession = {
+			id: 'store-source-snapshot',
+			mode: 'git',
+			rootUri: vscode.Uri.file('/repo'),
+			createdAt: 1,
+			files: new Map([[uri.toString(), file]]),
+		};
+		const review = await new CodeReviewAgentService().review({
+			session,
+			root: workspaceFolder('/repo'),
+			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			client: {
+				completeJson: async () => `{"type":"final","result":{"findings":[{"hunkId":"${original.id}","severity":"warning","title":"Original","explanation":"Risk","recommendation":"Fix","evidence":[]}],"suggestions":[]}}`,
+			},
+			language: 'en',
+		});
+		const store = new AiReviewStore(new TestMemento() as unknown as vscode.Memento);
+		await store.save(session, review);
+
+		const added = computeLineDiff(uri.toString(), 'last\n', 'LAST\n')[0];
+		file.hunks = [original, added];
+		assert.strictEqual(store.load(session)?.findings[0].title, 'Original');
+
+		file.hunks = [{ ...original, newText: 'CHANGED\n' }, added];
+		assert.strictEqual(store.load(session), undefined);
+	});
+
 	test('drops AI code suggestions for delete chunks', () => {
 		const uri = vscode.Uri.file('/repo/src/deleted.ts');
 		const hunk = computeLineDiff(uri.toString(), 'old\n', '')[0];
@@ -4180,6 +4357,15 @@ suite('Git service', () => {
 			const service = new GitService();
 			const childProjects = await service.discoverProjects(workspaceFolder(parent));
 			assert.deepStrictEqual(childProjects.map((project) => project.name), ['api', 'web']);
+			assert.deepStrictEqual(childProjects.map((project) => project.branchName), [undefined, undefined]);
+
+			const initialBranch = git(api, 'symbolic-ref', '--quiet', '--short', 'HEAD').trim();
+			writeRepoFile(api, 'README.md', '# api\n');
+			git(api, 'add', 'README.md');
+			git(api, 'commit', '-m', 'initial');
+			const committedProjects = await service.discoverProjects(workspaceFolder(parent));
+			assert.strictEqual(committedProjects.find((project) => project.name === 'api')?.branchName, initialBranch);
+			assert.strictEqual(committedProjects.find((project) => project.name === 'web')?.branchName, undefined);
 
 			git(parent, 'init');
 			const rootProjects = await service.discoverProjects(workspaceFolder(parent));

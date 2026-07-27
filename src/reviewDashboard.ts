@@ -40,6 +40,7 @@ type DashboardMessage =
 	| { type: 'initializeWiki' }
 	| { type: 'updateWiki' }
 	| { type: 'generateAiReview' }
+	| { type: 'regenerateAiReview' }
 	| { type: 'openWikiIndex' }
 	| { type: 'openExtensionSettings' }
 	| { type: 'openFinding'; uri: string; hunkId: string }
@@ -103,6 +104,7 @@ export interface ReviewDashboardPayload {
 	files: ReviewDashboardFile[];
 	trackingTarget?: {
 		label: string;
+		branchName?: string;
 		kind: 'none' | 'aggregate' | 'project';
 		canSwitch: boolean;
 		disabled: boolean;
@@ -341,6 +343,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 		if (message.type === 'generateAiReview') {
 			await this.executeCommand('cli-diff.generateAiReview');
+			this.postState();
+			return;
+		}
+		if (message.type === 'regenerateAiReview') {
+			await this.executeCommand('cli-diff.generateAiReview', 'regenerate');
 			this.postState();
 			return;
 		}
@@ -1212,10 +1219,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			font-weight: 700;
 		}
 		.header-left {
+			flex: 1 1 auto;
 			min-width: 0;
 			display: flex;
 			align-items: center;
 			gap: 2px;
+			overflow: hidden;
 		}
 		.header-toggle {
 			flex: 0 0 auto;
@@ -1248,6 +1257,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			transform: rotate(-45deg);
 		}
 		.tracking-target {
+			flex: 0 1 auto;
 			min-width: 0;
 			max-width: min(220px, 45vw);
 			height: 20px;
@@ -1262,7 +1272,20 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			opacity: 1;
 			cursor: default;
 		}
+		.tracking-branch {
+			flex: 1 1 auto;
+			min-width: 0;
+			overflow: hidden;
+			color: var(--muted);
+			font-weight: 500;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+			pointer-events: none;
+			user-select: text;
+		}
+		.tracking-branch[hidden] { display: none; }
 		.header-actions {
+			flex: 0 0 auto;
 			display: flex;
 			align-items: center;
 			height: 20px;
@@ -1391,6 +1414,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 						<span class="settings-menu-title">Generate AI review</span>
 						<span class="settings-menu-reason"></span>
 					</button>
+					<button class="settings-menu-item" type="button" role="menuitem" data-menu-action="regenerateAiReview" hidden>
+						<span class="settings-menu-title">Regenerate AI review</span>
+						<span class="settings-menu-reason"></span>
+					</button>
 					<div class="settings-menu-divider" role="separator"></div>
 					<button class="settings-menu-item" type="button" role="menuitem" data-menu-action="openWikiIndex">
 						<span class="settings-menu-title">Open Code Wiki home</span>
@@ -1471,6 +1498,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 						<span class="chevron" aria-hidden="true"></span>
 					</button>
 					<button class="tracking-target" id="trackingTarget" type="button" title="Select tracked project" disabled></button>
+					<span class="tracking-branch" id="trackingBranch" hidden></span>
 				</div>
 				<div class="header-actions">
 					<button class="refresh-button bulk-action-button" id="acceptAll" type="button" title="Accept all pending changes" aria-label="Accept all pending changes">
@@ -1496,6 +1524,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const wikiPanel = document.querySelector('.wiki-panel');
 		const toggle = document.getElementById('toggle');
 		const trackingTarget = document.getElementById('trackingTarget');
+		const trackingBranch = document.getElementById('trackingBranch');
 		const list = document.getElementById('list');
 		const modelPill = document.getElementById('modelPill');
 		const homeButton = document.getElementById('homeButton');
@@ -1780,6 +1809,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			trackingTarget.textContent = tracking.label || '';
 			trackingTarget.title = tracking.canSwitch ? 'Select tracked project' : (tracking.label || 'No tracked project');
 			trackingTarget.disabled = !tracking.canSwitch || tracking.disabled;
+			trackingBranch.textContent = tracking.branchName || '';
+			trackingBranch.title = tracking.branchName || '';
+			trackingBranch.hidden = !tracking.branchName;
 		}
 
 		function updateBulkActionButtons(files) {
@@ -1949,6 +1981,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				running ? 'Agent is running'
 					: !wiki.configured ? 'Configure LLM first'
 						: !wiki.workspaceAvailable ? 'Open a workspace folder' : 'No pending source changes');
+			setMenuActionVisible('regenerateAiReview', !wiki.aggregateProjectView && wiki.aiReviewStatus === 'partial');
+			setMenuAction('regenerateAiReview', 'Regenerate AI review',
+				running || !wiki.configured || !wiki.workspaceAvailable || (wiki.pendingSourceCount || 0) === 0,
+				running ? 'Agent is running'
+					: !wiki.configured ? 'Configure LLM first'
+						: !wiki.workspaceAvailable ? 'Open a workspace folder' : 'No pending source changes');
 			setMenuAction('openWikiIndex', 'Open Code Wiki home', !openAvailable, openAvailable ? '' : 'Initialize Code Wiki first');
 			setMenuAction('openExtensionSettings', 'Open extension settings', false, '');
 		}
@@ -1961,6 +1999,13 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			item.disabled = Boolean(disabled);
 			item.querySelector('.settings-menu-title').textContent = label;
 			item.querySelector('.settings-menu-reason').textContent = disabled ? reason : '';
+		}
+
+		function setMenuActionVisible(action, visible) {
+			const item = settingsMenuItems.find((candidate) => candidate.dataset.menuAction === action);
+			if (item) {
+				item.hidden = !visible;
+			}
 		}
 
 		function aiReviewActionLabel(wiki) {
@@ -2597,7 +2642,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const meta = document.createElement('span');
 			meta.className = 'wiki-run-meta';
 			const position = group.fileIndex && group.fileCount ? 'file ' + group.fileIndex + '/' + group.fileCount + ' | ' : '';
-			meta.textContent = position + group.items.length + ' events' + runLogRecoveryMeta(statusValue);
+			meta.textContent = position + runLogCountsMeta(group.items) + runLogRecoveryMeta(statusValue);
 			main.append(title, meta);
 			const status = document.createElement('span');
 			status.className = 'wiki-run-status ' + statusValue;
@@ -2615,6 +2660,15 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			}
 			details.appendChild(body);
 			return details;
+		}
+
+		function runLogCountsMeta(items) {
+			const roundCount = new Set(items
+				.filter((item) => typeof item.round === 'number')
+				.map((item) => item.round)).size;
+			const eventCount = items.length;
+			return roundCount + ' ' + (roundCount === 1 ? 'round' : 'rounds')
+				+ ' · ' + eventCount + ' ' + (eventCount === 1 ? 'event' : 'events');
 		}
 
 		function renderRunLogRound(group, openRunLogKeys, parentKey) {
@@ -3082,6 +3136,7 @@ export function buildReviewDashboardPayload(
 		files,
 		trackingTarget: {
 			label: session ? currentProject?.name ?? path.basename(session.rootUri.fsPath) : '',
+			branchName: currentProject?.branchName,
 			kind: !session ? 'none' : currentProject ? 'project' : session.trackingTarget?.kind === 'aggregate' ? 'aggregate' : 'project',
 			canSwitch: hasAggregateReviewTarget(session),
 			disabled: false,

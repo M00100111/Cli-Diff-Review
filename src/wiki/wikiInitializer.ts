@@ -29,6 +29,7 @@ export interface WikiInitializationOptions {
 	signal?: AbortSignal;
 	onProgress?: (progress: WikiInitializationProgress) => void;
 	onTrace?: (event: AgentTraceEvent) => void;
+	onCheckpoint?: () => void;
 }
 
 export interface WikiFile {
@@ -213,6 +214,7 @@ export class WikiInitializationService {
 			signal: options.signal,
 			onProgress: (progress) => options.onProgress?.({ message: progress.message }),
 			onTrace: options.onTrace,
+			onCheckpoint: () => options.onCheckpoint?.(),
 		});
 		if (!agentsGuidanceWritten) {
 			throw new Error(`Wiki Agent did not create or refresh ${agentsGuidanceFileName} guidance.`);

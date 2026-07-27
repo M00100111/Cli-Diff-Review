@@ -112,6 +112,7 @@ export interface ReviewProject {
 	name: string;
 	rootUri: vscode.Uri;
 	headOid?: string;
+	branchName?: string;
 }
 
 export type ReviewTrackingTarget =

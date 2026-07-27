@@ -76,7 +76,10 @@ export class ReviewTreeProvider implements vscode.TreeDataProvider<ReviewTreeNod
 		const pending = files.reduce((total, file) => total + file.hunks.length, 0);
 		const accepted = files.reduce((total, file) => total + file.acceptedHunks.length, 0);
 		const rejected = files.reduce((total, file) => total + file.rejectedHunks.length, 0);
-		const item = new vscode.TreeItem(element.project.name, vscode.TreeItemCollapsibleState.Expanded);
+		const label = element.project.branchName
+			? `${element.project.name}  ${element.project.branchName}`
+			: element.project.name;
+		const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.Expanded);
 		item.contextValue = 'cliDiffProject';
 		item.description = [
 			pending > 0 ? `${pending} Pending` : undefined,

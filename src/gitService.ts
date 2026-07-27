@@ -230,17 +230,29 @@ export class GitService {
 
 	private async reviewProjectIfRoot(rootUri: vscode.Uri, name: string): Promise<ReviewProject | undefined> {
 		try {
-			const output = await this.gitInPath(rootUri.fsPath, ['rev-parse', '--show-toplevel', 'HEAD']);
+			const [output, branchName] = await Promise.all([
+				this.gitInPath(rootUri.fsPath, ['rev-parse', '--show-toplevel', 'HEAD']),
+				this.branchNamePath(rootUri.fsPath),
+			]);
 			const [topLevel, headOid = ''] = output.trim().split(/\r?\n/);
 			if (canonicalPath(topLevel) !== canonicalPath(rootUri.fsPath)) {
 				return undefined;
 			}
-			return { id: uriKey(rootUri), name, rootUri, headOid };
+			return { id: uriKey(rootUri), name, rootUri, headOid, branchName };
 		} catch {
 			if (!await this.isGitRoot(rootUri)) {
 				return undefined;
 			}
 			return { id: uriKey(rootUri), name, rootUri, headOid: '' };
+		}
+	}
+
+	private async branchNamePath(rootPath: string): Promise<string | undefined> {
+		try {
+			const branchName = (await this.gitInPath(rootPath, ['symbolic-ref', '--quiet', '--short', 'HEAD'])).trim();
+			return branchName || undefined;
+		} catch {
+			return undefined;
 		}
 	}
 

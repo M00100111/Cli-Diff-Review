@@ -144,6 +144,7 @@ export class ReviewController implements vscode.Disposable {
 	private readonly fileOperationQueue = new SerialOperationQueue<string>();
 	private gitRefreshTimer: NodeJS.Timeout | undefined;
 	private llmDashboardRefreshTimer: NodeJS.Timeout | undefined;
+	private llmDashboardRefreshPending = false;
 	private gitRefreshRequested = false;
 	private gitRefreshInFlight: Promise<void> | undefined;
 	private llmDashboardRefreshGeneration = 0;
@@ -251,7 +252,7 @@ export class ReviewController implements vscode.Disposable {
 			this.registerCommand('cli-diff.initializeLlmWiki', () => this.initializeLlmWiki()),
 			this.registerCommand('cli-diff.cancelLlmWikiInitialization', () => this.cancelLlmWikiInitialization()),
 			this.registerCommand('cli-diff.updateLlmWiki', () => this.updateLlmWiki()),
-			this.registerCommand('cli-diff.generateAiReview', () => this.generateAiReview()),
+			this.registerCommand('cli-diff.generateAiReview', (mode?: 'regenerate') => this.generateAiReview(mode)),
 			this.registerCommand('cli-diff.openWikiIndex', () => this.openWikiIndex()),
 			this.registerCommand('cli-diff.openAiReviewFinding', (uri: string, hunkId: string) => this.openAiReviewFinding(uri, hunkId)),
 			this.registerCommand('cli-diff.applyAiSuggestion', (uri: string, hunkId: string, suggestionId: string) => this.applyAiSuggestion(uri, hunkId, suggestionId)),
@@ -278,6 +279,7 @@ export class ReviewController implements vscode.Disposable {
 			clearTimeout(this.llmDashboardRefreshTimer);
 			this.llmDashboardRefreshTimer = undefined;
 		}
+		this.llmDashboardRefreshPending = false;
 		for (const timer of this.refreshTimers.values()) {
 			clearTimeout(timer);
 		}
@@ -2321,6 +2323,11 @@ export class ReviewController implements vscode.Disposable {
 						this.appendProjectAgentRunLog(task, event);
 					}
 				},
+				onCheckpoint: () => {
+					if (this.isCurrentProjectAgentTask(task)) {
+						this.scheduleLlmWikiDashboardRefresh();
+					}
+				},
 			});
 			if (this.isCurrentProjectAgentTask(task)) {
 				const progress = result.summary || `Generated ${result.fileCount} wiki files.`;
@@ -2439,6 +2446,11 @@ export class ReviewController implements vscode.Disposable {
 						this.appendProjectAgentRunLog(task, event);
 					}
 				},
+				onCheckpoint: () => {
+					if (this.isCurrentProjectAgentTask(task)) {
+						this.scheduleLlmWikiDashboardRefresh();
+					}
+				},
 			});
 			if (this.isCurrentProjectAgentTask(task)) {
 				this.appendProjectAgentRunLog(task, {
@@ -2481,7 +2493,7 @@ export class ReviewController implements vscode.Disposable {
 		}
 	}
 
-	private async generateAiReview(): Promise<void> {
+	private async generateAiReview(mode?: 'regenerate'): Promise<void> {
 		let task: ProjectAgentTask | undefined;
 		try {
 			if (this.showSelectedProjectBusyMessage()) {
@@ -2517,7 +2529,22 @@ export class ReviewController implements vscode.Disposable {
 			const strategy = this.aiReviewStrategy();
 			const fileConcurrency = this.aiReviewFileConcurrency();
 			const storedReview = this.aiReviewStore.load(session);
-			const existingReview = storedReview?.status === 'partial' ? storedReview : undefined;
+			if (mode === 'regenerate' && storedReview?.status === 'partial') {
+				const confirmed = await vscode.window.showWarningMessage(
+					'Regenerate AI review?',
+					{
+						modal: true,
+						detail: 'Current AI review progress and partial results will be discarded.',
+					},
+					'Regenerate',
+				);
+				if (confirmed !== 'Regenerate') {
+					return;
+				}
+			}
+			const existingReview = mode === 'regenerate'
+				? undefined
+				: storedReview?.status === 'partial' ? storedReview : undefined;
 			task = this.beginProjectAgentTask('review', root, project?.id, Boolean(existingReview));
 			if (!task) {
 				return;
@@ -2539,7 +2566,7 @@ export class ReviewController implements vscode.Disposable {
 					maxRounds: maxRounds === 'unlimited' ? 'unlimited' : maxRounds,
 					strategy,
 					fileConcurrency,
-					mode: existingReview ? 'continue' : 'generate',
+					mode: existingReview ? 'continue' : mode === 'regenerate' ? 'regenerate' : 'generate',
 					wikiContext: includeWikiTools ? 'enabled' : 'disabled',
 					completedFiles: existingReview?.completedFiles.length ?? 0,
 					files: files.map((file) => ({ uri: file.uri.toString(), relativePath: file.relativePath, chunks: file.hunks.length })),
@@ -2641,6 +2668,7 @@ export class ReviewController implements vscode.Disposable {
 					runtime.checkpointSaveQueue = runtime.checkpointSaveQueue.then(async () => {
 						if (this.isCurrentProjectAgentTask(task)) {
 							await this.aiReviewStore.save(session, review);
+							this.scheduleLlmWikiDashboardRefresh();
 						}
 					});
 					return runtime.checkpointSaveQueue;
@@ -2717,9 +2745,14 @@ export class ReviewController implements vscode.Disposable {
 		if (!file) {
 			return;
 		}
-		const hunk = file.hunks.find((candidate) => candidate.id === hunkId);
+		const matchesIdentity = (candidate: ReviewHunk): boolean => (
+			candidate.id === hunkId
+			|| candidate.sourceHunkId === hunkId
+			|| candidate.reviewItemId === hunkId
+		);
+		const hunk = file.hunks.find(matchesIdentity);
 		const reviewed = hunk ? undefined : [...file.acceptedHunks, ...file.rejectedHunks]
-			.find((candidate) => candidate.id === hunkId || candidate.id.endsWith(`-${hunkId}`));
+			.find((candidate) => matchesIdentity(candidate) || candidate.id.endsWith(`-${hunkId}`));
 		await this.openReviewPresentation(file.uri, {
 			line: hunk?.newStart ?? reviewed?.displayStart ?? 0,
 			column: 0,
@@ -2739,7 +2772,7 @@ export class ReviewController implements vscode.Disposable {
 			const file = this.resolveFile(uriString);
 			const reviewSession = file ? this.sessionForFile(file) : undefined;
 			const storedReview = this.aiReviewStore.load(reviewSession);
-			const suggestion = storedReview?.suggestions.find((item) => item.id === suggestionId && item.uri === uriString && item.hunkId === hunkId);
+			const suggestion = storedReview?.suggestions.find((item) => item.id === suggestionId && item.uri === uriString);
 			const hunk = file?.hunks.find((item) => item.id === hunkId);
 			if (!file || !suggestion || !hunk) {
 				vscode.window.showInformationMessage('No AI suggestion selected.');
@@ -3556,13 +3589,25 @@ export class ReviewController implements vscode.Disposable {
 	}
 
 	private scheduleLlmWikiDashboardRefresh(): void {
+		this.llmDashboardRefreshPending = true;
 		if (this.llmDashboardRefreshTimer) {
-			clearTimeout(this.llmDashboardRefreshTimer);
+			return;
 		}
 		this.llmDashboardRefreshTimer = setTimeout(() => {
-			this.llmDashboardRefreshTimer = undefined;
-			void this.refreshLlmWikiDashboardState();
+			void this.flushLlmWikiDashboardRefresh();
 		}, this.refreshDebounceMs());
+	}
+
+	private async flushLlmWikiDashboardRefresh(): Promise<void> {
+		this.llmDashboardRefreshPending = false;
+		try {
+			await this.refreshLlmWikiDashboardState();
+		} finally {
+			this.llmDashboardRefreshTimer = undefined;
+			if (this.llmDashboardRefreshPending) {
+				this.scheduleLlmWikiDashboardRefresh();
+			}
+		}
 	}
 
 	private refreshReviewPresentation(uri?: vscode.Uri): void {
