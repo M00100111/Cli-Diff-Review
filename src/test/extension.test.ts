@@ -1627,6 +1627,8 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('runLogListScrollPositions.get(projectKey)'));
 		assert.ok(view.webview.html.includes('restoreScrollTop(wikiRunList, runLogScrollTop)'));
 		assert.ok(view.webview.html.includes('function renderProjectAgents'));
+		assert.ok(view.webview.html.includes("branch.className = 'project-agent-branch'"));
+		assert.ok(view.webview.html.includes('branch.textContent = item.branchName'));
 		assert.ok(view.webview.html.includes("type: 'selectTrackingProject'"));
 		assert.ok(view.webview.html.includes('const runLogDetailScrollPositions = new Map()'));
 		assert.ok(view.webview.html.includes('function captureRunLogDetailScrollPositions'));

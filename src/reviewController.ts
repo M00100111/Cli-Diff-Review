@@ -3797,6 +3797,7 @@ export class ReviewController implements vscode.Disposable {
 			return {
 				projectId: project.id,
 				projectName: project.name,
+				branchName: project.branchName,
 				rootUri: project.rootUri.toString(),
 				taskKind: runtime?.task?.kind ?? runtime?.run?.kind,
 				lifecycle,
