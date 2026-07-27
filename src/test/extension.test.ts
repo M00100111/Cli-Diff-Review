@@ -178,6 +178,11 @@ suite('Review webview compatibility', () => {
 		assert.strictEqual(languageIdFromPath('src/App.VUE'), 'vue');
 	});
 
+	test('uses Monaco SQL highlighting for SQL files', () => {
+		assert.strictEqual(languageIdFromPath('database/schema.sql'), 'sql');
+		assert.strictEqual(languageIdFromPath('database/MIGRATION.SQL'), 'sql');
+	});
+
 	test('emits syntactically valid Review Webview JavaScript with Vue tokenizers', () => {
 		const manager = Object.create(ReviewWebviewManager.prototype) as ReviewWebviewManager;
 		Object.assign(manager as unknown as Record<string, unknown>, {

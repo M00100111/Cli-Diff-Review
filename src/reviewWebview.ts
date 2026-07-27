@@ -2171,6 +2171,7 @@ export function languageIdFromPath(relativePath: string): string {
 		['.md', 'markdown'],
 		['.py', 'python'],
 		['.rs', 'rust'],
+		['.sql', 'sql'],
 		['.ts', 'typescript'],
 		['.tsx', 'typescript'],
 		['.vue', 'vue'],
