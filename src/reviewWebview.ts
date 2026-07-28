@@ -736,6 +736,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 			text-decoration: underline;
 			cursor: pointer;
 		}
+		.monaco-editor .margin-view-overlays .line-numbers { transform: translateX(4px); }
 		.monaco-editor .margin-view-overlays .cli-margin-add { border-left: 3px solid var(--add-line); }
 		.monaco-editor .margin-view-overlays .cli-margin-delete { border-left: 3px solid var(--delete-line); }
 		.monaco-editor .margin-view-overlays .cli-margin-modify { border-left: 3px solid var(--modify-line); }
