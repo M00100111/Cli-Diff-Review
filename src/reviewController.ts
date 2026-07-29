@@ -4,7 +4,7 @@ import * as vscode from 'vscode';
 import { AiReviewLanguage, AiReviewPartialError, AiReviewStore, AiReviewStrategy, CodeReviewAgentService, CodeReviewTraceContext, normalizeAiSuggestionReplacementText, reviewChangeSignature, StoredAiReview, sortFindings, sourcePendingFiles } from './agent/codeReview';
 import type { AgentTraceEvent } from './agent/runtime';
 import { AgentRunStore, ProjectAgentLifecycle, ProjectAgentTaskKind, StoredProjectAgentRun } from './agentRunStore';
-import { GitService } from './gitService';
+import { GitBranchRef, GitService } from './gitService';
 import { computeLineDiff } from './diffEngine';
 import { contentStateHash, expectedRejectedFileHash, fileStateHash, GitReviewJournalStore } from './gitReviewJournal';
 import { createLlmClient, LlmClient } from './llm/client';
@@ -92,6 +92,15 @@ interface ProjectAgentRuntime {
 	loaded: boolean;
 }
 
+interface BranchExtractionState {
+	version: 1;
+	projectRootUri: string;
+	targetHeadOid: string;
+	targetLabel: string;
+	sourceRef: string;
+	startedAt: number;
+}
+
 type SuggestionMappingFailureReason =
 	| 'no-candidate'
 	| 'other-hunk-overlap'
@@ -174,12 +183,17 @@ export class ReviewController implements vscode.Disposable {
 		this.agentRunStore = new AgentRunStore(context);
 		void this.migrateLegacyReviewStorage();
 		this.treeProvider = new ReviewTreeProvider(() => this.activeSession, () => this.dashboardStoredAiReview());
-		this.dashboardProvider = new ReviewDashboardProvider(() => buildReviewDashboardPayload(
-			this.activeSession,
-			this.currentReviewUri,
-			(uri) => this.isOpenDocumentDirty(uri),
-			this.llmWikiState,
-		));
+		this.dashboardProvider = new ReviewDashboardProvider(() => {
+			const extraction = this.currentBranchExtraction();
+			return buildReviewDashboardPayload(
+				this.activeSession,
+				this.currentReviewUri,
+				(uri) => this.isOpenDocumentDirty(uri),
+				this.llmWikiState,
+				extraction?.sourceRef,
+				extraction?.targetLabel,
+			);
+		});
 		this.reviewWebview = new ReviewWebviewManager(
 			context,
 			() => this.activeSession,
@@ -240,6 +254,8 @@ export class ReviewController implements vscode.Disposable {
 			this.registerCommand('cli-diff.rejectAll', () => this.rejectAll()),
 			this.registerCommand('cli-diff.undoAll', () => this.undoAll()),
 			this.registerCommand('cli-diff.selectTrackingTarget', (projectId?: string) => this.selectTrackingTarget(projectId)),
+			this.registerCommand('cli-diff.selectGitBranch', () => this.selectGitBranch()),
+			this.registerCommand('cli-diff.exitBranchExtraction', () => this.exitBranchExtraction()),
 			this.registerCommand('cli-diff.nextChange', (uri?: string, hunkId?: string) => this.navigateChange(1, uri, hunkId)),
 			this.registerCommand('cli-diff.previousChange', (uri?: string, hunkId?: string) => this.navigateChange(-1, uri, hunkId)),
 			this.registerCommand('cli-diff.openReviewView', (uri?: string) => this.openReviewView(uri)),
@@ -421,6 +437,7 @@ export class ReviewController implements vscode.Disposable {
 		}
 		if (mode === 'git') {
 			await this.attachRejectedJournals(files, projects ?? []);
+			await this.validateBranchExtractions(projects ?? []);
 		}
 
 		this.activeSession = {
@@ -664,6 +681,217 @@ export class ReviewController implements vscode.Disposable {
 		}
 		await this.refreshLlmWikiDashboardState();
 		this.refreshUi();
+	}
+
+	private async selectGitBranch(): Promise<void> {
+		const project = currentReviewProject(this.activeSession);
+		if (!project) {
+			return;
+		}
+		if (this.branchExtraction(project)) {
+			void vscode.window.showInformationMessage(`Exit the extracted review from ${this.branchExtraction(project)?.sourceRef} before switching branches.`);
+			return;
+		}
+		try {
+			const folder = reviewProjectFolder(project);
+			const refs = await this.gitService.branchRefs(folder);
+			const items: Array<(vscode.QuickPickItem & { action?: 'extract' | 'checkout'; ref?: GitBranchRef })> = [
+				{
+					label: `$(git-merge) Review branch changes in ${project.branchName ?? project.name}…`,
+					description: 'Extract code into the current workspace',
+					action: 'extract',
+				},
+			];
+			const local = refs.filter((ref) => ref.kind === 'local');
+			const remote = refs.filter((ref) => ref.kind === 'remote');
+			if (local.length > 0) {
+				items.push({ label: 'Local', kind: vscode.QuickPickItemKind.Separator });
+				items.push(...local.map((ref) => ({
+					label: ref.name,
+					description: ref.current ? 'Current' : undefined,
+					action: 'checkout' as const,
+					ref,
+				})));
+			}
+			if (remote.length > 0) {
+				items.push({ label: 'Remote', kind: vscode.QuickPickItemKind.Separator });
+				items.push(...remote.map((ref) => ({
+					label: ref.name,
+					description: ref.current ? 'Current · Detached HEAD' : 'Detached HEAD',
+					action: 'checkout' as const,
+					ref,
+				})));
+			}
+			const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select a Git branch action' });
+			if (!picked?.action) {
+				return;
+			}
+			if (picked.action === 'extract') {
+				await this.extractBranchReview(project, refs);
+				return;
+			}
+			if (!picked.ref || picked.ref.current) {
+				return;
+			}
+			await this.enqueueProjectGitOperation(project, async () => {
+				await this.gitService.checkout(folder, picked.ref?.name ?? '');
+			});
+			await this.requestGitSessionRefresh();
+		} catch (error) {
+			this.showError(error);
+		}
+	}
+
+	private async extractBranchReview(project: ReviewProject, refs: GitBranchRef[]): Promise<void> {
+		const sourceItems: Array<(vscode.QuickPickItem & { ref?: GitBranchRef })> = [];
+		const local = refs.filter((ref) => ref.kind === 'local' && !ref.current);
+		const remote = refs.filter((ref) => ref.kind === 'remote' && !ref.current);
+		if (local.length > 0) {
+			sourceItems.push({ label: 'Local', kind: vscode.QuickPickItemKind.Separator });
+			sourceItems.push(...local.map((ref) => ({ label: ref.name, ref })));
+		}
+		if (remote.length > 0) {
+			sourceItems.push({ label: 'Remote', kind: vscode.QuickPickItemKind.Separator });
+			sourceItems.push(...remote.map((ref) => ({ label: ref.name, ref })));
+		}
+		const picked = await vscode.window.showQuickPick(sourceItems, {
+			placeHolder: 'Select a branch to review in the current workspace',
+		});
+		if (!picked?.ref) {
+			return;
+		}
+		if (this.hasDirtyDocumentInProject(project)) {
+			void vscode.window.showInformationMessage(`Save or revert open files in ${project.name} before extracting branch changes.`);
+			return;
+		}
+		if (this.projectHasReviewDecisions(project)) {
+			void vscode.window.showInformationMessage(`Finish the current ${project.name} review before extracting branch changes.`);
+			return;
+		}
+		const folder = reviewProjectFolder(project);
+		await this.enqueueProjectGitOperation(project, async () => {
+			if (!await this.gitService.isClean(folder)) {
+				throw new Error(`The ${project.name} working tree and index must be clean before extracting branch changes.`);
+			}
+			const headOid = await this.gitService.headOid(folder);
+			if (!headOid) {
+				throw new Error(`The ${project.name} repository has no HEAD commit.`);
+			}
+			const extraction = await this.gitService.extractBranchPatch(folder, picked.ref?.name ?? '');
+			if (!extraction.ok) {
+				void vscode.window.showWarningMessage('The selected branch has merge conflicts. No changes were applied.');
+				return;
+			}
+			if (!extraction.patch) {
+				void vscode.window.showInformationMessage('The selected branch has no changes to review.');
+				return;
+			}
+			await this.gitService.applyPatch(folder, extraction.patch, { check: true });
+			await this.gitService.applyPatch(folder, extraction.patch);
+			const state: BranchExtractionState = {
+				version: 1,
+				projectRootUri: project.rootUri.toString(),
+				targetHeadOid: headOid,
+				targetLabel: project.branchName ?? headOid.slice(0, 7),
+				sourceRef: picked.ref?.name ?? '',
+				startedAt: Date.now(),
+			};
+			await this.context.workspaceState.update(branchExtractionStorageKey(project.rootUri), state);
+		});
+		await this.requestGitSessionRefresh();
+	}
+
+	private async exitBranchExtraction(): Promise<void> {
+		const project = currentReviewProject(this.activeSession);
+		const extraction = project ? this.branchExtraction(project) : undefined;
+		if (!project || !extraction) {
+			return;
+		}
+		const confirmed = await vscode.window.showWarningMessage(
+			`Exit extracted review from “${extraction.sourceRef}”?\n\nThis discards all staged, unstaged, and untracked changes in “${project.name}”.`,
+			{ modal: true },
+			'Exit and Discard',
+		);
+		if (confirmed !== 'Exit and Discard') {
+			return;
+		}
+		if (this.hasDirtyDocumentInProject(project)) {
+			void vscode.window.showInformationMessage(`Save or revert open files in ${project.name} before exiting the extracted review.`);
+			return;
+		}
+		try {
+			const folder = reviewProjectFolder(project);
+			await this.enqueueProjectGitOperation(project, async () => {
+				const headOid = await this.gitService.headOid(folder);
+				if (headOid !== extraction.targetHeadOid) {
+					await this.context.workspaceState.update(branchExtractionStorageKey(project.rootUri), undefined);
+					throw new Error('Git HEAD changed after branch extraction. The extraction label was cleared without modifying files.');
+				}
+				await this.gitService.restoreProject(folder, extraction.targetHeadOid);
+				await this.gitReviewJournal.clear(project, extraction.targetHeadOid);
+				await this.aiReviewStore.clear(project.rootUri);
+				await this.context.workspaceState.update(branchExtractionStorageKey(project.rootUri), undefined);
+			});
+			if (this.currentReviewUri && uriIsInside(project.rootUri, this.currentReviewUri)) {
+				this.currentReviewUri = undefined;
+			}
+			await this.requestGitSessionRefresh();
+		} catch (error) {
+			this.showError(error);
+			await this.requestGitSessionRefresh();
+		}
+	}
+
+	private branchExtraction(project: ReviewProject): BranchExtractionState | undefined {
+		const stored = this.context.workspaceState.get<BranchExtractionState>(branchExtractionStorageKey(project.rootUri));
+		return stored?.version === 1 && stored.projectRootUri === project.rootUri.toString() ? stored : undefined;
+	}
+
+	private currentBranchExtraction(): BranchExtractionState | undefined {
+		const project = currentReviewProject(this.activeSession);
+		return project ? this.branchExtraction(project) : undefined;
+	}
+
+	private async validateBranchExtractions(projects: ReviewProject[]): Promise<void> {
+		for (const project of projects) {
+			const extraction = this.branchExtraction(project);
+			if (extraction && extraction.targetHeadOid !== project.headOid) {
+				await this.context.workspaceState.update(branchExtractionStorageKey(project.rootUri), undefined);
+			}
+		}
+	}
+
+	private hasDirtyDocumentInProject(project: ReviewProject): boolean {
+		return vscode.workspace.textDocuments.some((document) => (
+			document.uri.scheme === 'file'
+			&& document.isDirty
+			&& uriIsInside(project.rootUri, document.uri)
+		));
+	}
+
+	private projectHasReviewDecisions(project: ReviewProject): boolean {
+		return [...(this.activeSession?.files.values() ?? [])].some((file) => (
+			file.projectId === project.id
+			&& (file.acceptedHunks.length > 0 || file.rejectedHunks.length > 0 || file.appliedAiSuggestions.length > 0)
+		));
+	}
+
+	private async enqueueProjectGitOperation(project: ReviewProject, operation: () => Promise<void>): Promise<void> {
+		await this.fileOperationQueue.enqueue(uriKey(project.rootUri), async () => {
+			if (this.gitRefreshInFlight) {
+				await this.gitRefreshInFlight;
+			}
+			if (this.gitRefreshTimer) {
+				clearTimeout(this.gitRefreshTimer);
+				this.gitRefreshTimer = undefined;
+			}
+			this.gitMutationDepth += 1;
+			try {
+				await operation();
+			} finally {
+				this.gitMutationDepth = Math.max(0, this.gitMutationDepth - 1);
+			}
+		});
 	}
 
 	private createFileState(pair: FilePair): ReviewFileState {
@@ -3327,6 +3555,7 @@ export class ReviewController implements vscode.Disposable {
 		const previousFiles = this.activeSession.files;
 		const previousProjects = this.activeSession.projects ?? [];
 		const projects = await this.gitService.discoverProjects(workspaceRoot);
+		await this.validateBranchExtractions(projects);
 		await this.interruptRemovedProjectAgents(previousProjects, projects);
 		await this.loadProjectAgentRuns(projects);
 		const pairs = await this.createProjectFilePairs(projects);
@@ -5207,6 +5436,10 @@ export class ReviewController implements vscode.Disposable {
 
 function trackingTargetStorageKey(rootUri: vscode.Uri): string {
 	return `cliDiff.trackingTarget.${rootUri.toString()}`;
+}
+
+function branchExtractionStorageKey(rootUri: vscode.Uri): string {
+	return `cliDiff.branchExtraction.v1.${rootUri.toString()}`;
 }
 
 function uriIsInside(rootUri: vscode.Uri, uri: vscode.Uri): boolean {

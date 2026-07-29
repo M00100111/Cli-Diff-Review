@@ -21,6 +21,16 @@ export interface GitApplyOptions {
 	check?: boolean;
 }
 
+export interface GitBranchRef {
+	name: string;
+	kind: 'local' | 'remote';
+	current: boolean;
+}
+
+export type GitBranchExtraction =
+	| { ok: true; patch: string }
+	| { ok: false; reason: 'conflict' };
+
 const diffOptions = [
 	'--full-index', '--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames', '--unified=3', '--relative', '--',
 ];
@@ -198,6 +208,84 @@ export class GitService {
 		await this.git(root, args, { input: patch });
 	}
 
+	public async branchRefs(root: vscode.WorkspaceFolder): Promise<GitBranchRef[]> {
+		const [output, localBranch, headOid] = await Promise.all([
+			this.git(root, [
+				'for-each-ref',
+				'--format=%(refname:short)%00%(refname)%00%(symref)',
+				'refs/heads',
+				'refs/remotes',
+			]),
+			this.symbolicBranchNamePath(root.uri.fsPath),
+			this.headOid(root),
+		]);
+		const refs = output.split(/\r?\n/g)
+			.filter(Boolean)
+			.map((line): GitBranchRef | undefined => {
+				const [name = '', fullName = '', symref = ''] = line.split('\0');
+				if (!name || symref || fullName.endsWith('/HEAD')) {
+					return undefined;
+				}
+				const kind: GitBranchRef['kind'] = fullName.startsWith('refs/heads/') ? 'local' : 'remote';
+				return {
+					name,
+					kind,
+					current: kind === 'local' && name === localBranch,
+				};
+			})
+			.filter((ref): ref is GitBranchRef => Boolean(ref));
+		if (!localBranch && headOid) {
+			const pointedRemote = await this.remoteRefsPointingAt(root, headOid);
+			const pointed = new Set(pointedRemote);
+			for (const ref of refs) {
+				if (ref.kind === 'remote' && pointed.has(ref.name)) {
+					ref.current = true;
+				}
+			}
+		}
+		return refs.sort((left, right) => left.kind.localeCompare(right.kind) || left.name.localeCompare(right.name));
+	}
+
+	public async checkout(root: vscode.WorkspaceFolder, ref: string): Promise<void> {
+		await this.git(root, ['checkout', ref]);
+	}
+
+	public async isClean(root: vscode.WorkspaceFolder): Promise<boolean> {
+		const output = await this.gitBuffer(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
+		return output.length === 0;
+	}
+
+	public async extractBranchPatch(root: vscode.WorkspaceFolder, sourceRef: string): Promise<GitBranchExtraction> {
+		const merge = await this.runGit(root.uri.fsPath, [
+			'merge-tree', '--write-tree', '--no-messages', 'HEAD', sourceRef,
+		], { allowedExitCodes: [0, 1] });
+		if (merge.code === 1) {
+			return { ok: false, reason: 'conflict' };
+		}
+		const treeOid = merge.stdout.toString('utf8').trim().split(/\r?\n/g)[0];
+		if (!treeOid) {
+			throw new Error('Git did not return a merged tree.');
+		}
+		const patch = await this.git(root, [
+			'diff',
+			'--full-index',
+			'--binary',
+			'--no-color',
+			'--no-ext-diff',
+			'--no-textconv',
+			'--no-renames',
+			'HEAD',
+			treeOid,
+			'--',
+		]);
+		return { ok: true, patch };
+	}
+
+	public async restoreProject(root: vscode.WorkspaceFolder, headOid: string): Promise<void> {
+		await this.git(root, ['restore', `--source=${headOid}`, '--staged', '--worktree', '--', '.']);
+		await this.git(root, ['clean', '-fd']);
+	}
+
 	public combinePatches(hunks: GitReviewHunk[]): string {
 		return combineGitHunkPatches(hunks);
 	}
@@ -248,12 +336,55 @@ export class GitService {
 	}
 
 	private async branchNamePath(rootPath: string): Promise<string | undefined> {
+		const symbolic = await this.symbolicBranchNamePath(rootPath);
+		if (symbolic) {
+			return symbolic;
+		}
+		try {
+			const headOid = await this.headOidPath(rootPath);
+			if (!headOid) {
+				return undefined;
+			}
+			const remoteRefs = await this.remoteRefsPointingAtPath(rootPath, headOid);
+			if (remoteRefs[0]) {
+				return `${remoteRefs[0]} (detached)`;
+			}
+			const shortOid = (await this.gitInPath(rootPath, ['rev-parse', '--short', 'HEAD'])).trim();
+			return shortOid ? `${shortOid} (detached)` : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	private async symbolicBranchNamePath(rootPath: string): Promise<string | undefined> {
 		try {
 			const branchName = (await this.gitInPath(rootPath, ['symbolic-ref', '--quiet', '--short', 'HEAD'])).trim();
 			return branchName || undefined;
 		} catch {
 			return undefined;
 		}
+	}
+
+	private remoteRefsPointingAt(root: vscode.WorkspaceFolder, oid: string): Promise<string[]> {
+		return this.remoteRefsPointingAtPath(root.uri.fsPath, oid);
+	}
+
+	private async remoteRefsPointingAtPath(rootPath: string, oid: string): Promise<string[]> {
+		const output = await this.gitInPath(rootPath, [
+			'for-each-ref',
+			'--points-at',
+			oid,
+			'--format=%(refname:short)%00%(symref)',
+			'refs/remotes',
+		]);
+		return output.split(/\r?\n/g)
+			.filter(Boolean)
+			.map((line) => {
+				const [name = '', symref = ''] = line.split('\0');
+				return symref ? '' : name;
+			})
+			.filter(Boolean)
+			.sort((left, right) => left.localeCompare(right));
 	}
 
 	private async indexStateSignaturePath(rootPath: string): Promise<string> {
@@ -364,7 +495,7 @@ export class GitService {
 		return result.stdout.toString('utf8');
 	}
 
-	private runGit(cwd: string, args: string[], options: GitRunOptions): Promise<{ stdout: Buffer; stderr: Buffer }> {
+	private runGit(cwd: string, args: string[], options: GitRunOptions): Promise<{ stdout: Buffer; stderr: Buffer; code: number }> {
 		return new Promise((resolve, reject) => {
 			const child = spawn('git', ['-C', cwd, ...args], { stdio: ['pipe', 'pipe', 'pipe'] });
 			const stdout: Buffer[] = [];
@@ -374,7 +505,7 @@ export class GitService {
 			child.on('error', reject);
 			child.on('close', (code) => {
 				const allowed = options.allowedExitCodes ?? [0];
-				const result = { stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) };
+				const result = { stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr), code: code ?? -1 };
 				if (code === null || !allowed.includes(code)) {
 					reject(new Error(result.stderr.toString('utf8') || `Git exited with code ${code ?? 'unknown'}.`));
 					return;

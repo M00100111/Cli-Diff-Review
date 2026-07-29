@@ -24,6 +24,8 @@ type DashboardMessage =
 	| { type: 'closeReviewEditors' }
 	| { type: 'selectTrackingTarget' }
 	| { type: 'selectTrackingProject'; projectId: string }
+	| { type: 'selectGitBranch' }
+	| { type: 'exitBranchExtraction' }
 	| {
 		type: 'saveLlmConfig';
 		profileId?: string;
@@ -105,6 +107,7 @@ export interface ReviewDashboardPayload {
 	trackingTarget?: {
 		label: string;
 		branchName?: string;
+		extractionSource?: string;
 		kind: 'none' | 'aggregate' | 'project';
 		canSwitch: boolean;
 		disabled: boolean;
@@ -302,6 +305,16 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 		if (message.type === 'selectTrackingProject') {
 			await this.executeCommand('cli-diff.selectTrackingTarget', message.projectId);
+			this.postState();
+			return;
+		}
+		if (message.type === 'selectGitBranch') {
+			await this.executeCommand('cli-diff.selectGitBranch');
+			this.postState();
+			return;
+		}
+		if (message.type === 'exitBranchExtraction') {
+			await this.executeCommand('cli-diff.exitBranchExtraction');
 			this.postState();
 			return;
 		}
@@ -1292,18 +1305,31 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			opacity: 1;
 			cursor: default;
 		}
-		.tracking-branch {
+		.tracking-branch,
+		.tracking-extraction-source {
 			flex: 1 1 auto;
 			min-width: 0;
+			padding: 0;
+			border: 0;
 			overflow: hidden;
 			color: var(--muted);
+			background: transparent;
 			font-weight: 500;
 			text-overflow: ellipsis;
 			white-space: nowrap;
-			pointer-events: none;
-			user-select: text;
+			cursor: pointer;
 		}
-		.tracking-branch[hidden] { display: none; }
+		.tracking-branch:hover,
+		.tracking-extraction-source:hover {
+			color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground));
+		}
+		.tracking-extraction-arrow {
+			flex: 0 0 auto;
+			color: var(--muted);
+		}
+		.tracking-branch[hidden],
+		.tracking-extraction-arrow[hidden],
+		.tracking-extraction-source[hidden] { display: none; }
 		.header-actions {
 			flex: 0 0 auto;
 			display: flex;
@@ -1518,7 +1544,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 						<span class="chevron" aria-hidden="true"></span>
 					</button>
 					<button class="tracking-target" id="trackingTarget" type="button" title="Select tracked project" disabled></button>
-					<span class="tracking-branch" id="trackingBranch" hidden></span>
+					<button class="tracking-branch" id="trackingBranch" type="button" hidden></button>
+					<span class="tracking-extraction-arrow" id="trackingExtractionArrow" hidden>←</span>
+					<button class="tracking-extraction-source" id="trackingExtractionSource" type="button" hidden></button>
 				</div>
 				<div class="header-actions">
 					<button class="refresh-button bulk-action-button" id="acceptAll" type="button" title="Accept all pending changes" aria-label="Accept all pending changes">
@@ -1545,6 +1573,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const toggle = document.getElementById('toggle');
 		const trackingTarget = document.getElementById('trackingTarget');
 		const trackingBranch = document.getElementById('trackingBranch');
+		const trackingExtractionArrow = document.getElementById('trackingExtractionArrow');
+		const trackingExtractionSource = document.getElementById('trackingExtractionSource');
 		const list = document.getElementById('list');
 		const modelPill = document.getElementById('modelPill');
 		const homeButton = document.getElementById('homeButton');
@@ -1584,6 +1614,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		rejectAllButton.addEventListener('click', () => vscode.postMessage({ type: 'rejectAll' }));
 		undoAllButton.addEventListener('click', () => vscode.postMessage({ type: 'undoAll' }));
 		trackingTarget.addEventListener('click', () => vscode.postMessage({ type: 'selectTrackingTarget' }));
+		trackingBranch.addEventListener('click', () => vscode.postMessage({ type: 'selectGitBranch' }));
+		trackingExtractionSource.addEventListener('click', () => vscode.postMessage({ type: 'exitBranchExtraction' }));
 		document.getElementById('refresh').addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
 		modelPill.addEventListener('click', openModelPicker);
 		addModelConfig.addEventListener('click', openNewConfig);
@@ -1832,6 +1864,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			trackingBranch.textContent = tracking.branchName || '';
 			trackingBranch.title = tracking.branchName || '';
 			trackingBranch.hidden = !tracking.branchName;
+			trackingExtractionSource.textContent = tracking.extractionSource || '';
+			trackingExtractionSource.title = tracking.extractionSource ? 'Exit extracted branch review' : '';
+			trackingExtractionSource.hidden = !tracking.extractionSource;
+			trackingExtractionArrow.hidden = !tracking.extractionSource;
 		}
 
 		function updateBulkActionButtons(files) {
@@ -3067,6 +3103,8 @@ export function buildReviewDashboardPayload(
 	currentReviewUri: vscode.Uri | undefined,
 	isDirty: (uri: vscode.Uri) => boolean,
 	llmWiki: LlmWikiDashboardState = defaultLlmWikiDashboardState(),
+	extractionSource?: string,
+	extractionTargetLabel?: string,
 ): ReviewDashboardPayload {
 	const currentKey = currentReviewUri ? uriKey(currentReviewUri) : undefined;
 	const hunkLinksById = dashboardHunkLinks(session);
@@ -3166,7 +3204,8 @@ export function buildReviewDashboardPayload(
 		files,
 		trackingTarget: {
 			label: session ? currentProject?.name ?? path.basename(session.rootUri.fsPath) : '',
-			branchName: currentProject?.branchName,
+			branchName: currentProject ? extractionTargetLabel ?? currentProject.branchName : undefined,
+			extractionSource: currentProject ? extractionSource : undefined,
 			kind: !session ? 'none' : currentProject ? 'project' : session.trackingTarget?.kind === 'aggregate' ? 'aggregate' : 'project',
 			canSwitch: hasAggregateReviewTarget(session),
 			disabled: false,

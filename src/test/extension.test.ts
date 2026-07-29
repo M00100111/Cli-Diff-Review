@@ -1137,6 +1137,16 @@ suite('Review state', () => {
 		assert.strictEqual(rootProjectPayload.trackingTarget?.label, 'api');
 		assert.strictEqual(rootProjectPayload.trackingTarget?.branchName, 'main');
 		assert.strictEqual(rootProjectPayload.files[0].relativePath, 'src/app.ts');
+		const extractedPayload = buildReviewDashboardPayload(
+			rootProject,
+			undefined,
+			() => false,
+			undefined,
+			'origin/feature',
+			'main',
+		);
+		assert.strictEqual(extractedPayload.trackingTarget?.branchName, 'main');
+		assert.strictEqual(extractedPayload.trackingTarget?.extractionSource, 'origin/feature');
 	});
 
 	test('builds dashboard payload with current review and action states', () => {
@@ -1597,9 +1607,12 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('id="settingsMenu"'));
 		assert.ok(view.webview.html.includes('id="trackingTarget"'));
 		assert.ok(view.webview.html.includes('id="trackingBranch"'));
+		assert.ok(view.webview.html.includes('id="trackingExtractionArrow"'));
+		assert.ok(view.webview.html.includes('id="trackingExtractionSource"'));
 		assert.ok(view.webview.html.includes("trackingTarget.textContent = tracking.label || '';"));
 		assert.ok(view.webview.html.includes("trackingBranch.textContent = tracking.branchName || '';"));
-		assert.match(view.webview.html, /\.tracking-branch\s*{[\s\S]*?flex: 1 1 auto;[\s\S]*?pointer-events: none;/);
+		assert.ok(view.webview.html.includes("type: 'selectGitBranch'"));
+		assert.ok(view.webview.html.includes("type: 'exitBranchExtraction'"));
 		assert.ok(view.webview.html.includes('id="acceptAll"'));
 		assert.ok(view.webview.html.includes('id="rejectAll"'));
 		assert.ok(view.webview.html.includes('id="undoAll"'));
@@ -1821,6 +1834,8 @@ suite('Review state', () => {
 		messageHandler({ type: 'closeReviewEditors' });
 		messageHandler({ type: 'selectTrackingTarget' });
 		messageHandler({ type: 'selectTrackingProject', projectId: 'project-b' });
+		messageHandler({ type: 'selectGitBranch' });
+		messageHandler({ type: 'exitBranchExtraction' });
 		messageHandler({ type: 'regenerateAiReview' });
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.openWikiIndex' && call.args.length === 0));
@@ -1830,6 +1845,8 @@ suite('Review state', () => {
 		assert.ok(commands.some((call) => call.command === 'cli-diff.selectTrackingTarget'));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.selectTrackingTarget'
 			&& call.args[0] === 'project-b'));
+		assert.ok(commands.some((call) => call.command === 'cli-diff.selectGitBranch'));
+		assert.ok(commands.some((call) => call.command === 'cli-diff.exitBranchExtraction'));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.generateAiReview'
 			&& call.args[0] === 'regenerate'));
 		messageHandler({ type: 'acceptAll' });
@@ -4380,6 +4397,114 @@ suite('Git service', () => {
 			assert.strictEqual(rootProjects[0].rootUri.fsPath, vscode.Uri.file(parent).fsPath);
 		} finally {
 			removeTempRepo(parent);
+		}
+	});
+
+	test('lists and checks out local and remote branch refs without creating a local remote branch', async function (this: Mocha.Context) {
+		this.timeout(30000);
+		const root = createTempGitRepo();
+		try {
+			writeRepoFile(root, 'tracked.txt', 'base\n');
+			git(root, 'add', 'tracked.txt');
+			git(root, 'commit', '-m', 'initial');
+			const mainBranch = git(root, 'symbolic-ref', '--quiet', '--short', 'HEAD').trim();
+			git(root, 'checkout', '-b', 'feature');
+			writeRepoFile(root, 'tracked.txt', 'feature\n');
+			git(root, 'commit', '-am', 'feature');
+			const featureOid = git(root, 'rev-parse', 'HEAD').trim();
+			git(root, 'checkout', mainBranch);
+			git(root, 'update-ref', 'refs/remotes/origin/feature', featureOid);
+			const localRefsBefore = git(root, 'for-each-ref', '--format=%(refname:short)', 'refs/heads');
+
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			const refs = await service.branchRefs(folder);
+			assert.ok(refs.some((ref) => ref.kind === 'local' && ref.name === mainBranch && ref.current));
+			assert.ok(refs.some((ref) => ref.kind === 'local' && ref.name === 'feature'));
+			assert.ok(refs.some((ref) => ref.kind === 'remote' && ref.name === 'origin/feature'));
+
+			await service.checkout(folder, 'origin/feature');
+			assert.strictEqual(git(root, 'rev-parse', '--abbrev-ref', 'HEAD').trim(), 'HEAD');
+			assert.strictEqual(
+				git(root, 'for-each-ref', '--format=%(refname:short)', 'refs/heads'),
+				localRefsBefore,
+			);
+			const detachedRefs = await service.branchRefs(folder);
+			assert.ok(detachedRefs.some((ref) => ref.kind === 'remote' && ref.name === 'origin/feature' && ref.current));
+			const [project] = await service.discoverProjects(folder);
+			assert.strictEqual(project.branchName, 'origin/feature (detached)');
+		} finally {
+			removeTempRepo(root);
+		}
+	});
+
+	test('extracts a conflict-free merged tree only into the working tree and restores the project', async function (this: Mocha.Context) {
+		this.timeout(30000);
+		const root = createTempGitRepo();
+		try {
+			writeRepoFile(root, 'base.txt', 'base\n');
+			git(root, 'add', '.');
+			git(root, 'commit', '-m', 'initial');
+			const targetBranch = git(root, 'symbolic-ref', '--quiet', '--short', 'HEAD').trim();
+			git(root, 'checkout', '-b', 'feature');
+			writeRepoFile(root, 'base.txt', 'base\nfeature\n');
+			writeRepoFile(root, 'added.txt', 'added\n');
+			git(root, 'add', '.');
+			git(root, 'commit', '-m', 'feature');
+			git(root, 'checkout', targetBranch);
+			const headOid = git(root, 'rev-parse', 'HEAD').trim();
+
+			const service = new GitService();
+			const folder = workspaceFolder(root);
+			const extraction = await service.extractBranchPatch(folder, 'feature');
+			assert.strictEqual(extraction.ok, true);
+			assert.ok(extraction.ok && extraction.patch.includes('added.txt'));
+			if (!extraction.ok) {
+				return;
+			}
+			await service.applyPatch(folder, extraction.patch, { check: true });
+			await service.applyPatch(folder, extraction.patch);
+
+			assert.strictEqual(git(root, 'rev-parse', 'HEAD').trim(), headOid);
+			assert.strictEqual(git(root, 'diff', '--cached'), '');
+			assert.match(git(root, 'diff'), /feature/);
+			assert.strictEqual(fs.readFileSync(path.join(root, 'added.txt'), 'utf8'), 'added\n');
+
+			git(root, 'add', 'base.txt');
+			writeRepoFile(root, 'extra.txt', 'extra\n');
+			await service.restoreProject(folder, headOid);
+			assert.strictEqual(git(root, 'status', '--porcelain'), '');
+			assert.strictEqual(fs.existsSync(path.join(root, 'added.txt')), false);
+			assert.strictEqual(fs.existsSync(path.join(root, 'extra.txt')), false);
+			assert.strictEqual(git(root, 'rev-parse', 'HEAD').trim(), headOid);
+		} finally {
+			removeTempRepo(root);
+		}
+	});
+
+	test('reports merge-tree conflicts without modifying visible Git state', async function (this: Mocha.Context) {
+		this.timeout(30000);
+		const root = createTempGitRepo();
+		try {
+			writeRepoFile(root, 'tracked.txt', 'base\n');
+			git(root, 'add', '.');
+			git(root, 'commit', '-m', 'initial');
+			const targetBranch = git(root, 'symbolic-ref', '--quiet', '--short', 'HEAD').trim();
+			git(root, 'checkout', '-b', 'feature');
+			writeRepoFile(root, 'tracked.txt', 'feature\n');
+			git(root, 'commit', '-am', 'feature');
+			git(root, 'checkout', targetBranch);
+			writeRepoFile(root, 'tracked.txt', 'target\n');
+			git(root, 'commit', '-am', 'target');
+			const headOid = git(root, 'rev-parse', 'HEAD').trim();
+
+			const extraction = await new GitService().extractBranchPatch(workspaceFolder(root), 'feature');
+			assert.deepStrictEqual(extraction, { ok: false, reason: 'conflict' });
+			assert.strictEqual(git(root, 'rev-parse', 'HEAD').trim(), headOid);
+			assert.strictEqual(git(root, 'status', '--porcelain'), '');
+			assert.strictEqual(git(root, 'diff', '--cached'), '');
+		} finally {
+			removeTempRepo(root);
 		}
 	});
 
