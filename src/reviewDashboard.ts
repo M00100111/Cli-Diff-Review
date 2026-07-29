@@ -408,6 +408,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const settingIconUri = typeof webview.asWebviewUri === 'function' ? webview.asWebviewUri(settingIconFile).toString() : '';
 		const homeIconFile = vscode.Uri.joinPath(vscode.Uri.file(__dirname), '..', 'resources', 'home.svg');
 		const homeIconUri = typeof webview.asWebviewUri === 'function' ? webview.asWebviewUri(homeIconFile).toString() : '';
+		const refreshIconFile = vscode.Uri.joinPath(vscode.Uri.file(__dirname), '..', 'resources', 'refresh.svg');
+		const refreshIconUri = typeof webview.asWebviewUri === 'function' ? webview.asWebviewUri(refreshIconFile).toString() : '';
 		return /* html */`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1426,6 +1428,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			stroke-linecap: round;
 			stroke-linejoin: round;
 		}
+		#refresh img {
+			width: 13px;
+			height: 13px;
+			display: block;
+		}
 	</style>
 </head>
 <body>
@@ -1559,7 +1566,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5H3.5V3.5"/><path d="M3.8 5.4A5 5 0 1 1 4.9 12"/></svg>
 					</button>
 					<button class="refresh-button" id="refresh" type="button" title="Refresh and stage reviewed changes" aria-label="Refresh and stage reviewed changes">
-						<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8A5 5 0 1 1 11.5 4.5"/><path d="M11.5 2.5V4.5H13.5"/></svg>
+						<img src="${refreshIconUri}" alt="" aria-hidden="true">
 					</button>
 				</div>
 			</header>
