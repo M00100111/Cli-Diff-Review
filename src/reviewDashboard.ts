@@ -410,6 +410,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const homeIconUri = typeof webview.asWebviewUri === 'function' ? webview.asWebviewUri(homeIconFile).toString() : '';
 		const refreshIconFile = vscode.Uri.joinPath(vscode.Uri.file(__dirname), '..', 'resources', 'refresh.svg');
 		const refreshIconUri = typeof webview.asWebviewUri === 'function' ? webview.asWebviewUri(refreshIconFile).toString() : '';
+		const mergeIconFile = vscode.Uri.joinPath(vscode.Uri.file(__dirname), '..', 'resources', 'merge.svg');
+		const mergeIconUri = typeof webview.asWebviewUri === 'function' ? webview.asWebviewUri(mergeIconFile).toString() : '';
 		return /* html */`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1321,13 +1323,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			white-space: nowrap;
 			cursor: pointer;
 		}
-		.tracking-branch:hover,
-		.tracking-extraction-source:hover {
-			color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground));
-		}
 		.tracking-extraction-arrow {
 			flex: 0 0 auto;
-			color: var(--muted);
+			width: 15px;
+			height: 15px;
 		}
 		.tracking-branch[hidden],
 		.tracking-extraction-arrow[hidden],
@@ -1552,7 +1551,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					</button>
 					<button class="tracking-target" id="trackingTarget" type="button" title="Select tracked project" disabled></button>
 					<button class="tracking-branch" id="trackingBranch" type="button" hidden></button>
-					<span class="tracking-extraction-arrow" id="trackingExtractionArrow" hidden>←</span>
+					<img class="tracking-extraction-arrow" id="trackingExtractionArrow" src="${mergeIconUri}" alt="" aria-hidden="true" hidden>
 					<button class="tracking-extraction-source" id="trackingExtractionSource" type="button" hidden></button>
 				</div>
 				<div class="header-actions">
