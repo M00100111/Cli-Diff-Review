@@ -280,12 +280,12 @@
           "minimum": 0,
           "description": "Maximum rounds for each AI Review agent. Applies to knowledge, planning, file, and integration agents. 0 means unlimited."
         },
-        "cliDiff.aiReviewFileConcurrency": {
+        "cliDiff.agentConcurrency": {
           "type": "number",
           "order": 7,
           "default": 3,
           "minimum": 0,
-          "description": "Maximum number of file-level AI review agents to run concurrently. 1 runs serially; 0 runs all pending files concurrently."
+          "description": "Max concurrent agents per project. 1 runs serially; 0 runs all."
         },
         "cliDiff.aiReviewLanguage": {
           "type": "string",

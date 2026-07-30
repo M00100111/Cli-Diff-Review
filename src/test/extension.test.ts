@@ -12,7 +12,7 @@ import { acceptHunkInBaseline, computeLineDiff } from '../diffEngine';
 import { GitService, parseCatFileBatch } from '../gitService';
 import { combineGitHunkPatches, decodeGitPath, parseGitPatch } from '../gitPatch';
 import { expectedRejectedFileHash, fileStateHash, GitReviewJournalStore } from '../gitReviewJournal';
-import { AnthropicClient, DeepSeekClient, GlmClient, OpenAiCompatibleClient } from '../llm/client';
+import { AnthropicClient, DeepSeekClient, GlmClient, LlmJsonRequest, OpenAiCompatibleClient } from '../llm/client';
 import { LlmConfigStore } from '../llm/config';
 import { parseStrictJsonObject } from '../llm/json';
 import { NativeReviewEditorManager } from '../nativeReviewEditor';
@@ -377,7 +377,7 @@ suite('Extension configuration', () => {
 			'cliDiff.reviewEditorMode',
 			'cliDiff.aiReviewStrategy',
 			'cliDiff.aiReviewMaxRounds',
-			'cliDiff.aiReviewFileConcurrency',
+			'cliDiff.agentConcurrency',
 			'cliDiff.aiReviewLanguage',
 		];
 		const properties = manifest.contributes?.configuration?.properties ?? {};
@@ -494,11 +494,11 @@ suite('Extension configuration', () => {
 	});
 
 
-	test('declares AI review file concurrency setting defaults', () => {
+	test('declares Agent concurrency setting defaults', () => {
 		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
 			contributes?: { configuration?: { properties?: Record<string, unknown> } };
 		};
-		const setting = manifest.contributes?.configuration?.properties?.['cliDiff.aiReviewFileConcurrency'] as {
+		const setting = manifest.contributes?.configuration?.properties?.['cliDiff.agentConcurrency'] as {
 			type?: unknown;
 			default?: unknown;
 			minimum?: unknown;
@@ -509,7 +509,10 @@ suite('Extension configuration', () => {
 		assert.strictEqual(setting.type, 'number');
 		assert.strictEqual(setting.default, 3);
 		assert.strictEqual(setting.minimum, 0);
-		assert.match(String(setting.description), /0 runs all pending files concurrently/);
+		assert.strictEqual(
+			setting.description,
+			'Max concurrent agents per project. 1 runs serially; 0 runs all.',
+		);
 	});
 
 	test('declares review editor mode setting defaults', () => {
@@ -681,13 +684,13 @@ suite('Review controller bulk actions', () => {
 
 	test('confirms LLM Code Wiki initialization after resolving the target project', () => {
 		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
-		const confirmationIndex = source.indexOf('`Initialize LLM Code Wiki for “${root.name}”?`');
-		const taskIndex = source.indexOf("this.beginProjectAgentTask('initialize', root, project?.id)");
+		const confirmationIndex = source.indexOf('`${continueExisting ? \'Continue\' : \'Initialize\'} LLM Code Wiki for “${root.name}”?`');
+		const taskIndex = source.indexOf("this.beginProjectAgentTask('initialize', root, project?.id, continueExisting)");
 
 		assert.ok(confirmationIndex >= 0);
 		assert.ok(taskIndex > confirmationIndex);
 		assert.ok(source.includes("detail: 'Token usage varies with project size and complexity.'"));
-		assert.ok(source.includes("if (confirmation !== 'Initialize')"));
+		assert.ok(source.includes("if (confirmation !== (continueExisting ? 'Continue' : 'Initialize'))"));
 	});
 
 	test('wires AI review partial retry and max round configuration through the controller', () => {
@@ -695,13 +698,13 @@ suite('Review controller bulk actions', () => {
 
 		assert.ok(source.includes("event.affectsConfiguration('cliDiff.aiReviewMaxRounds')"));
 		assert.ok(source.includes("event.affectsConfiguration('cliDiff.aiReviewStrategy')"));
-		assert.ok(source.includes("event.affectsConfiguration('cliDiff.aiReviewFileConcurrency')"));
+		assert.ok(source.includes("event.affectsConfiguration('cliDiff.agentConcurrency')"));
 		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewMaxRounds', 32)"));
 		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<string>('aiReviewStrategy', 'Multi')"));
-		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewFileConcurrency', 3)"));
+		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<number>('agentConcurrency', 3)"));
 		assert.strictEqual(source.includes('aiReviewFindingOrder'), false);
 		assert.ok(source.includes('const strategy = this.aiReviewStrategy();'));
-		assert.ok(source.includes('const fileConcurrency = this.aiReviewFileConcurrency();'));
+		assert.ok(source.includes('const fileConcurrency = this.agentConcurrency();'));
 		assert.ok(source.includes('strategy,'));
 		assert.ok(source.includes('fileConcurrency,'));
 		assert.ok(source.includes("return 'unlimited';"));
@@ -748,7 +751,8 @@ suite('Review controller bulk actions', () => {
 		assert.ok(source.includes('await this.aiReviewStore.save(session, review);\n\t\t\t\t\t\t\tthis.scheduleLlmWikiDashboardRefresh();'));
 		const wikiInitializer = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'wiki', 'wikiInitializer.ts'), 'utf8');
 		assert.ok(wikiInitializer.includes('onCheckpoint?: () => void;'));
-		assert.ok(wikiInitializer.includes('onCheckpoint: () => options.onCheckpoint?.()'));
+		assert.ok(wikiInitializer.includes('await this.savePipelineCheckpoint(options, checkpoint);'));
+		assert.ok(wikiInitializer.includes('options.onCheckpoint?.();'));
 	});
 
 	test('wires review editor mode through native editor and review page presenters', () => {
@@ -2072,6 +2076,7 @@ suite('LLM Code Wiki', () => {
 		const skill = fs.readFileSync(path.join(root, 'llm-code-wiki', 'SKILL.md'), 'utf8');
 		const schema = fs.readFileSync(path.join(root, 'llm-code-wiki', 'schema.md'), 'utf8');
 		const initializer = fs.readFileSync(path.join(root, 'src', 'wiki', 'wikiInitializer.ts'), 'utf8');
+		const tools = fs.readFileSync(path.join(root, 'src', 'agent', 'tools.ts'), 'utf8');
 
 		assert.ok(skill.includes('✨💬 我已阅读llm-code-wiki.SKILL.md'));
 		assert.ok(skill.includes('✨🎯 我已阅读llm-code-wiki/references：{references名称}'));
@@ -2100,18 +2105,16 @@ suite('LLM Code Wiki', () => {
 		assert.ok(schema.includes('Do not list `references/schema.md` as a normal knowledge page.'));
 		assert.ok(schema.includes('`.state.json`'));
 
-		assert.ok(initializer.includes('write_agents_guidance'));
-		assert.ok(initializer.includes('.agents/skills/llm-code-wiki/SKILL.md'));
-		assert.ok(initializer.includes('Explicitly invite Claude Code, Codex, and other coding agents'));
-		assert.ok(initializer.includes('keeping the wiki aligned is part of the expected work when the change affects durable project knowledge'));
-		assert.ok(initializer.includes('changes affect behavior, architecture, workflows, public interfaces, commands, configuration, data flow, module responsibilities, file structure, or important design decisions'));
-		assert.ok(initializer.includes('formatting-only edits, comment-only changes, or mechanical cleanups'));
-		assert.ok(initializer.includes('should record uncertainty in references/open-questions.md'));
-		assert.ok(initializer.includes('state in the final response whether wiki pages were updated, or why no wiki update was needed'));
-		assert.ok(initializer.includes('must not modify .agents/skills/llm-code-wiki/SKILL.md'));
-		assert.ok(initializer.includes('do not list schema.md in the main index catalog'));
-		assert.ok(initializer.includes('Preserve and integrate source-grounded Wiki updates already made by normal coding agents'));
-		assert.ok(initializer.includes('Do not add schema.md to the normal index.md catalog of business wiki pages.'));
+		assert.ok(tools.includes("tool('write_agents_guidance'"));
+		assert.ok(tools.includes('.agents/skills/llm-code-wiki'));
+		assert.ok(initializer.includes('Planner Agent for a Wiki'));
+		assert.ok(initializer.includes('Module Analyst Agent in a repository Wiki pipeline'));
+		assert.ok(initializer.includes('Wiki Integration Agent for repository Wiki'));
+		assert.ok(initializer.includes('only Agent allowed to write Wiki files'));
+		assert.ok(initializer.includes('allowedWorkspacePaths'));
+		assert.ok(initializer.includes("tool.name !== 'append_wiki_log'"));
+		assert.ok(initializer.includes('Keep schema.md out of the normal index.md business-page catalog.'));
+		assert.ok(initializer.includes('record unresolved uncertainty in open-questions.md'));
 	});
 
 	test('passes Agent trace events through Wiki initialization', async function (this: Mocha.Context) {
@@ -2124,6 +2127,34 @@ suite('LLM Code Wiki', () => {
 			writeRepoFile(repositoryRoot, 'src/app.ts', 'export const value = 1;\n');
 			const wiki = validWikiResponse();
 			const responses = [
+				JSON.stringify({
+					type: 'final',
+					result: {
+						summary: 'Planned core module.',
+						modules: [{
+							id: 'core',
+							name: 'Core',
+							sourceScopes: ['src'],
+							sharedPaths: [],
+							goals: ['Understand the core module.'],
+						}],
+					},
+				}),
+				JSON.stringify({
+					type: 'final',
+					result: {
+						moduleId: 'core',
+						summary: 'Core application module.',
+						responsibilities: ['Owns the application entry point.'],
+						entryPoints: ['src/app.ts'],
+						interfaces: [],
+						workflows: [],
+						dependencies: [],
+						decisions: [],
+						evidencePaths: ['src/app.ts'],
+						openQuestions: [],
+					},
+				}),
 				JSON.stringify({
 					type: 'tool_calls',
 					calls: [
@@ -2143,25 +2174,257 @@ suite('LLM Code Wiki', () => {
 				}),
 				'{"type":"final","result":{"summary":"Generated wiki.","warnings":[]}}',
 			];
-			const trace: AgentTraceEvent[] = [];
+			const trace: Array<{ event: AgentTraceEvent; stage: string; moduleId?: string }> = [];
 			const service = new WikiInitializationService(vscode.Uri.file(extensionRoot));
 			const result = await service.initialize({
 				root: workspaceFolder(repositoryRoot),
 				config: { provider: 'openai', baseUrl: 'https://example.test', model: 'wiki-test', apiKey: 'secret' },
 				client: { completeJson: async () => responses.shift() ?? '' },
-				onTrace: (event) => trace.push(event),
+				onTrace: (event, context) => trace.push({ event, stage: context.stage, moduleId: context.moduleId }),
 			});
 
 			assert.strictEqual(result.summary, 'Generated wiki.');
 			const agents = fs.readFileSync(path.join(repositoryRoot, 'AGENTS.md'), 'utf8');
 			assert.ok(agents.includes(agentsGuidanceStartMarker));
 			assert.ok(agents.includes('.agents/skills/llm-code-wiki'));
-			assert.ok(trace.some((event) => event.kind === 'llm_request'));
-			assert.ok(trace.some((event) => event.kind === 'tool_result' && event.summary.includes('write_wiki_file')));
-			assert.ok(trace.some((event) => event.kind === 'run_complete'));
+			assert.ok(trace.some(({ event, stage }) => stage === 'plan' && event.kind === 'run_complete'));
+			assert.ok(trace.some(({ event, stage, moduleId }) => stage === 'module' && moduleId === 'core' && event.kind === 'run_complete'));
+			assert.ok(trace.some(({ event, stage }) => stage === 'integration' && event.kind === 'tool_result' && event.summary.includes('write_wiki_file')));
+			assert.ok(trace.some(({ event, stage }) => stage === 'integration' && event.kind === 'run_complete'));
 		} finally {
 			fs.rmSync(extensionRoot, { recursive: true, force: true });
 			fs.rmSync(repositoryRoot, { recursive: true, force: true });
+		}
+	});
+
+	test('runs Wiki Module Analysts with the configured per-project concurrency', async function (this: Mocha.Context) {
+		this.timeout(30000);
+		for (const [configured, expectedMaximum] of [[1, 1], [3, 3], [0, 4]] as const) {
+			const extensionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-extension-'));
+			const repositoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-wiki-concurrency-'));
+			try {
+				writeRepoFile(extensionRoot, 'llm-code-wiki/SKILL.md', '# Skill\n');
+				writeRepoFile(extensionRoot, 'llm-code-wiki/schema.md', '# Schema\n');
+				for (let index = 1; index <= 4; index += 1) {
+					writeRepoFile(repositoryRoot, `src/module-${index}/index.ts`, `export const module${index} = true;\n`);
+				}
+				const wiki = validWikiResponse();
+				let activeAnalysts = 0;
+				let maximumAnalysts = 0;
+				const client = {
+					completeJson: async (request: LlmJsonRequest): Promise<string> => {
+						const system = request.messages?.find((message) => message.role === 'system')?.content ?? '';
+						const user = request.messages?.find((message) => message.role === 'user')?.content ?? '';
+						if (system.includes('Planner Agent')) {
+							return JSON.stringify({
+								type: 'final',
+								result: {
+									summary: 'Four modules.',
+									modules: Array.from({ length: 4 }, (_, index) => ({
+										id: `module-${index + 1}`,
+										name: `Module ${index + 1}`,
+										sourceScopes: [`src/module-${index + 1}`],
+										sharedPaths: [],
+										goals: ['Analyze the module.'],
+									})),
+								},
+							});
+						}
+						if (system.includes('Module Analyst Agent')) {
+							const moduleId = /"id":"(module-\d+)"/.exec(user)?.[1];
+							assert.ok(moduleId);
+							activeAnalysts += 1;
+							maximumAnalysts = Math.max(maximumAnalysts, activeAnalysts);
+							await new Promise((resolve) => setTimeout(resolve, 20));
+							activeAnalysts -= 1;
+							return JSON.stringify({
+								type: 'final',
+								result: {
+									moduleId,
+									summary: `${moduleId} analysis.`,
+									responsibilities: ['Owns its module.'],
+									entryPoints: [`src/${moduleId}/index.ts`],
+									interfaces: [],
+									workflows: [],
+									dependencies: [],
+									decisions: [],
+									evidencePaths: [`src/${moduleId}/index.ts`],
+									openQuestions: [],
+								},
+							});
+						}
+						if (system.includes('Wiki Integration Agent')) {
+							if (request.messages?.some((message) => message.content.includes('"type":"tool_results"'))) {
+								return '{"type":"final","result":{"summary":"Integrated wiki.","warnings":[]}}';
+							}
+							return JSON.stringify({
+								type: 'tool_calls',
+								calls: [
+									...wiki.files.map((file, index) => ({
+										id: `write-${index}`,
+										name: 'write_wiki_file',
+										arguments: file,
+									})),
+									{
+										id: 'write-agents',
+										name: 'write_agents_guidance',
+										arguments: { content: 'Read `.agents/skills/llm-code-wiki` before repository work.' },
+									},
+								],
+							});
+						}
+						throw new Error('Unexpected Wiki Agent request.');
+					},
+				};
+				await new WikiInitializationService(vscode.Uri.file(extensionRoot)).initialize({
+					root: workspaceFolder(repositoryRoot),
+					config: { provider: 'openai', baseUrl: 'https://example.test', model: 'wiki-test', apiKey: 'secret' },
+					client,
+					concurrency: configured,
+				});
+				assert.strictEqual(maximumAnalysts, expectedMaximum, `concurrency ${configured}`);
+			} finally {
+				fs.rmSync(extensionRoot, { recursive: true, force: true });
+				fs.rmSync(repositoryRoot, { recursive: true, force: true });
+			}
+		}
+	});
+
+	test('continues a failed Wiki pipeline without repeating its plan or completed modules', async function (this: Mocha.Context) {
+		this.timeout(30000);
+		const extensionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-extension-'));
+		const repositoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-wiki-resume-'));
+		const storageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-wiki-storage-'));
+		try {
+			writeRepoFile(extensionRoot, 'llm-code-wiki/SKILL.md', '# Skill\n');
+			writeRepoFile(extensionRoot, 'llm-code-wiki/schema.md', '# Schema\n');
+			writeRepoFile(repositoryRoot, 'src/first/index.ts', 'export const first = true;\n');
+			writeRepoFile(repositoryRoot, 'src/second/index.ts', 'export const second = true;\n');
+			const wiki = validWikiResponse();
+			let plannerCalls = 0;
+			const firstModuleCalls = new Map<string, number>();
+			const firstClient = {
+				completeJson: async (request: LlmJsonRequest): Promise<string> => {
+					const system = request.messages?.find((message) => message.role === 'system')?.content ?? '';
+					const user = request.messages?.find((message) => message.role === 'user')?.content ?? '';
+					if (system.includes('Planner Agent')) {
+						plannerCalls += 1;
+						return JSON.stringify({
+							type: 'final',
+							result: {
+								summary: 'Two modules.',
+								modules: [
+									{ id: 'first', name: 'First', sourceScopes: ['src/first'], sharedPaths: [], goals: ['Analyze first.'] },
+									{ id: 'second', name: 'Second', sourceScopes: ['src/second'], sharedPaths: [], goals: ['Analyze second.'] },
+								],
+							},
+						});
+					}
+					if (system.includes('Module Analyst Agent')) {
+						const moduleId = /"id":"(first|second)"/.exec(user)?.[1];
+						assert.ok(moduleId);
+						firstModuleCalls.set(moduleId, (firstModuleCalls.get(moduleId) ?? 0) + 1);
+						if (moduleId === 'second') {
+							throw new Error('Temporary second-module failure.');
+						}
+						return JSON.stringify({
+							type: 'final',
+							result: {
+								moduleId,
+								summary: 'First module.',
+								responsibilities: [],
+								entryPoints: ['src/first/index.ts'],
+								interfaces: [],
+								workflows: [],
+								dependencies: [],
+								decisions: [],
+								evidencePaths: ['src/first/index.ts'],
+								openQuestions: [],
+							},
+						});
+					}
+					throw new Error('Integration must not start after an Analyst failure.');
+				},
+			};
+			const firstService = new WikiInitializationService(vscode.Uri.file(extensionRoot), vscode.Uri.file(storageRoot));
+			await assert.rejects(() => firstService.initialize({
+				root: workspaceFolder(repositoryRoot),
+				config: { provider: 'openai', baseUrl: 'https://example.test', model: 'wiki-test', apiKey: 'secret' },
+				client: firstClient,
+				concurrency: 1,
+			}), /Temporary second-module failure/);
+			assert.strictEqual(await firstService.hasPipelineCheckpoint(vscode.Uri.file(repositoryRoot), 'initialize'), true);
+			assert.strictEqual(plannerCalls, 1);
+			assert.deepStrictEqual(Object.fromEntries(firstModuleCalls), { first: 1, second: 1 });
+
+			let resumedPlannerCalls = 0;
+			const resumedModules: string[] = [];
+			const resumedClient = {
+				completeJson: async (request: LlmJsonRequest): Promise<string> => {
+					const system = request.messages?.find((message) => message.role === 'system')?.content ?? '';
+					const user = request.messages?.find((message) => message.role === 'user')?.content ?? '';
+					if (system.includes('Planner Agent')) {
+						resumedPlannerCalls += 1;
+						throw new Error('Planner was repeated.');
+					}
+					if (system.includes('Module Analyst Agent')) {
+						const moduleId = /"id":"(first|second)"/.exec(user)?.[1];
+						assert.ok(moduleId);
+						resumedModules.push(moduleId);
+						return JSON.stringify({
+							type: 'final',
+							result: {
+								moduleId,
+								summary: 'Second module.',
+								responsibilities: [],
+								entryPoints: ['src/second/index.ts'],
+								interfaces: [],
+								workflows: [],
+								dependencies: [],
+								decisions: [],
+								evidencePaths: ['src/second/index.ts'],
+								openQuestions: [],
+							},
+						});
+					}
+					if (system.includes('Wiki Integration Agent')) {
+						if (request.messages?.some((message) => message.content.includes('"type":"tool_results"'))) {
+							return '{"type":"final","result":{"summary":"Resumed integration.","warnings":[]}}';
+						}
+						return JSON.stringify({
+							type: 'tool_calls',
+							calls: [
+								...wiki.files.map((file, index) => ({
+									id: `resume-write-${index}`,
+									name: 'write_wiki_file',
+									arguments: file,
+								})),
+								{
+									id: 'resume-agents',
+									name: 'write_agents_guidance',
+									arguments: { content: 'Read `.agents/skills/llm-code-wiki` before repository work.' },
+								},
+							],
+						});
+					}
+					throw new Error('Unexpected resumed Wiki Agent request.');
+				},
+			};
+			const resumedService = new WikiInitializationService(vscode.Uri.file(extensionRoot), vscode.Uri.file(storageRoot));
+			const result = await resumedService.initialize({
+				root: workspaceFolder(repositoryRoot),
+				config: { provider: 'openai', baseUrl: 'https://example.test', model: 'wiki-test', apiKey: 'secret' },
+				client: resumedClient,
+				concurrency: 1,
+			});
+			assert.strictEqual(result.summary, 'Resumed integration.');
+			assert.strictEqual(resumedPlannerCalls, 0);
+			assert.deepStrictEqual(resumedModules, ['second']);
+			assert.strictEqual(await resumedService.hasPipelineCheckpoint(vscode.Uri.file(repositoryRoot)), false);
+		} finally {
+			fs.rmSync(extensionRoot, { recursive: true, force: true });
+			fs.rmSync(repositoryRoot, { recursive: true, force: true });
+			fs.rmSync(storageRoot, { recursive: true, force: true });
 		}
 	});
 
@@ -3101,6 +3364,43 @@ suite('Agent runtime', () => {
 			await assert.rejects(() => list.execute({ path: 'src/app.go' }, undefined), /is a file.*read_workspace_file/);
 			await assert.rejects(() => list.execute({ path: 'missing' }, undefined), /does not exist or cannot be accessed/);
 			await assert.rejects(() => list.execute({ path: '../outside' }, undefined), /Invalid relative path/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test('limits Module Analyst source tools to assigned paths', async function (this: Mocha.Context) {
+		this.timeout(10000);
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-agent-scope-'));
+		try {
+			writeRepoFile(root, 'src/orders/service.ts', 'export const orderMarker = true;\n');
+			writeRepoFile(root, 'src/users/service.ts', 'export const userMarker = true;\n');
+			writeRepoFile(root, 'package.json', '{"name":"scoped"}\n');
+			const tools = createReadOnlyAgentTools({
+				root: workspaceFolder(root),
+				allowedWorkspacePaths: ['src/orders', 'package.json'],
+			});
+			const listFiles = tools.find((tool) => tool.name === 'list_workspace_files');
+			const listDirectory = tools.find((tool) => tool.name === 'list_workspace_directory');
+			const read = tools.find((tool) => tool.name === 'read_workspace_file');
+			const search = tools.find((tool) => tool.name === 'search_workspace');
+			assert.ok(listFiles);
+			assert.ok(listDirectory);
+			assert.ok(read);
+			assert.ok(search);
+
+			const files = await listFiles.execute({}, undefined) as { files: string[] };
+			assert.deepStrictEqual(files.files, ['package.json', 'src/orders/service.ts']);
+			const rootListing = await listDirectory.execute({ path: '.' }, undefined) as { entries: Array<{ path: string }> };
+			assert.deepStrictEqual(rootListing.entries.map((entry) => entry.path), ['src', 'package.json']);
+			const srcListing = await listDirectory.execute({ path: 'src' }, undefined) as { entries: Array<{ path: string }> };
+			assert.deepStrictEqual(srcListing.entries.map((entry) => entry.path), ['src/orders']);
+			await assert.rejects(() => read.execute({ path: 'src/users/service.ts' }, undefined), /outside the assigned module scope/);
+			await assert.rejects(() => listDirectory.execute({ path: 'src/users' }, undefined), /outside the assigned module scope/);
+			const matches = await search.execute({ query: 'Marker', mode: 'literal', limit: 20 }, undefined) as {
+				matches: Array<{ path: string }>;
+			};
+			assert.deepStrictEqual(matches.matches.map((match) => match.path), ['src/orders/service.ts']);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

@@ -123,7 +123,7 @@ export interface LlmWikiRunLogEntry {
 	sequence: number;
 	timestamp: string;
 	source?: 'wiki' | 'review';
-	stage?: 'knowledge' | 'plan' | 'file' | 'integration';
+	stage?: 'knowledge' | 'plan' | 'file' | 'module' | 'integration';
 	fileUri?: string;
 	relativePath?: string;
 	fileIndex?: number;
@@ -168,7 +168,9 @@ export interface LlmWikiDashboardState {
 	pendingSourceCount: number;
 	wikiNeedsUpdate: boolean;
 	wikiInitializationAvailable?: boolean;
+	wikiInitializationContinuation?: boolean;
 	wikiUpdateAvailable?: boolean;
+	wikiUpdateContinuation?: boolean;
 	wikiOpenAvailable?: boolean;
 	findings: ReviewDashboardFinding[];
 	jsonOutputEnabled: boolean;
@@ -2033,7 +2035,8 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const initialized = wiki.status === 'initialized';
 			const initializeLabel = wiki.status === 'paused'
 				? 'Resume Wiki Initialization'
-				: wiki.status === 'failed' ? 'Retry Wiki Initialization' : 'Initialize LLM Code Wiki';
+				: wiki.wikiInitializationContinuation ? 'Continue Wiki Initialization'
+					: wiki.status === 'failed' ? 'Retry Wiki Initialization' : 'Initialize LLM Code Wiki';
 			const initializationAvailable = wiki.wikiInitializationAvailable ?? !initialized;
 			const updateAvailable = wiki.wikiUpdateAvailable ?? wiki.wikiNeedsUpdate;
 			const openAvailable = wiki.wikiOpenAvailable ?? initialized;
@@ -2042,7 +2045,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					: !wiki.configured ? 'Configure LLM first'
 						: !wiki.workspaceAvailable ? 'Open a workspace folder'
 							: 'Wiki already initialized');
-			setMenuAction('updateWiki', 'Update LLM Code Wiki',
+			setMenuAction('updateWiki', wiki.wikiUpdateContinuation ? 'Continue Wiki Update' : 'Update LLM Code Wiki',
 				running || !wiki.configured || !wiki.workspaceAvailable || !updateAvailable,
 				running ? 'Agent is running'
 					: !wiki.configured ? 'Configure LLM first'
@@ -2713,7 +2716,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			title.textContent = group.relativePath || 'File';
 			const meta = document.createElement('span');
 			meta.className = 'wiki-run-meta';
-			const position = group.fileIndex && group.fileCount ? 'file ' + group.fileIndex + '/' + group.fileCount + ' | ' : '';
+			const moduleGroup = group.items.some((item) => item.stage === 'module');
+			const position = group.fileIndex && group.fileCount
+				? (moduleGroup ? 'module ' : 'file ') + group.fileIndex + '/' + group.fileCount + ' | '
+				: '';
 			meta.textContent = position + runLogCountsMeta(group.items) + runLogRecoveryMeta(statusValue);
 			main.append(title, meta);
 			const status = document.createElement('span');

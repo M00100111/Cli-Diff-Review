@@ -15,7 +15,9 @@ export interface AgentToolOptions {
 	maxReadChars?: number;
 	reviewSession?: ReviewSession;
 	includeWikiTools?: boolean;
+	allowedWorkspacePaths?: string[];
 	onAgentsGuidanceWritten?: () => void;
+	onWikiMutation?: () => void | Promise<void>;
 }
 
 const protectedWikiFiles = new Set(['schema.md', 'SKILL.md', '.state.json']);
@@ -128,6 +130,7 @@ export function createWikiAgentTools(options: AgentToolOptions): AgentTool[] {
 			throwIfAborted(signal);
 			await vscode.workspace.fs.writeFile(uri, encodeUtf8(content));
 			options.generatedFiles?.add(relativePath);
+			await options.onWikiMutation?.();
 			return { path: relativePath, chars: content.length };
 		}),
 		tool('delete_generated_wiki_file', `Delete one previously generated Markdown file under ${wikiReferencesPath}. Arguments: {"path":"modules/old.md"}.`, objectSchema({ path: stringSchema('Generated Markdown path relative to the Wiki references directory.') }), async (args, signal) => {
@@ -145,6 +148,7 @@ export function createWikiAgentTools(options: AgentToolOptions): AgentTool[] {
 				// Deleting an already absent generated file is idempotent.
 			}
 			options.generatedFiles.delete(relativePath);
+			await options.onWikiMutation?.();
 			return { path: relativePath, deleted: true };
 		}),
 		tool('append_wiki_log', `Append a short Markdown entry to ${wikiReferencesPath}/log.md. Arguments: {"content":"## Entry..."}.`, objectSchema({ content: stringSchema('Short Markdown log entry.') }), async (args, signal) => {
@@ -159,6 +163,7 @@ export function createWikiAgentTools(options: AgentToolOptions): AgentTool[] {
 			const content = stringArgument(args, 'content');
 			await vscode.workspace.fs.writeFile(uri, encodeUtf8(`${existing.trimEnd()}\n\n${content.trim()}\n`));
 			options.generatedFiles?.add('log.md');
+			await options.onWikiMutation?.();
 			return { path: 'log.md', appendedChars: content.length };
 		}),
 		tool('write_agents_guidance', 'Create or refresh the Cli Diff Review managed block in the repository root AGENTS.md. Arguments: {"content":"# Project guide..."}; this tool cannot write any other file.', objectSchema({
@@ -168,6 +173,7 @@ export function createWikiAgentTools(options: AgentToolOptions): AgentTool[] {
 			const content = stringArgument(args, 'content');
 			await writeManagedAgentsGuidance(options.root.uri, content);
 			options.onAgentsGuidanceWritten?.();
+			await options.onWikiMutation?.();
 			return { path: 'AGENTS.md', chars: content.length };
 		}),
 	];
@@ -186,13 +192,17 @@ async function listWorkspaceFiles(options: AgentToolOptions, signal?: AbortSigna
 	for (const uri of uris) {
 		throwIfAborted(signal);
 		const candidate = paths.get(uri.toString());
-		if (!candidate || isGeneratedAgentsGuidancePath(candidate) || ignored.has(candidate) || candidate.split('/').some((segment) => segment.startsWith('.'))) {
+		if (!candidate
+			|| isGeneratedAgentsGuidancePath(candidate)
+			|| ignored.has(candidate)
+			|| candidate.split('/').some((segment) => segment.startsWith('.'))
+			|| !workspacePathAllowed(options, candidate)) {
 			continue;
 		}
 		files.push(candidate);
 	}
 	for (const file of reviewSnapshotFiles(options)) {
-		if (!files.includes(file.relativePath)) {
+		if (workspacePathAllowed(options, file.relativePath) && !files.includes(file.relativePath)) {
 			files.push(file.relativePath);
 		}
 	}
@@ -206,6 +216,9 @@ async function listWorkspaceDirectory(
 ): Promise<{ path: string; entries: WorkspaceDirectoryEntry[] }> {
 	throwIfAborted(signal);
 	const normalized = normalizeSafeDirectoryPath(candidate);
+	if (!workspaceDirectoryAllowed(options, normalized)) {
+		throw new Error(`Workspace directory "${normalized || '.'}" is outside the assigned module scope.`);
+	}
 	const uri = normalized ? containedUri(options.root.uri, normalized) : options.root.uri;
 	const displayPath = normalized || '.';
 	const stat = await statWorkspacePath(uri, displayPath, 'directory');
@@ -226,7 +239,11 @@ async function listWorkspaceDirectory(
 		}));
 	const ignored = await gitIgnoredReviewPaths(options.root, candidates.map((entry) => entry.path));
 	const entries = candidates
-		.filter((entry) => !ignored.has(entry.path) && !isGeneratedAgentsGuidancePath(entry.path))
+		.filter((entry) => (
+			!ignored.has(entry.path)
+			&& !isGeneratedAgentsGuidancePath(entry.path)
+			&& workspaceDirectoryAllowed(options, entry.path)
+		))
 		.flatMap((entry): WorkspaceDirectoryEntry[] => {
 			if ((entry.type & vscode.FileType.Directory) !== 0) {
 				return [{ name: entry.name, path: entry.path, type: 'directory' }];
@@ -281,6 +298,9 @@ async function readWorkspaceFile(
 	if (normalized.split('/').some((segment) => segment.startsWith('.'))) {
 		throw new Error('Source tools cannot read dot-path files.');
 	}
+	if (!workspacePathAllowed(options, normalized)) {
+		throw new Error(`Workspace file "${normalized}" is outside the assigned module scope.`);
+	}
 	const reviewFile = reviewSnapshotFiles(options).find((file) => file.relativePath === normalized);
 	if (reviewFile) {
 		const text = reviewFile.currentExists ? reviewFile.newText : reviewFile.oldText;
@@ -306,6 +326,37 @@ async function readWorkspaceFile(
 		currentExists: true,
 		contentSource: 'workspace',
 	};
+}
+
+function workspacePathAllowed(options: AgentToolOptions, candidate: string): boolean {
+	const scopes = normalizedWorkspaceScopes(options.allowedWorkspacePaths);
+	if (!scopes) {
+		return true;
+	}
+	const normalized = normalizeReviewPath(candidate);
+	return scopes.some((scope) => scope === '.' || normalized === scope || normalized.startsWith(`${scope}/`));
+}
+
+function workspaceDirectoryAllowed(options: AgentToolOptions, candidate: string): boolean {
+	const scopes = normalizedWorkspaceScopes(options.allowedWorkspacePaths);
+	if (!scopes) {
+		return true;
+	}
+	const normalized = normalizeReviewPath(candidate) || '.';
+	return scopes.some((scope) => (
+		scope === '.'
+		|| normalized === '.'
+		|| normalized === scope
+		|| normalized.startsWith(`${scope}/`)
+		|| scope.startsWith(`${normalized}/`)
+	));
+}
+
+function normalizedWorkspaceScopes(value: string[] | undefined): string[] | undefined {
+	if (!value) {
+		return undefined;
+	}
+	return [...new Set(value.map((scope) => normalizeReviewPath(scope) || '.'))];
 }
 
 async function readTextFile(options: AgentToolOptions, uri: vscode.Uri, signal?: AbortSignal): Promise<{ path: string; content: string; truncated: boolean }> {
