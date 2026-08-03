@@ -373,7 +373,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			return;
 		}
 		if (message.type === 'openExtensionSettings') {
-			await this.executeCommand('workbench.action.openSettings', '@ext:local.cli-diff-review');
+			await this.executeCommand('workbench.action.openSettings', '@ext:M00100111.cli-diff-review');
 			this.postState();
 			return;
 		}
@@ -2924,7 +2924,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					llmThinkingMode.value = 'high';
 					llmStrictTools.checked = true;
 				} else if (glm) {
-					llmBaseUrl.value = 'https://open.bigmodel.cn/api/paas/v4';
+					llmBaseUrl.value = 'https://open.bigmodel.cn/api/coding/paas/v4';
 					llmModel.value = 'glm-5.2';
 					llmJsonOutput.checked = true;
 					llmThinkingMode.value = 'high';

@@ -26,6 +26,17 @@ Cli Diff Review 将代码生成与代码审阅分离，通过 Git 汇总 Agent �
 
 这种方式不要求 Coding Agent 主动接入插件。只要 Agent 修改了 Git 工作区，Cli Diff Review 就能补充类似 Cursor 和 GitHub Copilot 的后置 Review 体验。
 
+**交互说明**
+![image-20260803194527802](README.assets/image-20260803194527802.png)
+
+**支持多项目变更检测**
+
+![image-20260803192648529](README.assets/image-20260803192648529.png)
+
+**支持代码段/文件级/项目级review操作(接受/拒绝/撤销)**
+
+![image-20260803195316558](README.assets/image-20260803195316558.png)
+
 ### 在本地审阅 Pull Request
 
 远程代码仓库提供的 Pull Request Review 通常围绕局部 Diff 展开。面对复杂变更时，很难浏览完整文件、跳转代码定义和引用，AI 生成的修改建议也难以直接应用到本地代码。
@@ -33,6 +44,11 @@ Cli Diff Review 将代码生成与代码审阅分离，通过 Git 汇总 Agent �
 Cli Diff Review 可以将分支之间的代码差异提取到当前工作区，复用已有的代码变更检测和审阅能力，无需切换或合并待审分支。
 
 这使 Pull Request 的代码审校可以在完整的本地开发环境中进行，不再受远程代码仓库局部 Diff 交互的限制。
+![image-20260803203050359](README.assets/image-20260803203050359.png)
+
+![image-20260803203351042](README.assets/image-20260803203351042.png)
+
+
 
 ## LLM Code Wiki
 
@@ -103,6 +119,12 @@ LLM Code Wiki 的优势是轻量、透明和可版本管理，适合保存 Codin
 
 两者关注的问题不同，也可以在更复杂的场景中配合使用。
 
+![image-20260803214840864](README.assets/image-20260803214840864.png)
+
+![image-20260803220059481](README.assets/image-20260803220059481.png)
+
+
+
 ## AI Review
 
 Cli Diff Review 可以基于当前工作区变更或分支差异运行 AI Code Review。
@@ -141,3 +163,7 @@ AI Review 支持：
 ```
 
 支持 OpenAI、Anthropic，并针对 DeepSeek 和 GLM 模型服务进行了专门适配。
+
+![image-20260803201424106](README.assets/image-20260803201424106.png)
+
+![image-20260803201627136](README.assets/image-20260803201627136.png)

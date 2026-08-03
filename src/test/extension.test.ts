@@ -1733,7 +1733,7 @@ suite('Review state', () => {
 		assert.ok(view.webview.html.includes('.review-chunk.has-findings'));
 		assert.ok(view.webview.html.includes('.review-chunk.has-suggestion'));
 		assert.ok(view.webview.html.includes('function renderReviewChunkSuggestion'));
-		assert.ok(view.webview.html.includes('https://open.bigmodel.cn/api/paas/v4'));
+		assert.ok(view.webview.html.includes('https://open.bigmodel.cn/api/coding/paas/v4'));
 		assert.ok(view.webview.html.includes('glm-5.2'));
 		assert.ok(view.webview.html.includes("['xhigh', 'XHigh']"));
 		assert.ok(view.webview.html.includes('review-suggestion-action'));
@@ -1844,7 +1844,7 @@ suite('Review state', () => {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.openWikiIndex' && call.args.length === 0));
 		assert.ok(commands.some((call) => call.command === 'workbench.action.openSettings'
-			&& call.args[0] === '@ext:local.cli-diff-review'));
+			&& call.args[0] === '@ext:M00100111.cli-diff-review'));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.closeReviewEditors' && call.args.length === 0));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.selectTrackingTarget'));
 		assert.ok(commands.some((call) => call.command === 'cli-diff.selectTrackingTarget'
@@ -2117,7 +2117,7 @@ suite('LLM Code Wiki', () => {
 		assert.ok(initializer.includes('record unresolved uncertainty in open-questions.md'));
 	});
 
-	test('passes Agent trace events through Wiki initialization', async function (this: Mocha.Context) {
+	test('normalizes optional Planner and structured Analyst fields during Wiki initialization', async function (this: Mocha.Context) {
 		this.timeout(30000);
 		const extensionRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-extension-'));
 		const repositoryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cli-diff-wiki-init-'));
@@ -2135,7 +2135,6 @@ suite('LLM Code Wiki', () => {
 							id: 'core',
 							name: 'Core',
 							sourceScopes: ['src'],
-							sharedPaths: [],
 							goals: ['Understand the core module.'],
 						}],
 					},
@@ -2145,14 +2144,14 @@ suite('LLM Code Wiki', () => {
 					result: {
 						moduleId: 'core',
 						summary: 'Core application module.',
-						responsibilities: ['Owns the application entry point.'],
-						entryPoints: ['src/app.ts'],
-						interfaces: [],
-						workflows: [],
-						dependencies: [],
-						decisions: [],
+						responsibilities: [{ name: 'Application ownership', detail: 'Owns the application entry point.' }],
+						entryPoints: [{ name: 'Application entry point', path: 'src/app.ts' }],
+						interfaces: [{ name: 'Exported value', detail: 'Exports the application value.' }],
+						workflows: [{ name: 'Startup', steps: ['Load src/app.ts.'] }],
+						dependencies: [{ name: 'Runtime', detail: 'Uses the JavaScript runtime.' }],
+						decisions: [{ name: 'Module shape', detail: 'Keeps the example compact.' }],
 						evidencePaths: ['src/app.ts'],
-						openQuestions: [],
+						openQuestions: [{ question: 'Future behavior', detail: 'No additional behavior is documented.' }],
 					},
 				}),
 				JSON.stringify({

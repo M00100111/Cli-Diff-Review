@@ -606,6 +606,7 @@ function plannerSystemPrompt(operation: WikiPipelineOperation): string {
 		`You are the Planner Agent for a Wiki ${operation} pipeline.`,
 		'Inspect the repository with read-only tools and divide the work into coherent architectural or business modules, never one module per file.',
 		'Use repository-relative files or directory prefixes in sourceScopes and sharedPaths. Do not use globs, absolute paths, dot paths, or parent traversal.',
+		'Every module must include sharedPaths. Use an empty array when there are no shared paths.',
 		'Every changed path in an update must be covered by at least one module sourceScopes or sharedPaths entry.',
 		'Return {"type":"final","result":{"summary":"...","modules":[{"id":"stable-id","name":"Module","sourceScopes":["src/module"],"sharedPaths":["package.json"],"goals":["..."]}]}}.',
 	].join('\n');
@@ -625,6 +626,7 @@ function moduleAnalystSystemPrompt(): string {
 		'You are a read-only Module Analyst Agent in a repository Wiki pipeline.',
 		'Analyze only the assigned source scopes and shared paths. Wiki pages may be read for context but never modified.',
 		'Ground every durable claim in repository-relative evidence paths and record uncertainty rather than guessing.',
+		'Every list field must contain plain strings only. Do not return objects inside responsibilities, entryPoints, interfaces, workflows, dependencies, decisions, evidencePaths, or openQuestions.',
 		'Return {"type":"final","result":{"moduleId":"...","summary":"...","responsibilities":[],"entryPoints":[],"interfaces":[],"workflows":[],"dependencies":[],"decisions":[],"evidencePaths":[],"openQuestions":[]}}.',
 	].join('\n');
 }
@@ -689,7 +691,11 @@ function validateWikiModulePlan(value: Record<string, unknown>, diff?: SourceFin
 		}
 		ids.add(candidate.id);
 		const sourceScopes = sourcePathArray(candidate.sourceScopes, 'sourceScopes');
-		const sharedPaths = sourcePathArray(candidate.sharedPaths, 'sharedPaths', true);
+		const sharedPaths = sourcePathArray(
+			candidate.sharedPaths === undefined ? [] : candidate.sharedPaths,
+			'sharedPaths',
+			true,
+		);
 		const goals = stringArray(candidate.goals, 'goals');
 		if (sourceScopes.length === 0) {
 			throw new Error(`Wiki module ${candidate.id} has no source scope.`);
@@ -726,15 +732,33 @@ function validateWikiModuleAnalysis(value: Record<string, unknown>, module: Wiki
 	return {
 		moduleId: module.id,
 		summary: value.summary.trim(),
-		responsibilities: stringArray(value.responsibilities, 'responsibilities'),
-		entryPoints: stringArray(value.entryPoints, 'entryPoints'),
-		interfaces: stringArray(value.interfaces, 'interfaces'),
-		workflows: stringArray(value.workflows, 'workflows'),
-		dependencies: stringArray(value.dependencies, 'dependencies'),
-		decisions: stringArray(value.decisions, 'decisions'),
+		responsibilities: analysisTextArray(value.responsibilities, 'responsibilities'),
+		entryPoints: analysisTextArray(value.entryPoints, 'entryPoints'),
+		interfaces: analysisTextArray(value.interfaces, 'interfaces'),
+		workflows: analysisTextArray(value.workflows, 'workflows'),
+		dependencies: analysisTextArray(value.dependencies, 'dependencies'),
+		decisions: analysisTextArray(value.decisions, 'decisions'),
 		evidencePaths,
-		openQuestions: stringArray(value.openQuestions, 'openQuestions'),
+		openQuestions: analysisTextArray(value.openQuestions, 'openQuestions'),
 	};
+}
+
+function analysisTextArray(value: unknown, label: string): string[] {
+	if (value === undefined) {
+		return [];
+	}
+	if (!Array.isArray(value)) {
+		throw new Error(`${label} must be an array.`);
+	}
+	return value.map((item) => {
+		if (typeof item === 'string') {
+			return item.trim();
+		}
+		if (isJsonObject(item)) {
+			return JSON.stringify(item);
+		}
+		throw new Error(`${label} items must be strings or JSON objects.`);
+	}).filter(Boolean);
 }
 
 function sourcePathArray(value: unknown, label: string, allowEmpty = false): string[] {

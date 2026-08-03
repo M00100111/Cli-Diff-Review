@@ -1,15 +1,15 @@
 {
   "name": "cli-diff-review",
   "displayName": "Cli Diff Review",
-  "description": "Cli Diff Review brings lightweight code change review for CLI-assisted edits to VS Code.",
-  "version": "0.0.1",
+  "description": "Cli Diff Review brings lightweight code change review for Cli Coding Agents.",
+  "version": "0.0.2",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/M00100111/Cli-Diff-Review.git"
   },
   "icon": "resources/icon.png",
-  "publisher": "local",
+  "publisher": "M00100111",
   "engines": {
     "vscode": "^1.105.0"
   },
