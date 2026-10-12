@@ -889,18 +889,11 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 		}
 		.cli-old-line {
 			display: grid;
-			grid-template-columns: 24px 1fr;
+			grid-template-columns: minmax(0, 1fr);
 			min-height: var(--vscode-editor-line-height, 20px);
 			color: var(--old-code-fg);
 			white-space: pre;
 		}
-		.cli-marker {
-			text-align: center;
-			user-select: none;
-			opacity: 0.85;
-		}
-		.cli-hunk-zone.delete .cli-marker { color: var(--delete-line); }
-		.cli-hunk-zone.modify .cli-marker { color: var(--delete-line); }
 		.cli-old-code {
 			overflow: hidden;
 			text-overflow: clip;
@@ -1604,11 +1597,6 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 		function createOldLine(text, ranges = []) {
 			const row = document.createElement('div');
 			row.className = 'cli-old-line';
-
-			const marker = document.createElement('span');
-			marker.className = 'cli-marker';
-			marker.textContent = '-';
-			row.appendChild(marker);
 
 			const code = document.createElement('span');
 			code.className = 'cli-old-code';
