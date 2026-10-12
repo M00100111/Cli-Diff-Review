@@ -15,7 +15,6 @@ import { expectedRejectedFileHash, fileStateHash, GitReviewJournalStore } from '
 import { AnthropicClient, DeepSeekClient, GlmClient, LlmJsonRequest, OpenAiCompatibleClient } from '../llm/client';
 import { LlmConfigStore } from '../llm/config';
 import { parseStrictJsonObject } from '../llm/json';
-import { NativeReviewEditorManager } from '../nativeReviewEditor';
 import { buildReviewDashboardPayload, defaultLlmWikiDashboardState, ReviewDashboardProvider } from '../reviewDashboard';
 import { ReviewController } from '../reviewController';
 import { isDotReviewPath, shouldSkipReviewPath } from '../reviewFileFilter';
@@ -217,7 +216,7 @@ suite('Review webview compatibility', () => {
 	});
 
 	test('keeps Review Webview CSP and initialization failure handling compatible', () => {
-		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewWebview.ts'), 'utf8');
+		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewWebview.ts'), 'utf8').replace(/\r\n/g, '\n');
 		assert.ok(source.includes('font-src ${cspSource} data:;'));
 		assert.ok(source.includes("require(['vs/editor/editor.main']"));
 		assert.ok(source.includes('function registerVueLanguage()'));
@@ -374,7 +373,6 @@ suite('Extension configuration', () => {
 			'cliDiff.autoStartGitReview',
 			'cliDiff.refreshDebounceMs',
 			'cliDiff.reviewWikiChanges',
-			'cliDiff.reviewEditorMode',
 			'cliDiff.aiReviewStrategy',
 			'cliDiff.aiReviewMaxRounds',
 			'cliDiff.agentConcurrency',
@@ -382,7 +380,7 @@ suite('Extension configuration', () => {
 		];
 		const properties = manifest.contributes?.configuration?.properties ?? {};
 		assert.deepStrictEqual(Object.keys(properties), expected);
-		assert.deepStrictEqual(expected.map((key) => properties[key]?.order), [1, 2, 3, 4, 5, 6, 7, 8]);
+		assert.deepStrictEqual(expected.map((key) => properties[key]?.order), [1, 2, 3, 4, 5, 6, 7]);
 	});
 
 	test('declares one refresh debounce setting for background synchronization', () => {
@@ -515,21 +513,9 @@ suite('Extension configuration', () => {
 		);
 	});
 
-	test('declares review editor mode setting defaults', () => {
-		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
-			contributes?: { configuration?: { properties?: Record<string, unknown> } };
-		};
-		const setting = manifest.contributes?.configuration?.properties?.['cliDiff.reviewEditorMode'] as {
-			default?: unknown;
-			enum?: unknown[];
-			enumItemLabels?: unknown[];
-		} | undefined;
-
-		assert.ok(setting);
-		assert.strictEqual(setting.default, 'reviewPage');
-		assert.deepStrictEqual(setting.enum, ['nativeEditor', 'reviewPage']);
-		assert.deepStrictEqual(setting.enumItemLabels, ['Native inline diff editor', 'Review page']);
-
+	test('does not expose the retired review editor mode setting', () => {
+		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8'));
+		assert.strictEqual(manifest.contributes.configuration.properties['cliDiff.reviewEditorMode'], undefined);
 	});
 });
 
@@ -754,130 +740,73 @@ suite('Review controller bulk actions', () => {
 		assert.ok(wikiInitializer.includes('await this.savePipelineCheckpoint(options, checkpoint);'));
 		assert.ok(wikiInitializer.includes('options.onCheckpoint?.();'));
 	});
+});
 
-	test('wires review editor mode through native editor and review page presenters', () => {
-		const controllerSource = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
-		const nativeSource = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'nativeReviewEditor.ts'), 'utf8');
-		const closeMethod = controllerSource.match(/private closeReviewEditors\(\): void \{([\s\S]*?)\n\t\}/)?.[1];
-
-		assert.ok(controllerSource.includes("import { NativeReviewEditorManager"));
-		assert.ok(controllerSource.includes("this.registerCommand('cli-diff.closeReviewEditors', () => this.closeReviewEditors())"));
-		assert.strictEqual(closeMethod?.trim(), 'this.reviewWebview.closeAll();\n\t\tthis.nativeReviewEditor.clear();');
-		assert.ok(controllerSource.includes('firstReviewRevealPosition'));
-		assert.ok(controllerSource.includes("get<string>('reviewEditorMode', 'reviewPage')"));
-		assert.ok(controllerSource.includes("configured === 'nativeEditor' ? 'nativeEditor' : 'reviewPage'"));
-		assert.ok(controllerSource.includes("await this.openReviewPresentation(uri);"));
-		assert.ok(controllerSource.includes('const effectiveReveal = reveal ?? (file ? firstReviewRevealPosition(file) : undefined);'));
-		assert.ok(controllerSource.includes("await this.nativeReviewEditor.revealChunk(uri, effectiveReveal.hunkId)"));
-		assert.ok(controllerSource.includes("await this.reviewWebview.open(uri, effectiveReveal?.line !== undefined"));
-		assert.ok(controllerSource.includes('this.nativeReviewEditor.refresh(uri);'));
-		assert.ok(controllerSource.includes('private async syncNativeReviewAfterMutation(uri: vscode.Uri, reveal?: NativeReviewRevealPosition): Promise<void>'));
-		assert.ok(controllerSource.includes('await this.nativeReviewEditor.syncOpen(uri, reveal);'));
-		assert.ok(controllerSource.includes('await this.syncNativeReviewAfterMutation(target.file.uri, { line: target.hunk.newStart, column: 0 });'));
-		assert.ok(controllerSource.includes('await this.syncNativeReviewAfterMutation(file.uri);'));
-		assert.ok(controllerSource.includes('await this.syncNativeReviewAfterMutation(refreshedFile.uri);'));
-		assert.ok(controllerSource.includes('...this.nativeReviewEditor.closeCompleted(),'));
-		assert.ok(nativeSource.includes('registerTextDocumentContentProvider(NativeReviewEditorManager.beforeDocumentScheme'));
-		assert.ok(nativeSource.includes('registerTextDocumentContentProvider(NativeReviewEditorManager.afterDocumentScheme'));
-		assert.ok(nativeSource.includes("provideTextDocumentContent: (uri) => this.provideReviewDocumentContent(uri)"));
-		assert.ok(nativeSource.includes("'vscode.diff'"));
-		assert.ok(nativeSource.includes("this.reviewDocumentUri(file, 'before')"));
-		assert.ok(nativeSource.includes("this.reviewDocumentUri(file, 'after')"));
-		assert.ok(nativeSource.includes("return payload.side === 'after' ? file.newText : this.beforeText(file);"));
-		assert.ok(nativeSource.includes('public async syncOpen(uri: vscode.Uri, reveal?: NativeReviewRevealPosition): Promise<boolean>'));
-		assert.ok(nativeSource.includes('private readonly openFileKeys = new Set<string>();'));
-		assert.ok(nativeSource.includes('vscode.window.tabGroups.onDidChangeTabs'));
-		assert.ok(nativeSource.includes('if (tabs.length === 0 && !this.openFileKeys.has(key) && !this.isActiveReviewDocumentForFile(uri))'));
-		assert.ok(nativeSource.includes('vscode.window.tabGroups.close(tabs, true)'));
-		assert.ok(nativeSource.includes('private isActiveReviewDocumentForFile(fileUri: vscode.Uri): boolean'));
-		assert.ok(nativeSource.includes('this.refresh(uri);'));
-		assert.ok(nativeSource.includes('await this.reveal(file, reveal ?? firstReviewRevealPosition(file));'));
-		assert.ok(nativeSource.includes('this.openFileKeys.add(key);'));
-		assert.ok(nativeSource.includes('return true;'));
-		assert.ok(nativeSource.includes('query: encodeURIComponent(JSON.stringify({ uri: uri.toString(), side }))'));
-		assert.strictEqual(nativeSource.includes('side, revision'), false);
-		assert.ok(nativeSource.includes('private fileUriFromDiffInput(input: vscode.TabInputTextDiff): vscode.Uri | undefined'));
-		assert.ok(nativeSource.includes('private textDiffInput(tab: vscode.Tab): vscode.TabInputTextDiff | undefined'));
-		assert.ok(nativeSource.includes("'original' in input"));
-		assert.ok(nativeSource.includes("'modified' in input"));
-		assert.ok(nativeSource.includes('private isUriLike(value: unknown): value is vscode.Uri'));
-		assert.strictEqual(nativeSource.includes('nativeDiffInline'), false);
-		assert.strictEqual(nativeSource.includes('ensureInlineDiffMode'), false);
-		assert.strictEqual(nativeSource.includes('renderSideBySide'), false);
-		assert.strictEqual(nativeSource.includes('registerCodeLensProvider'), false);
-		assert.strictEqual(nativeSource.includes('provideReviewCodeLenses'), false);
-		assert.strictEqual(nativeSource.includes("diffConfig.update('codeLens'"), false);
-		assert.ok(nativeSource.includes("vscode.commands.executeCommand('revealLine'"));
-		assert.ok(nativeSource.includes('input instanceof vscode.TabInputTextDiff'));
-		assert.ok(nativeSource.includes('closeCompleted(): vscode.Uri[]'));
-		assert.strictEqual(nativeSource.includes('createTextEditorDecorationType'), false);
-		assert.strictEqual(nativeSource.includes('registerInlineCompletionItemProvider'), false);
-		assert.strictEqual(nativeSource.includes('provideInlineCompletionItems('), false);
-		assert.strictEqual(nativeSource.includes("editor.action.inlineSuggest.trigger"), false);
-		assert.strictEqual(nativeSource.includes('new vscode.InlineCompletionItem'), false);
-		assert.strictEqual(nativeSource.includes('gutterIconPath'), false);
-		assert.strictEqual(nativeSource.includes('oldCodeBlockDecoration'), false);
-		assert.strictEqual(nativeSource.includes('oldCodeBlockText'), false);
-		assert.strictEqual(nativeSource.includes('display: block'), false);
-		assert.strictEqual(nativeSource.includes('white-space: pre'), false);
-		assert.strictEqual(nativeSource.includes('editor.findMatchHighlightBackground'), false);
-		assert.strictEqual(nativeSource.includes("borderWidth: '0 0 0 2px'"), false);
-		assert.strictEqual(nativeSource.includes("borderWidth: '1px 0 1px 2px'"), false);
-	});
-
-	test('keeps native diff document URIs stable across review revisions', () => {
-		const manager = Object.create(NativeReviewEditorManager.prototype) as {
-			reviewDocumentUriForFileUri(uri: vscode.Uri, side: 'before' | 'after'): vscode.Uri;
-			reviewDocumentPayload(uri: vscode.Uri): { fileUri: vscode.Uri; side: 'before' | 'after' } | undefined;
-		};
-		const fileUri = vscode.Uri.file('D:/repo/src/app.ts');
-		const before = manager.reviewDocumentUriForFileUri(fileUri, 'before');
-		const after = manager.reviewDocumentUriForFileUri(fileUri, 'after');
-		const afterAgain = manager.reviewDocumentUriForFileUri(fileUri, 'after');
-
-		assert.strictEqual(after.toString(), afterAgain.toString());
-		assert.strictEqual(decodeURIComponent(after.query).includes('revision'), false);
-		assert.strictEqual(manager.reviewDocumentPayload(before)?.fileUri.toString(), fileUri.toString());
-		assert.strictEqual(manager.reviewDocumentPayload(after)?.side, 'after');
-	});
-
-	test('hides accepted chunks from the native diff without adding review CodeLens actions', () => {
+suite('Review page presentation', () => {
+	test('opens review pages with default and explicit positions without consulting legacy mode', async () => {
 		const uri = vscode.Uri.file('/repo/src/app.ts');
-		const oldText = 'old\nkeep\n';
-		const newText = 'new\nkeep\npending\n';
-		const [accepted, pending] = computeLineDiff(uri.toString(), oldText, newText);
-		const file = reviewFileState(uri, 'src/app.ts', {
-			oldText,
-			newText,
-			hunks: [pending],
-			acceptedHunks: [reviewedHunkFrom(accepted, 'accept')],
-			revision: 7,
+		const hunks = computeLineDiff(uri.toString(), 'keep\nold\n', 'keep\nnew\n');
+		const file = reviewFileState(uri, 'src/app.ts', { hunks });
+		const opened: unknown[] = [];
+		const activated: string[] = [];
+		const controller = Object.create(ReviewController.prototype) as any;
+		Object.assign(controller, {
+			activeSession: { files: new Map([[uri.toString(), file]]) },
+			reviewEditorMode: () => { throw new Error('Retired mode must not be read'); },
+			reviewWebview: { open: async (target: vscode.Uri, position: unknown) => opened.push([target.toString(), position]) },
+			setCurrentReviewUri: (target: vscode.Uri) => activated.push(target.toString()),
 		});
-		const session: ReviewSession = {
-			id: 'native-accepted-baseline', mode: 'git', rootUri: vscode.Uri.file('/repo'), createdAt: 1,
-			files: new Map([[uri.toString(), file]]),
+		await controller.openReviewPresentation(uri);
+		await controller.openReviewPresentation(uri, { line: 0, column: 3 });
+		file.skippedReason = 'Binary file';
+		await controller.openReviewPresentation(uri);
+		controller.activeSession = undefined;
+		await controller.openReviewPresentation(uri);
+		assert.deepStrictEqual(opened, [
+			[uri.toString(), { line: hunks[0].newStart, column: 0 }],
+			[uri.toString(), { line: 0, column: 3 }],
+			[uri.toString(), { line: hunks[0].newStart, column: 0 }],
+			[uri.toString(), undefined],
+		]);
+		assert.deepStrictEqual(activated, Array(4).fill(uri.toString()));
+	});
+
+	test('refreshes and closes review pages without a native presenter', () => {
+		const uri = vscode.Uri.file('/repo/src/app.ts');
+		const refreshed: (vscode.Uri | undefined)[] = [];
+		let closed = 0;
+		const controller = Object.create(ReviewController.prototype) as any;
+		controller.reviewWebview = {
+			refresh: (target?: vscode.Uri) => refreshed.push(target),
+			closeAll: () => closed++,
 		};
-		const manager = Object.create(NativeReviewEditorManager.prototype) as any;
-		manager.getSession = () => session;
-		const before = manager.reviewDocumentUriForFileUri(uri, 'before');
-		const after = manager.reviewDocumentUriForFileUri(uri, 'after');
+		controller.treeProvider = { refresh: () => undefined };
+		controller.dashboardProvider = { refresh: () => undefined };
+		controller.scheduleLlmWikiDashboardRefresh = () => undefined;
+		controller.refreshUi();
+		controller.refreshReviewPresentation(uri);
+		controller.closeReviewEditors();
+		assert.deepStrictEqual(refreshed, [undefined, uri]);
+		assert.strictEqual(closed, 1);
+	});
 
-		assert.strictEqual(manager.provideReviewDocumentContent(before), 'new\nkeep\n');
-		assert.strictEqual(manager.provideReviewDocumentContent(after), newText);
-
-		for (const [caseName, baseline, working] of [
-			['add', '', 'added\n'],
-			['delete', 'deleted\n', ''],
-			['modify', 'before\n', 'after\n'],
-		] as const) {
-			const acceptedHunk = computeLineDiff(`${uri.toString()}#${caseName}`, baseline, working)[0];
-			const acceptedFile = reviewFileState(uri, `src/${caseName}.ts`, {
-				oldText: baseline,
-				newText: working,
-				acceptedHunks: [reviewedHunkFrom(acceptedHunk, 'accept')],
-			});
-			assert.strictEqual(manager.beforeText(acceptedFile), working, `${caseName} should disappear from native diff after accept`);
-		}
+	test('clears current review selection only when its completed page closes', () => {
+		const uri = vscode.Uri.file('/repo/src/app.ts');
+		const controller = Object.create(ReviewController.prototype) as any;
+		let dashboardRefreshes = 0;
+		Object.assign(controller, {
+			currentReviewUri: uri,
+			reviewWebview: { closeCompleted: () => [] },
+			dashboardProvider: { refresh: () => dashboardRefreshes++ },
+			refreshLlmWikiDashboardState: async () => undefined,
+		});
+		controller.closeCompletedReviewEditorsAfterManualRefresh();
+		assert.strictEqual(controller.currentReviewUri, uri);
+		assert.strictEqual(dashboardRefreshes, 0);
+		controller.reviewWebview.closeCompleted = () => [uri];
+		controller.closeCompletedReviewEditorsAfterManualRefresh();
+		assert.strictEqual(controller.currentReviewUri, undefined);
+		assert.strictEqual(dashboardRefreshes, 1);
 	});
 });
 
@@ -5244,7 +5173,6 @@ suite('Git review journal', () => {
 				aiReviewStore: aiStore,
 				isOpenDocumentDirty: () => false,
 				refreshUi: () => undefined,
-				syncNativeReviewAfterMutation: async () => undefined,
 				synchronizeOpenDocumentAfterGitMutation: async () => undefined,
 				humanEditBatches: new Map(),
 				humanSaveIntents: new Map(),
@@ -5561,7 +5489,6 @@ suite('Git review journal', () => {
 				aiReviewStore: { load: () => undefined, save: async () => undefined, clear: async () => undefined },
 				isOpenDocumentDirty: () => false,
 				refreshUi: () => undefined,
-				syncNativeReviewAfterMutation: async () => undefined,
 				refreshReviewPresentation: () => undefined,
 				refreshLlmWikiDashboardState: async () => undefined,
 				writeCurrentFileText: async (_uri: vscode.Uri, text: string) => writeRepoFile(root, 'tracked.txt', text),
@@ -5784,7 +5711,6 @@ suite('Git review journal', () => {
 				aiReviewStore: { load: () => undefined, save: async () => undefined, clear: async () => undefined },
 				isOpenDocumentDirty: () => false,
 				refreshUi: () => undefined,
-				syncNativeReviewAfterMutation: async () => undefined,
 				synchronizeOpenDocumentAfterGitMutation: async () => undefined,
 				humanEditBatches: new Map(),
 				humanSaveIntents: new Map(),
@@ -6041,7 +5967,6 @@ function reviewControllerHarness(
 		updateSnapshotBaselineFile: async () => undefined,
 		refreshFile: async () => undefined,
 		refreshUnmatchedMutation: async () => { unmatchedMutationCount += 1; },
-		syncNativeReviewAfterMutation: async () => undefined,
 		showError: (error: unknown) => {
 			throw error;
 		},

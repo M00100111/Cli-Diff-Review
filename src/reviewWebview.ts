@@ -394,7 +394,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 			return;
 		}
 
-		host.panel.title = `Review: ${file.relativePath}`;
+		host.panel.title = `Review: ${path.basename(file.relativePath)}`;
 		const payload = this.serialize(file, host.document, host.revealPosition);
 		const sequence = ++host.stateSequence;
 		const delivered = await host.panel.webview.postMessage({ type: 'state', sequence, file: payload });

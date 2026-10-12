@@ -9,7 +9,6 @@ import { computeLineDiff } from './diffEngine';
 import { contentStateHash, expectedRejectedFileHash, fileStateHash, GitReviewJournalStore } from './gitReviewJournal';
 import { createLlmClient, LlmClient } from './llm/client';
 import { LlmConfigInput, LlmConfigStore, LlmSavedConfig, LlmRuntimeConfig } from './llm/config';
-import { NativeReviewEditorManager, NativeReviewRevealPosition } from './nativeReviewEditor';
 import { buildReviewDashboardPayload, defaultLlmWikiDashboardState, LlmWikiDashboardState, LlmWikiRunLogEntry, ProjectAgentSummary, ReviewDashboardProvider } from './reviewDashboard';
 import { ReviewTreeProvider } from './reviewTree';
 import {
@@ -24,6 +23,7 @@ import { isGitIgnoredReviewPath, shouldSkipReviewPath } from './reviewFileFilter
 import {
 	captureLineBlockContext,
 	firstReviewRevealPosition,
+	ReviewRevealPosition,
 	gitReviewFileStateFingerprint,
 	isStaleRevision,
 	lineBlockWithContextMatches,
@@ -67,7 +67,6 @@ interface ReviewNavigationTarget extends vscode.QuickPickItem {
 }
 
 type RunLogSource = 'wiki' | 'review';
-type ReviewEditorMode = 'nativeEditor' | 'reviewPage';
 
 type RunLogMetadata = Pick<LlmWikiRunLogEntry, 'source' | 'stage' | 'fileUri' | 'relativePath' | 'fileIndex' | 'fileCount'>;
 
@@ -144,7 +143,6 @@ export class ReviewController implements vscode.Disposable {
 	private readonly treeProvider: ReviewTreeProvider;
 	private readonly dashboardProvider: ReviewDashboardProvider;
 	private readonly reviewWebview: ReviewWebviewManager;
-	private readonly nativeReviewEditor: NativeReviewEditorManager;
 	private readonly refreshTimers = new Map<string, NodeJS.Timeout>();
 	private readonly humanEditBatches = new Map<string, EditedRange[]>();
 	private readonly humanSaveIntents = new Map<string, number>();
@@ -204,14 +202,9 @@ export class ReviewController implements vscode.Disposable {
 			(uri, line, column) => this.openNavigationTarget(uri, line, column),
 			(uri) => this.setCurrentReviewUri(uri),
 		);
-		this.nativeReviewEditor = new NativeReviewEditorManager(
-			() => this.activeSession,
-			() => this.reviewEditorMode() === 'nativeEditor',
-		);
 
 		this.disposables.push(
 			this.reviewWebview,
-			this.nativeReviewEditor,
 			this.dashboardProvider,
 			vscode.window.registerTreeDataProvider('cli-diff.review', this.treeProvider),
 			vscode.window.registerWebviewViewProvider(ReviewDashboardProvider.viewType, this.dashboardProvider),
@@ -234,8 +227,6 @@ export class ReviewController implements vscode.Disposable {
 			vscode.workspace.onDidChangeConfiguration((event) => {
 				if (event.affectsConfiguration('cliDiff.reviewWikiChanges')) {
 					void this.refreshAll();
-				} else if (event.affectsConfiguration('cliDiff.reviewEditorMode')) {
-					this.refreshReviewPresentation();
 				} else if (event.affectsConfiguration('cliDiff.aiReviewLanguage')
 					|| event.affectsConfiguration('cliDiff.aiReviewMaxRounds')
 					|| event.affectsConfiguration('cliDiff.agentConcurrency')
@@ -1054,7 +1045,6 @@ export class ReviewController implements vscode.Disposable {
 			target.file.acceptedHunks.push(accepted);
 			this.touchFileRevision(target.file);
 			this.refreshUi();
-			await this.syncNativeReviewAfterMutation(target.file.uri, { line: target.hunk.newStart, column: 0 });
 		} catch (error) {
 			this.showError(error);
 		}
@@ -1120,7 +1110,6 @@ export class ReviewController implements vscode.Disposable {
 				throw error;
 			}
 			await this.refreshGitReviewFile(target.file.uri);
-			await this.syncNativeReviewAfterMutation(target.file.uri, { line: target.hunk.newStart, column: 0 });
 		} catch (error) {
 			this.showError(error);
 		}
@@ -1161,7 +1150,6 @@ export class ReviewController implements vscode.Disposable {
 				await this.refreshGitReviewFile(target.file.uri);
 				const restoredFile = this.resolveFile(target.file.uri.toString());
 				await this.saveAiReviewWithCurrentSignature(storedReview, restoredFile ? this.sessionForFile(restoredFile) : reviewSession);
-				await this.syncNativeReviewAfterMutation(target.file.uri, { line: target.hunk.displayStart, column: 0 });
 				return;
 			}
 			if (target.hunk.patch) {
@@ -1198,7 +1186,6 @@ export class ReviewController implements vscode.Disposable {
 				}
 				await this.refreshGitReviewFile(target.file.uri);
 				this.refreshUi();
-				await this.syncNativeReviewAfterMutation(target.file.uri, { line: target.hunk.displayStart, column: 0 });
 				return;
 			}
 
@@ -1248,7 +1235,6 @@ export class ReviewController implements vscode.Disposable {
 			this.touchFileRevision(target.file);
 			await this.saveAiReviewWithCurrentSignature(aiReviewToResign, aiReviewSession);
 			await this.refreshFile(target.file.uri, { reconcileExternalChanges: false });
-			await this.syncNativeReviewAfterMutation(target.file.uri, { line: target.hunk.displayStart, column: 0 });
 		} catch (error) {
 			this.showError(error);
 		}
@@ -1297,7 +1283,6 @@ export class ReviewController implements vscode.Disposable {
 				file.hunks = [];
 				this.touchFileRevision(file);
 				this.refreshUi();
-				await this.syncNativeReviewAfterMutation(file.uri);
 				return;
 			}
 
@@ -1324,7 +1309,6 @@ export class ReviewController implements vscode.Disposable {
 			file.appliedAiSuggestions = [];
 			this.touchFileRevision(file);
 			await this.refreshFile(file.uri, { reconcileExternalChanges: false });
-			await this.syncNativeReviewAfterMutation(file.uri);
 		} catch (error) {
 			this.showError(error);
 		}
@@ -1397,7 +1381,6 @@ export class ReviewController implements vscode.Disposable {
 					throw error;
 				}
 				await this.refreshGitReviewFile(file.uri);
-				await this.syncNativeReviewAfterMutation(file.uri);
 				return;
 			}
 
@@ -1434,7 +1417,6 @@ export class ReviewController implements vscode.Disposable {
 
 			await this.writeCurrentFileText(refreshedFile.uri, currentText);
 			await this.refreshFile(refreshedFile.uri, { reconcileExternalChanges: false });
-			await this.syncNativeReviewAfterMutation(refreshedFile.uri);
 		} catch (error) {
 			this.showError(error);
 		}
@@ -1512,7 +1494,6 @@ export class ReviewController implements vscode.Disposable {
 				await this.refreshGitReviewFile(file.uri);
 				const restoredFile = this.resolveFile(file.uri.toString());
 				await this.saveAiReviewWithCurrentSignature(aiReviewToResign, restoredFile ? this.sessionForFile(restoredFile) : aiReviewSession);
-				await this.syncNativeReviewAfterMutation(file.uri);
 				return;
 			}
 
@@ -1525,7 +1506,6 @@ export class ReviewController implements vscode.Disposable {
 			this.touchFileRevision(file);
 			await this.saveAiReviewWithCurrentSignature(aiReviewToResign, aiReviewSession);
 			await this.refreshFile(file.uri, { reconcileExternalChanges: false });
-			await this.syncNativeReviewAfterMutation(file.uri);
 		} catch (error) {
 			this.showError(error);
 		}
@@ -1828,29 +1808,14 @@ export class ReviewController implements vscode.Disposable {
 		await this.openReviewPresentation(uri);
 	}
 
-	private async openReviewPresentation(uri: vscode.Uri, reveal?: NativeReviewRevealPosition): Promise<void> {
+	private async openReviewPresentation(uri: vscode.Uri, reveal?: Pick<ReviewRevealPosition, 'line' | 'column'>): Promise<void> {
 		const file = this.activeSession?.files.get(uriKey(uri));
 		const effectiveReveal = reveal ?? (file ? firstReviewRevealPosition(file) : undefined);
-		if (this.reviewEditorMode() === 'nativeEditor' && file && !file.skippedReason) {
-			const opened = effectiveReveal?.hunkId
-				? await this.nativeReviewEditor.revealChunk(uri, effectiveReveal.hunkId)
-				: await this.nativeReviewEditor.open(uri, effectiveReveal);
-			if (opened) {
-				this.setCurrentReviewUri(uri);
-				return;
-			}
-		}
-
 		await this.reviewWebview.open(uri, effectiveReveal?.line !== undefined ? {
 			line: effectiveReveal.line,
 			column: effectiveReveal.column ?? 0,
 		} : undefined);
 		this.setCurrentReviewUri(uri);
-	}
-
-	private reviewEditorMode(): ReviewEditorMode {
-		const configured = vscode.workspace.getConfiguration('cliDiff').get<string>('reviewEditorMode', 'reviewPage');
-		return configured === 'nativeEditor' ? 'nativeEditor' : 'reviewPage';
 	}
 
 	private async navigateFromReview(
@@ -2146,7 +2111,6 @@ export class ReviewController implements vscode.Disposable {
 		await this.openReviewPresentation(file.uri, {
 			line: hunk?.newStart ?? reviewed?.displayStart ?? 0,
 			column: 0,
-			hunkId: hunk?.id ?? reviewed?.id ?? hunkId,
 		});
 	}
 
@@ -2155,7 +2119,6 @@ export class ReviewController implements vscode.Disposable {
 		await this.ensureVisibleEditorsReviewed();
 
 		if (!this.activeSession) {
-			this.nativeReviewEditor.clear();
 			this.closeCompletedReviewEditorsAfterManualRefresh();
 			return;
 		}
@@ -2166,14 +2129,10 @@ export class ReviewController implements vscode.Disposable {
 
 	private closeReviewEditors(): void {
 		this.reviewWebview.closeAll();
-		this.nativeReviewEditor.clear();
 	}
 
 	private closeCompletedReviewEditorsAfterManualRefresh(): void {
-		const closedKeys = new Set([
-			...this.reviewWebview.closeCompleted(),
-			...this.nativeReviewEditor.closeCompleted(),
-		].map(uriKey));
+		const closedKeys = new Set(this.reviewWebview.closeCompleted().map(uriKey));
 		if (!this.currentReviewUri || !closedKeys.has(uriKey(this.currentReviewUri))) {
 			return;
 		}
@@ -2995,7 +2954,6 @@ export class ReviewController implements vscode.Disposable {
 		await this.openReviewPresentation(file.uri, {
 			line: hunk?.newStart ?? reviewed?.displayStart ?? 0,
 			column: 0,
-			hunkId: hunk?.id ?? reviewed?.id ?? hunkId,
 		});
 	}
 
@@ -3852,11 +3810,6 @@ export class ReviewController implements vscode.Disposable {
 
 	private refreshReviewPresentation(uri?: vscode.Uri): void {
 		this.reviewWebview.refresh(uri);
-		this.nativeReviewEditor.refresh(uri);
-	}
-
-	private async syncNativeReviewAfterMutation(uri: vscode.Uri, reveal?: NativeReviewRevealPosition): Promise<void> {
-		await this.nativeReviewEditor.syncOpen(uri, reveal);
 	}
 
 	private wikiRunTextDetail(label: string, content: string): AgentTraceEvent['details'][number] {

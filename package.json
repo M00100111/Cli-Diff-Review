@@ -248,23 +248,9 @@
           "default": true,
           "description": "Include Git-detected changes under .agents/skills/llm-code-wiki in Cli Diff Review. Disable to ignore that directory."
         },
-        "cliDiff.reviewEditorMode": {
-          "type": "string",
-          "order": 4,
-          "enum": [
-            "nativeEditor",
-            "reviewPage"
-          ],
-          "enumItemLabels": [
-            "Native inline diff editor",
-            "Review page"
-          ],
-          "default": "reviewPage",
-          "description": "Controls whether review files open in the VS Code/Cursor native inline diff editor or the Cli Diff Review page."
-        },
         "cliDiff.aiReviewStrategy": {
           "type": "string",
-          "order": 5,
+          "order": 4,
           "enum": [
             "Auto",
             "Multi",
@@ -275,21 +261,21 @@
         },
         "cliDiff.aiReviewMaxRounds": {
           "type": "number",
-          "order": 6,
+          "order": 5,
           "default": 32,
           "minimum": 0,
           "description": "Maximum rounds for each AI Review agent. Applies to knowledge, planning, file, and integration agents. 0 means unlimited."
         },
         "cliDiff.agentConcurrency": {
           "type": "number",
-          "order": 7,
+          "order": 6,
           "default": 3,
           "minimum": 0,
           "description": "Max concurrent agents per project. 1 runs serially; 0 runs all."
         },
         "cliDiff.aiReviewLanguage": {
           "type": "string",
-          "order": 8,
+          "order": 7,
           "enum": [
             "zh-CN",
             "en"
