@@ -61,4 +61,10 @@ const extensionConfig = {
     new MonacoAssetsPlugin(),
   ],
 };
-module.exports = [ extensionConfig ];
+const previewWorkerConfig = {
+  target: 'webworker', mode: 'none', entry: './src/previewWorker.ts',
+  output: { path: path.resolve(__dirname, 'dist'), filename: 'previewWorker.js' },
+  resolve: extensionConfig.resolve, module: extensionConfig.module,
+  devtool: 'nosources-source-map',
+};
+module.exports = [ extensionConfig, previewWorkerConfig ];
