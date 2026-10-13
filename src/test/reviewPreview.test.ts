@@ -3,14 +3,16 @@ import * as vscode from 'vscode';
 import { ReviewWebviewManager } from '../reviewWebview';
 
 suite('Preview host synchronization', () => {
-	test('serializes the index baseline separately from HEAD and the review snapshot', () => {
+	test('marks unsynchronized text without sending a full-file comparison baseline', () => {
 		const manager = Object.create(ReviewWebviewManager.prototype);
 		const uri = vscode.Uri.file('/preview.ts');
 		const file = { uri, relativePath: 'preview.ts', oldText: 'HEAD', newText: 'saved', gitSnapshot: { indexText: 'INDEX' }, currentExists: true };
 		const document = { uri, getText: () => 'unsaved', isDirty: true };
 		const payload = manager.serialize(file, document);
-		assert.strictEqual(payload.comparisonBaseText, 'INDEX');
-		assert.strictEqual(payload.reviewText, 'saved');
+		assert.strictEqual('comparisonBaseText' in payload, false);
+		assert.strictEqual('oldText' in payload, false);
+		assert.strictEqual(payload.reviewPending, true);
+		assert.strictEqual('reviewText' in payload, false);
 		assert.strictEqual(payload.newText, 'unsaved');
 		assert.strictEqual(payload.dirty, true);
 	});

@@ -157,6 +157,9 @@ export class ReviewController implements vscode.Disposable {
 	private gitRefreshInFlight: Promise<void> | undefined;
 	private llmDashboardRefreshGeneration = 0;
 	private gitMutationDepth = 0;
+	private gitReviewGeneration = 0;
+	private gitFullReviewGeneration = 0;
+	private gitFileReviewGenerations = new Map<string, number>();
 	private currentReviewUri: vscode.Uri | undefined;
 	private activeSession: ReviewSession | undefined;
 	private readonly projectAgentRuntimes = new Map<string, ProjectAgentRuntime>();
@@ -304,6 +307,7 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 
+		this.dashboardProvider.refresh();
 		const key = uriKey(event.document.uri);
 		if (this.isInternalWriteActive(event.document.uri)) {
 			this.humanEditBatches.delete(key);
@@ -1533,7 +1537,7 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 
-		const dirtyTargets = targets.filter((target) => this.isOpenDocumentDirty(target.file.uri));
+		const dirtyTargets = targets.filter((target) => this.isFileReviewPending(target.file));
 		if (dirtyTargets.length > 0) {
 			for (const target of dirtyTargets) {
 				this.refreshReviewPresentation(target.file.uri);
@@ -3505,6 +3509,10 @@ export class ReviewController implements vscode.Disposable {
 		}
 	}
 
+	private reviewDocumentVersions(): Map<string, number> {
+		return new Map(vscode.workspace.textDocuments.map(document => [uriKey(document.uri), document.version]));
+	}
+
 	private async refreshGitSessionFilesOnce(): Promise<void> {
 		if (!this.activeSession || this.activeSession.mode !== 'git') {
 			return;
@@ -3515,7 +3523,10 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 
-		const previousFiles = this.activeSession.files;
+		const session = this.activeSession;
+		const generation = this.gitReviewGeneration = (this.gitReviewGeneration ?? 0) + 1;
+		const documentVersions = this.reviewDocumentVersions();
+		const previousFiles = session.files;
 		const previousProjects = this.activeSession.projects ?? [];
 		const projects = await this.gitService.discoverProjects(workspaceRoot);
 		await this.validateBranchExtractions(projects);
@@ -3556,8 +3567,20 @@ export class ReviewController implements vscode.Disposable {
 				file.revision = previous.revision + 1;
 			}
 		}
-		this.activeSession.files = nextFiles;
-		this.activeSession.projects = projects;
+		if (this.activeSession !== session) { return; }
+		// Keep the last formal state while a newer edit or per-file refresh is in flight.
+		for (const key of new Set([...nextFiles.keys(), ...session.files.keys()])) {
+			const document = vscode.workspace.textDocuments.find(item => uriKey(item.uri) === key);
+			const changed = document && (document.isDirty || documentVersions.get(key) !== document.version);
+			if (changed || (this.gitFileReviewGenerations?.get(key) ?? 0) > generation) {
+				const current = session.files.get(key);
+				if (current) { nextFiles.set(key, current); } else { nextFiles.delete(key); }
+				if (changed && !document.isDirty) { this.gitRefreshRequested = true; }
+			}
+		}
+		this.gitFullReviewGeneration = generation;
+		session.files = nextFiles;
+		session.projects = projects;
 		await this.ensureTrackingTargetAvailable();
 		this.refreshUi();
 	}
@@ -3572,6 +3595,9 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 		const key = uriKey(uri);
+		const generation = this.gitReviewGeneration = (this.gitReviewGeneration ?? 0) + 1;
+		(this.gitFileReviewGenerations ??= new Map()).set(key, generation);
+		const documentVersion = this.reviewDocumentVersions().get(key);
 		const previous = session.files.get(key);
 		if (!previous) {
 			const relative = relativePath(project.rootUri, uri);
@@ -3592,6 +3618,12 @@ export class ReviewController implements vscode.Disposable {
 		let file = refreshed.get(key);
 		if (!file && previous?.appliedAiSuggestions.some((suggestion) => suggestion.resolvedToIndex)) {
 			file = await this.retainResolvedSuggestionFile(previous, project);
+		}
+		if (this.activeSession !== session || this.gitFileReviewGenerations.get(key) !== generation || this.gitFullReviewGeneration > generation) { return; }
+		const document = vscode.workspace.textDocuments.find(item => uriKey(item.uri) === key);
+		if (document && (document.isDirty || document.version !== documentVersion)) {
+			if (!document.isDirty) { this.scheduleRefresh(uri, { preferDisk: true }); }
+			return;
 		}
 		if (!file) {
 			session.files.delete(key);
@@ -4531,12 +4563,17 @@ export class ReviewController implements vscode.Disposable {
 		return vscode.workspace.textDocuments.some((document) => document.uri.toString() === uri.toString() && document.isDirty);
 	}
 
+	private isFileReviewPending(file: ReviewFileState): boolean {
+		const document = vscode.workspace.textDocuments.find(item => uriKey(item.uri) === uriKey(file.uri));
+		return Boolean(document && (document.isDirty || (file.currentExists && document.getText() !== file.newText)));
+	}
+
 	private ensureFileCleanForReviewMutation(file: ReviewFileState): boolean {
-		if (!this.isOpenDocumentDirty(file.uri)) {
+		if (!this.isFileReviewPending(file)) {
 			return true;
 		}
 
-		vscode.window.showInformationMessage('Save or revert this file before accepting, rejecting, or undoing Cli Diff Review changes.');
+		vscode.window.showInformationMessage('Save this file and wait for Git changes to update before continuing review.');
 		this.refreshReviewPresentation(file.uri);
 		return false;
 	}

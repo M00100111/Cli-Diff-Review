@@ -1,15 +1,23 @@
-import { computeDisplayDiff, DiffResult } from './inlineDiff';
-export interface PreviewRequest {
-	id: number; uri: string; baselineVersion: number; modelVersion: number;
-	oldText: string; newText: string;
-	hunks?: { id: string; oldText: string; newText: string }[];
+import { computeDisplayDiff, WordRange } from './inlineDiff';
+export interface HunkHighlightRequest {
+	id: number; uri: string; revision: number;
+	hunks: { id: string; oldText: string; newText: string }[];
 }
-export function computePreview(request: PreviewRequest): { result?: DiffResult; hunks?: Record<string, DiffResult> } {
-	if (!request.hunks) { return { result: computeDisplayDiff(request.oldText, request.newText) }; }
+export interface HunkWordRanges { oldRanges: WordRange[]; newRanges: WordRange[] }
+/** Only returns ranges inside supplied Git hunks, never replacement chunks. */
+export function computeHunkHighlights(request: HunkHighlightRequest): { hunks: Record<string, HunkWordRanges> } {
 	const deadline = performance.now() + 200;
-	const hunks: Record<string, DiffResult> = {};
+	const hunks: Record<string, HunkWordRanges> = {};
 	for (const hunk of request.hunks) {
-		hunks[hunk.id] = computeDisplayDiff(hunk.oldText, hunk.newText, Math.max(0, deadline - performance.now()));
+		const result = computeDisplayDiff(hunk.oldText, hunk.newText, Math.max(0, deadline - performance.now()));
+		const ranges: HunkWordRanges = { oldRanges: [], newRanges: [] };
+		if (!result.timedOut && !result.wordsTimedOut) {
+			for (const block of result.blocks) {
+				ranges.oldRanges.push(...block.oldRanges.map(range => ({ ...range, line: range.line + block.oldStart })));
+				ranges.newRanges.push(...block.newRanges.map(range => ({ ...range, line: range.line + block.newStart })));
+			}
+		}
+		hunks[hunk.id] = ranges;
 	}
 	return { hunks };
 }

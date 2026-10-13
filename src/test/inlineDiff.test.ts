@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vm from 'vm';
 import { computeDisplayDiff } from '../inlineDiff';
-import { computePreview } from '../previewComputation';
+import { computeHunkHighlights } from '../previewComputation';
 
 suite('Display-only word diff', () => {
 	test('highlights whole identifiers and separate edits', () => {
@@ -47,9 +47,9 @@ suite('Display-only word diff', () => {
 		assert.deepStrictEqual(result.blocks[0].newRanges, []);
 	});
 	test('keeps formal hunk identities without producing mutation data', () => {
-		const result = computePreview({ id: 1, uri: 'file:a', baselineVersion: 1, modelVersion: 1, oldText: '', newText: '', hunks: [{ id: 'git-id', oldText: 'count', newText: 'counter' }] });
-		assert.ok(result.hunks?.['git-id'].blocks[0].newRanges.length);
-		assert.strictEqual('patch' in result.hunks!['git-id'].blocks[0], false);
+		const result = computeHunkHighlights({ id: 1, uri: 'file:a', revision: 1, hunks: [{ id: 'git-id', oldText: 'count', newText: 'counter' }] });
+		assert.ok(result.hunks['git-id'].newRanges.length);
+		assert.strictEqual('blocks' in result.hunks['git-id'], false);
 	});
 	test('reconstructs randomly edited text from line blocks', () => {
 		let seed = 42;
@@ -80,43 +80,45 @@ function previewHarness() {
 	});
 	vm.runInContext(fs.readFileSync(path.join(__dirname, '../../resources/reviewPreview.js'), 'utf8'), context);
 	const api = context.window;
-	const controller = new api.CliDiffPreview('worker.js', () => {});
+	const controller = new api.CliDiffHunkHighlighter('worker.js', () => {});
 	let text = 'counter', version = 1;
 	const model = { getValue: () => text, getVersionId: () => version };
-	const state = { uri: 'file:a', comparisonBaseText: 'count', reviewText: 'counter', dirty: false, pendingHunks: [{ id: 'h', kind: 'modify', oldText: 'count', newText: 'counter' }] };
+	const state = { uri: 'file:a', revision: 1, pendingHunks: [{ id: 'h', kind: 'modify', oldText: 'count', newText: 'counter' }] };
 	return { api, controller, state, model, workers,
 		edit(value: string) { text = value; version++; },
 		async tick() { const first = timers.entries().next().value; if (first) { timers.delete(first[0]); await first[1](); } },
 	};
 }
-suite('Preview task lifecycle', () => {
-	test('cancels obsolete tasks and rejects stale worker replies', async () => {
+suite('Formal hunk highlighting lifecycle', () => {
+	test('suspends work during edits and rejects stale replies', async () => {
 		const h = previewHarness();
-		h.controller.update(h.state, h.model, true); await h.tick();
+		h.controller.update(h.state); await h.tick();
 		const old = h.workers[0];
-		h.edit('counter + extra'); h.controller.update({ ...h.state, dirty: true }, h.model, false); await h.tick();
+		h.controller.suspend();
 		assert.ok(old.terminated);
-		old.onmessage({ data: { ...old.request, result: { blocks: [{ kind: 'delete' }] } } });
-		assert.strictEqual(h.controller.blocks, null);
-		const latest = h.workers[1];
-		latest.onmessage({ data: { ...latest.request, result: { blocks: [] } } });
-		assert.strictEqual(h.controller.blocks.length, 0);
+		old.onmessage({ data: { ...old.request, hunks: { h: { oldRanges: [], newRanges: [{ line: 0, start: 0, end: 2 }] } } } });
+		assert.deepStrictEqual(Object.keys(h.controller.wordResults), []);
+		await h.tick(); assert.strictEqual(h.workers.length, 1);
 	});
-	test('uses non-operable previews until the saved review snapshot catches up', () => {
-		const h = previewHarness(); h.edit('other');
-		h.controller.update({ ...h.state, dirty: false }, h.model, true);
-		assert.strictEqual(h.controller.isPreview(), true);
-		const entries = h.controller.entries([{ id: 'h', decided: false }, { id: 'accepted', decided: true }]);
-		assert.strictEqual(entries.length, 1); assert.strictEqual(entries[0].preview, true);
-		h.state.reviewText = 'other'; h.controller.update(h.state, h.model, true);
-		assert.strictEqual(h.controller.isPreview(), false);
+	test('only submits formal hunks and never returns new chunks', async () => {
+		const h = previewHarness(); h.controller.update(h.state); await h.tick();
+		const worker = h.workers[0];
+		assert.strictEqual('oldText' in worker.request, false);
+		assert.strictEqual('newText' in worker.request, false);
+		assert.strictEqual(worker.request.hunks.length, 1);
+		worker.onmessage({ data: { ...worker.request, hunks: { h: { oldRanges: [], newRanges: [{ line: 0, start: 0, end: 2 }] } } } });
+		const formal = [{ id: 'h', displayLines: 1, decided: false }, { id: 'accepted', displayLines: 2, decided: true }];
+		const entries = h.controller.entries(formal);
+		assert.strictEqual(entries.length, 2); assert.strictEqual(entries[0].displayLines, 1);
+		assert.strictEqual(entries[0].newRanges.length, 1); assert.strictEqual(entries[1].newRanges.length, 0);
 	});
-	test('invalidates cache on baseline change and disposes pending workers', async () => {
-		const h = previewHarness(); h.controller.update(h.state, h.model, true); await h.tick();
-		const worker = h.workers[0]; worker.onmessage({ data: { ...worker.request, hunks: {} } });
-		assert.strictEqual(h.controller.cache.size, 1);
-		h.controller.update({ ...h.state, comparisonBaseText: 'new index' }, h.model, true); await h.tick();
-		assert.strictEqual(h.controller.cache.size, 0);
+	test('invalidates obsolete revisions and disposes pending workers', async () => {
+		const h = previewHarness(); h.controller.update(h.state); await h.tick();
+		const worker = h.workers[0];
+		h.controller.update({ ...h.state, revision: 2 }); await h.tick();
+		assert.ok(worker.terminated);
+		worker.onmessage({ data: { ...worker.request, hunks: { stale: {} } } });
+		assert.deepStrictEqual(Object.keys(h.controller.wordResults), []);
 		h.controller.dispose(); assert.ok(h.workers[1].terminated);
 	});
 	test('projects tabs and UTF-16 source ranges for old-side markup', () => {

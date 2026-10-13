@@ -1,60 +1,50 @@
-/* Display-only preview controller. No Git mutations or persisted hunk identities. */
+/* Word highlighting for formal Git hunks only. Never computes file-level chunks. */
 (function () {
 	'use strict';
-	class CliDiffPreview {
+	class CliDiffHunkHighlighter {
 		constructor(workerUri, changed) {
 			this.workerUri = workerUri; this.changed = changed;
-			this.requestId = 0; this.baselineVersion = 0; this.cache = new Map();
-			this.wordResults = {}; this.blocks = null; this.failed = false;
+			this.requestId = 0; this.wordResults = {}; this.cache = new Map();
 		}
-		isPreview() { return Boolean(this.state && (this.state.dirty || this.text !== this.state.reviewText)); }
-		update(state, model, immediate) {
-			const text = model.getValue();
-			const key = JSON.stringify([state.uri, state.comparisonBaseText, text, this.isFormal(state, text) ? state.pendingHunks.map(h => [h.id, h.oldText, h.newText]) : null]);
-			if (!this.state || this.state.uri !== state.uri || this.state.comparisonBaseText !== state.comparisonBaseText) {
-				this.baselineVersion++; this.cache.clear();
-			}
-			this.state = state; this.text = text; this.model = model;
+		suspend() {
+			this.cancel(); this.key = undefined; this.wordResults = {};
+		}
+		update(state) {
+			const hunks = state.pendingHunks.filter(h => h.kind === 'modify').map(h => ({ id: h.id, oldText: h.oldText, newText: h.newText }));
+			const key = JSON.stringify([state.uri, state.revision, hunks]);
 			if (key === this.key) { return; }
-			this.key = key; this.cancel(); this.blocks = null; this.wordResults = {}; this.failed = false;
+			this.cancel(); this.key = key; this.wordResults = {};
+			if (!hunks.length) { return; }
 			const cached = this.cache.get(key);
-			if (cached) { this.apply(cached); return; }
-			const id = this.requestId, baselineVersion = this.baselineVersion, modelVersion = model.getVersionId();
+			if (cached) { this.wordResults = cached; return; }
+			const id = this.requestId;
+			const request = { id, uri: state.uri, revision: state.revision, hunks };
 			this.timer = setTimeout(async () => {
-				const request = { id, uri: state.uri, baselineVersion, modelVersion, oldText: state.comparisonBaseText, newText: text };
-				if (this.isFormal(state, text)) { request.hunks = state.pendingHunks.filter(h => h.kind === 'modify').map(h => ({ id: h.id, oldText: h.oldText, newText: h.newText })); }
 				try {
 					this.watchdog = setTimeout(() => this.fail(id), 2000);
-					// VS Code resources must be fetched in the page, not imported inside a worker.
 					this.workerSource ??= fetch(this.workerUri).then(response => { if (!response.ok) { throw new Error('Worker resource unavailable'); } return response.text(); }).catch(error => { this.workerSource = null; throw error; });
 					const source = await this.workerSource;
 					if (id !== this.requestId) { return; }
 					const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
 					this.worker = new Worker(url); URL.revokeObjectURL(url);
 					this.worker.onmessage = ({ data }) => {
-						if (id !== this.requestId || data.id !== id || data.uri !== this.state.uri || data.baselineVersion !== this.baselineVersion || data.modelVersion !== this.model.getVersionId()) { return; }
+						if (id !== this.requestId || data.id !== id || data.uri !== request.uri || data.revision !== request.revision) { return; }
 						clearTimeout(this.watchdog); this.worker.terminate(); this.worker = null;
-						if (!data.failed && !data.result?.timedOut) {
-							this.cache.set(key, data);
+						this.wordResults = data.failed ? {} : data.hunks || {};
+						if (!data.failed) {
+							this.cache.set(key, this.wordResults);
 							if (this.cache.size > 4) { this.cache.delete(this.cache.keys().next().value); }
 						}
-						this.apply(data);
+						this.changed();
 					};
 					this.worker.onerror = () => this.fail(id);
-					// Includes worker startup; the computation itself has a 200ms budget.
 					this.worker.postMessage(request);
 				} catch { this.fail(id); }
-			}, immediate ? 0 : 150);
+			}, 0);
 		}
-		isFormal(state, text) { return !state.dirty && text === state.reviewText; }
 		fail(id) {
 			if (id !== this.requestId) { return; }
-			this.cancel(); this.failed = true; this.blocks = null; this.wordResults = {}; this.changed();
-		}
-		apply(data) {
-			this.failed = Boolean(data.failed || data.result?.timedOut);
-			this.blocks = this.failed ? null : data.result?.blocks ?? null;
-			this.wordResults = data.hunks || {}; this.changed();
+			this.cancel(); this.wordResults = {}; this.changed();
 		}
 		cancel() {
 			this.requestId++; clearTimeout(this.timer); clearTimeout(this.watchdog);
@@ -62,31 +52,10 @@
 		}
 		dispose() { this.cancel(); this.cache.clear(); }
 		entries(formal) {
-			if (this.isPreview()) {
-				if (this.blocks === null) {
-					return formal.filter(e => !e.decided).map(e => ({ ...e, preview: true, oldRanges: [], newRanges: [] }));
-				}
-				return this.blocks.map((b, i) => ({ ...b, id: 'preview-' + this.requestId + '-' + i, displayStart: b.newStart, displayLines: b.newLines,
-					zoneAfterLineNumber: b.newStart, oldLinesToShow: b.oldText.match(/[^\r\n]*(?:\r\n|\n|\r)|[^\r\n]+$/g) || [],
-					state: 'pending', decided: false, source: 'preview', preview: true }));
-			}
 			return formal.map(entry => {
-				if (entry.decided) { return { ...entry, oldRanges: [], newRanges: [] }; }
-				const diff = this.wordResults[entry.id];
-				const oldRanges = [], newRanges = [];
-				if (diff && !diff.timedOut && !diff.wordsTimedOut) {
-					for (const block of diff.blocks) {
-						oldRanges.push(...block.oldRanges.map(r => ({ ...r, line: r.line + block.oldStart })));
-						newRanges.push(...block.newRanges.map(r => ({ ...r, line: r.line + block.newStart })));
-					}
-				}
-				return { ...entry, oldRanges, newRanges };
+				const ranges = entry.decided ? undefined : this.wordResults[entry.id];
+				return { ...entry, oldRanges: ranges?.oldRanges || [], newRanges: ranges?.newRanges || [] };
 			});
-		}
-		status() {
-			if (this.failed) { return '实时预览暂不可用 · 显示最近审查区块'; }
-			if (this.isPreview()) { return this.state.dirty ? '未保存预览，保存后可审查' : '正在同步审查状态…'; }
-			return '';
 		}
 	}
 	// Project source columns into the colorizer input, including expanded tabs.
@@ -137,7 +106,7 @@
 			markTextNodes(code, projection.ranges);
 		} catch { /* Safe plain-text highlighting is already present. */ }
 	}
-	window.CliDiffPreview = CliDiffPreview;
+	window.CliDiffHunkHighlighter = CliDiffHunkHighlighter;
 	window.cliColorizeOldLine = colorizeOldLine;
 	window.cliPreviewRendering = { projectLine, markTextNodes };
 })();

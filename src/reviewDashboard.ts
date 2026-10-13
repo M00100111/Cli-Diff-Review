@@ -1909,6 +1909,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				revision: file.revision,
 				relativePath: file.relativePath,
 				dirty: file.dirty,
+				acceptDisabled: file.acceptDisabled,
 				chunks: file.chunks || [],
 				aiReviewResult: file.aiReviewResult,
 			});
@@ -1931,9 +1932,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		function updateBulkActionButtons(files) {
 			const pendingCount = files.reduce((sum, file) => sum + (file.pendingCount || 0), 0);
 			const reviewedCount = files.reduce((sum, file) => sum + (file.reviewedCount || 0), 0);
-			acceptAllButton.disabled = pendingCount === 0;
-			rejectAllButton.disabled = pendingCount === 0;
-			undoAllButton.disabled = reviewedCount === 0;
+			acceptAllButton.disabled = pendingCount === 0 || files.some(file => file.pendingCount > 0 && file.acceptDisabled);
+			rejectAllButton.disabled = pendingCount === 0 || files.some(file => file.pendingCount > 0 && file.rejectDisabled);
+			undoAllButton.disabled = reviewedCount === 0 || files.some(file => file.reviewedCount > 0 && file.undoDisabled);
 		}
 
 		function renderWiki(wiki) {
@@ -2507,6 +2508,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				action.className = 'review-suggestion-action';
 				action.textContent = 'Accept';
 				action.title = 'Accept AI suggestion';
+				action.disabled = !chunk.canAccept;
 				action.setAttribute('aria-label', 'Accept AI suggestion');
 				action.addEventListener('click', (event) => {
 					event.preventDefault();
@@ -3254,7 +3256,9 @@ export function buildReviewDashboardPayload(
 				const findingCount = findingsByFile.get(fileUri)?.length ?? 0;
 				const suggestionCount = suggestionsByFile.get(fileUri)?.length ?? 0;
 				const dirty = isDirty(file.uri);
-				const mutationDisabled = dirty || Boolean(file.skippedReason);
+				const document = vscode.workspace.textDocuments.find(item => uriKey(item.uri) === uriKey(file.uri));
+				const syncing = Boolean(document && file.currentExists && document.getText() !== file.newText);
+				const mutationDisabled = dirty || syncing || Boolean(file.skippedReason);
 				const status = dashboardStatus(file);
 				const displayPath = aggregate && file.projectName ? `${file.projectName}/${file.relativePath}` : file.relativePath;
 				return {

@@ -117,17 +117,16 @@ export type ReviewNavigationResponse =
 	| { type: 'references'; title: string; sourceUri: string; targets: ReviewNavigationTargetPayload[] };
 
 interface ReviewWebviewPayload {
-	comparisonBaseText: string;
-	reviewText: string;
+	reviewPending: boolean;
 	acknowledgedEditVersion?: number;
 	acknowledgedEditSession?: string;
 	uri: string;
 	relativePath: string;
-	oldText: string;
 	newText: string;
 	revision: number;
 	dirty: boolean;
 	readOnly: boolean;
+	mutationPending?: boolean;
 	languageId: string;
 	pendingHunks: ReviewHunk[];
 	acceptedHunks: ReviewedHunk[];
@@ -145,6 +144,7 @@ interface ReviewEditorHost {
 	panel: vscode.WebviewPanel;
 	ready: boolean;
 	stateSequence: number;
+	lastPayload?: ReviewWebviewPayload;
 	acknowledgedEditVersion?: number;
 	acknowledgedEditSession?: string;
 	revealPosition?: { line: number; column: number };
@@ -407,12 +407,18 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 		}
 
 		const file = this.getSession()?.files.get(host.key);
-		if (!file) {
-			return;
-		}
-
-		host.panel.title = `Review: ${path.basename(file.relativePath)}`;
-		const payload = this.serialize(file, host.document, host.revealPosition);
+		if (!file && !host.lastPayload) { return; }
+		const text = host.document.getText();
+		const payload: ReviewWebviewPayload = file ? this.serialize(file, host.document, host.revealPosition) : {
+			...host.lastPayload!, newText: text, dirty: host.document.isDirty,
+			...(host.document.isDirty ? {} : {
+				reviewPending: false, pendingHunks: [], acceptedHunks: [], rejectedHunks: [], appliedAiSuggestions: [],
+				skippedReason: undefined, revision: host.lastPayload!.revision + 1,
+			}),
+		};
+		host.panel.title = `Review: ${path.basename(payload.relativePath)}`;
+		payload.mutationPending = [...this.pendingMutations].some(key => key.startsWith(`${host.uri.toString()}::`));
+		host.lastPayload = payload;
 		payload.acknowledgedEditVersion = host.acknowledgedEditVersion ?? 0;
 		payload.acknowledgedEditSession = host.acknowledgedEditSession;
 		const sequence = ++host.stateSequence;
@@ -427,9 +433,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 		return {
 			uri: file.uri.toString(),
 			relativePath: file.relativePath,
-			oldText: file.oldText,
-			comparisonBaseText: file.gitSnapshot?.indexText ?? file.oldText,
-			reviewText: file.newText,
+			reviewPending: !usesReviewStateText && document.getText() !== file.newText,
 			newText: usesReviewStateText ? file.newText : document.getText(),
 			revision: file.revision,
 			dirty: usesReviewStateText ? false : document.isDirty,
@@ -939,7 +943,8 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 		let applyingState = false;
 		let lineDecorations = [];
 		let wordDecorations = [];
-		let preview;
+		let highlighter;
+		let hasRenderedReview = false;
 		let renderVersion = 0;
 		let clientVersion = 0;
 		const clientSession = crypto.randomUUID();
@@ -1307,7 +1312,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 			const pendingInput = model && acknowledgedVersion < clientVersion;
 			state = pendingInput ? Object.assign({}, nextState, { newText: model.getValue(), dirty: true }) : nextState;
 			dirty = Boolean(state.dirty);
-			pendingMutationKey = undefined;
+			if (!state.mutationPending && !dirty && !state.reviewPending) { pendingMutationKey = undefined; }
 			if (!ready) {
 				return;
 			}
@@ -1337,11 +1342,12 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 			}
 
 			previousModelText = model.getValue();
-			if (!preview) {
-				preview = new window.CliDiffPreview(${JSON.stringify(previewWorkerUri)}, function () { renderInlineDiff(); updateFooter(); });
-				window.addEventListener('pagehide', function () { preview.dispose(); });
+			if (!highlighter) {
+				highlighter = new window.CliDiffHunkHighlighter(${JSON.stringify(previewWorkerUri)}, function () { if (!reviewUnavailable()) { renderInlineDiff(); } });
+				window.addEventListener('pagehide', function () { highlighter.dispose(); });
 			}
-			preview.update(state, model, !dirty);
+			if (reviewUnavailable()) { highlighter.suspend(); }
+			else { highlighter.update(state); }
 			renderInlineDiff();
 			updateFooter();
 			revealStatePosition();
@@ -1373,10 +1379,14 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 			});
 			previousModelText = model.getValue();
 			state = Object.assign({}, state, { dirty: true });
-			preview.update(state, model, false);
+			highlighter?.suspend();
 			renderInlineDiff();
 			setMutationButtonsDisabled(true);
 			updateFooter();
+		}
+
+		function reviewUnavailable() {
+			return dirty || Boolean(state?.mutationPending) || Boolean(state?.reviewPending);
 		}
 
 		function renderInlineDiff() {
@@ -1384,9 +1394,15 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 				return;
 			}
 
+			if (reviewUnavailable() && hasRenderedReview) {
+				wordDecorations = editor.deltaDecorations(wordDecorations, []);
+				setMutationButtonsDisabled(true);
+				return;
+			}
+			hasRenderedReview = true;
 			const oldZoneIds = zoneIds;
 			renderVersion++;
-			hunkEntries = preview ? preview.entries(buildHunkEntries()) : buildHunkEntries();
+			hunkEntries = highlighter ? highlighter.entries(buildHunkEntries()) : buildHunkEntries();
 			const lineHeight = editor.getOption(monaco.editor.EditorOption.lineHeight) || 20;
 
 			editor.changeViewZones(function (accessor) {
@@ -1455,7 +1471,8 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 				statusNode.textContent = 'Unsupported Git change: ' + state.skippedReason;
 				return;
 			}
-			if (preview?.status()) { statusNode.textContent = preview.status(); return; }
+			if (dirty) { statusNode.textContent = 'Unsaved changes · Save to continue review'; return; }
+			if (reviewUnavailable()) { statusNode.textContent = 'Updating Git changes…'; return; }
 			const reviewedCount = state.acceptedHunks.length + state.rejectedHunks.length;
 			statusNode.textContent = state.pendingHunks.length + ' pending \\u00b7 ' + reviewedCount + ' reviewed';
 		}
@@ -1573,10 +1590,10 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 			actions.className = 'cli-actions';
 			header.appendChild(actions);
 
-			if (!entry.decided && !entry.preview) {
+			if (!entry.decided) {
 				actions.appendChild(createButton(labels.reject, 'reject', entry));
 				actions.appendChild(createButton(labels.accept, 'accept', entry));
-			} else if (!entry.preview && (entry.source === 'accept' || entry.source === 'reject')) {
+			} else if (entry.source === 'accept' || entry.source === 'reject') {
 				actions.appendChild(createButton(labels.undo, 'restore', entry));
 			}
 			actions.appendChild(createButton(labels.previous, 'previous', entry));
@@ -1617,7 +1634,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 			button.dataset.command = command;
 			button.dataset.hunkId = entry.id;
 			button.className = buttonClass(command);
-			button.disabled = Boolean((isMutationCommand(command) && (dirty || preview?.isPreview() || pendingMutationKey)) || (isNavigationCommand(command) && hunkEntries.length <= 1));
+			button.disabled = Boolean((isMutationCommand(command) && (reviewUnavailable() || pendingMutationKey)) || (isNavigationCommand(command) && hunkEntries.length <= 1));
 			return button;
 		}
 
@@ -1662,7 +1679,7 @@ export class ReviewWebviewManager implements vscode.CustomTextEditorProvider, vs
 				pendingMutationKey = mutationKey;
 				setMutationButtonsDisabled(true);
 			}
-			if (dirty || preview?.isPreview()) {
+			if (reviewUnavailable()) {
 				pendingMutationKey = undefined;
 				setMutationButtonsDisabled(true);
 				updateFooter();
