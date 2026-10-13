@@ -5315,6 +5315,7 @@ export class ReviewController implements vscode.Disposable {
 			return;
 		}
 		const disk = await this.readCurrentText(uri, { preferDisk: true });
+		if (document.isDirty || document.isClosed) { return; }
 		if (!disk.exists) {
 			const tabs = vscode.window.tabGroups.all.flatMap((group) => group.tabs).filter((tab) => {
 				const input = tab.input;
@@ -5328,14 +5329,27 @@ export class ReviewController implements vscode.Disposable {
 		if (document.getText() === disk.text) {
 			return;
 		}
-		await this.withInternalWrite(uri, 'plugin', async () => {
-			const edit = new vscode.WorkspaceEdit();
-			const fullRange = new vscode.Range(new vscode.Position(0, 0), document.positionAt(document.getText().length));
-			edit.replace(uri, fullRange, disk.text);
-			if (!await vscode.workspace.applyEdit(edit)) {
-				throw new Error('VS Code could not synchronize the open editor after the Git change.');
-			}
-			await document.save();
+		// Git already wrote the file. Applying an edit and saving here races VS Code's
+		// disk-version tracking and can produce a modified-since save conflict.
+		// Wait briefly for its native reload; never dirty, save, or revert the buffer.
+		await new Promise<void>((resolve) => {
+			const finish = () => {
+				clearTimeout(timer);
+				changed.dispose();
+				closed.dispose();
+				resolve();
+			};
+			const settled = () => document.isClosed || document.isDirty || document.getText() === disk.text;
+			const changed = vscode.workspace.onDidChangeTextDocument((event) => {
+				if (event.document === document && settled()) { finish(); }
+			});
+			const closed = vscode.workspace.onDidCloseTextDocument((item) => {
+				if (item === document) { finish(); }
+			});
+			// A late reload still updates the Review view through the normal document
+			// listener. Until then its existing reviewPending guard blocks mutations.
+			const timer = setTimeout(finish, 1500);
+			if (settled()) { finish(); }
 		});
 	}
 
