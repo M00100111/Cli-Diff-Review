@@ -12,7 +12,7 @@ import { acceptHunkInBaseline, computeLineDiff } from '../diffEngine';
 import { GitService, parseCatFileBatch } from '../gitService';
 import { combineGitHunkPatches, decodeGitPath, parseGitPatch } from '../gitPatch';
 import { expectedRejectedFileHash, fileStateHash, GitReviewJournalStore } from '../gitReviewJournal';
-import { AnthropicClient, DeepSeekClient, GlmClient, LlmJsonRequest, OpenAiCompatibleClient } from '../llm/client';
+import { DeepSeekClient, GlmClient, LlmJsonRequest } from '../llm/client';
 import { LlmConfigStore } from '../llm/config';
 import { parseStrictJsonObject } from '../llm/json';
 import { buildReviewDashboardPayload, defaultLlmWikiDashboardState, ReviewDashboardProvider } from '../reviewDashboard';
@@ -358,7 +358,7 @@ suite('Review webview compatibility', () => {
 	});
 
 	test('invokes completed Review editor cleanup only from the manual refresh flow', () => {
-		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
+		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8').replace(/\r\n/g, '\n');
 		assert.match(source, /refreshGitSessionFiles\(\{ source: 'manual' \}\);\s+this\.closeCompletedReviewEditorsAfterManualRefresh\(\);/);
 		assert.doesNotMatch(source, /refreshGitSessionFiles\(\{ source: 'gitIndexChanged' \}\);\s+this\.closeCompletedReviewEditorsAfterManualRefresh\(\);/);
 	});
@@ -373,14 +373,17 @@ suite('Extension configuration', () => {
 			'cliDiff.autoStartGitReview',
 			'cliDiff.refreshDebounceMs',
 			'cliDiff.reviewWikiChanges',
-			'cliDiff.aiReviewStrategy',
 			'cliDiff.aiReviewMaxRounds',
 			'cliDiff.agentConcurrency',
 			'cliDiff.aiReviewLanguage',
+			'cliDiff.aiReviewTotalBudgetTokens',
+			'cliDiff.aiReviewChildConcurrency',
+			'cliDiff.aiReviewAutoCompress',
+			'cliDiff.aiReviewChangeNotificationLimit',
 		];
 		const properties = manifest.contributes?.configuration?.properties ?? {};
 		assert.deepStrictEqual(Object.keys(properties), expected);
-		assert.deepStrictEqual(expected.map((key) => properties[key]?.order), [1, 2, 3, 4, 5, 6, 7]);
+		assert.deepStrictEqual(expected.map((key) => properties[key]?.order), [1, 2, 3, 5, 6, 7, 8, 9, 10, 11]);
 	});
 
 	test('declares one refresh debounce setting for background synchronization', () => {
@@ -475,22 +478,13 @@ suite('Extension configuration', () => {
 		assert.match(String(setting.description), /0 means unlimited/);
 	});
 
-	test('declares AI review strategy setting defaults', () => {
-		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
-			contributes?: { configuration?: { properties?: Record<string, unknown> } };
-		};
-		const setting = manifest.contributes?.configuration?.properties?.['cliDiff.aiReviewStrategy'] as {
-			type?: unknown;
-			default?: unknown;
-			enum?: unknown[];
-		} | undefined;
-
-		assert.ok(setting);
-		assert.strictEqual(setting.type, 'string');
-		assert.strictEqual(setting.default, 'Multi');
-		assert.deepStrictEqual(setting.enum, ['Auto', 'Multi', 'FileOnly']);
-	});
-
+	test('removes legacy review strategies and defaults to on-demand children', () => {
+ const properties = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')).contributes.configuration.properties;
+ assert.strictEqual(properties['cliDiff.aiReviewStrategy'], undefined);
+ assert.strictEqual(properties['cliDiff.aiReviewChildConcurrency'].default, 5);
+ assert.strictEqual(properties['cliDiff.aiReviewAutoCompress'].default, false);
+ assert.strictEqual(properties['cliDiff.aiReviewTotalBudgetTokens'].default, 1000000);
+ });
 
 	test('declares Agent concurrency setting defaults', () => {
 		const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as {
@@ -640,7 +634,7 @@ suite('Review controller bulk actions', () => {
 	});
 
 	test('wires bulk review commands through confirmation and file-level cores', () => {
-		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
+		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8').replace(/\r\n/g, '\n');
 
 		assert.ok(source.includes("this.registerCommand('cli-diff.acceptAll', () => this.acceptAll())"));
 		assert.ok(source.includes("this.registerCommand('cli-diff.rejectAll', () => this.rejectAll())"));
@@ -669,7 +663,7 @@ suite('Review controller bulk actions', () => {
 	});
 
 	test('confirms LLM Code Wiki initialization after resolving the target project', () => {
-		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
+		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8').replace(/\r\n/g, '\n');
 		const confirmationIndex = source.indexOf('`${continueExisting ? \'Continue\' : \'Initialize\'} LLM Code Wiki for “${root.name}”?`');
 		const taskIndex = source.indexOf("this.beginProjectAgentTask('initialize', root, project?.id, continueExisting)");
 
@@ -680,19 +674,13 @@ suite('Review controller bulk actions', () => {
 	});
 
 	test('wires AI review partial retry and max round configuration through the controller', () => {
-		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
+		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8').replace(/\r\n/g, '\n');
 
 		assert.ok(source.includes("event.affectsConfiguration('cliDiff.aiReviewMaxRounds')"));
-		assert.ok(source.includes("event.affectsConfiguration('cliDiff.aiReviewStrategy')"));
 		assert.ok(source.includes("event.affectsConfiguration('cliDiff.agentConcurrency')"));
 		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<number>('aiReviewMaxRounds', 32)"));
-		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<string>('aiReviewStrategy', 'Multi')"));
 		assert.ok(source.includes("vscode.workspace.getConfiguration('cliDiff').get<number>('agentConcurrency', 3)"));
 		assert.strictEqual(source.includes('aiReviewFindingOrder'), false);
-		assert.ok(source.includes('const strategy = this.aiReviewStrategy();'));
-		assert.ok(source.includes('const fileConcurrency = this.agentConcurrency();'));
-		assert.ok(source.includes('strategy,'));
-		assert.ok(source.includes('fileConcurrency,'));
 		assert.ok(source.includes("return 'unlimited';"));
 		assert.ok(source.includes("const existingReview = mode === 'regenerate'"));
 		assert.ok(source.includes("'Regenerate AI review?'"));
@@ -720,7 +708,7 @@ suite('Review controller bulk actions', () => {
 	});
 
 	test('uses one configured interval while throttling continuous AI dashboard events', () => {
-		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8');
+		const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewController.ts'), 'utf8').replace(/\r\n/g, '\n');
 		const dashboardScheduler = source.slice(
 			source.indexOf('private scheduleLlmWikiDashboardRefresh(): void'),
 			source.indexOf('private refreshReviewPresentation(', source.indexOf('private scheduleLlmWikiDashboardRefresh(): void')),
@@ -1688,7 +1676,7 @@ suite('Review state', () => {
 		assert.strictEqual(view.webview.html.includes('No findings for this chunk.'), false);
 		assert.ok(view.webview.html.includes("chunk.reviewStatus === 'reviewed'"));
 		assert.strictEqual(view.webview.html.includes('review-chunk-preview'), false);
-		const dashboardSource = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewDashboard.ts'), 'utf8');
+		const dashboardSource = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'reviewDashboard.ts'), 'utf8').replace(/\r\n/g, '\n');
 		assert.strictEqual(dashboardSource.includes('dashboardChunkPreview'), false);
 		assert.ok(view.webview.html.includes('var(--file-extension-column-width, auto)'));
 		assert.ok(view.webview.html.includes("tree.style.removeProperty('--file-extension-column-width')"));
@@ -1750,6 +1738,9 @@ suite('Review state', () => {
 			jsonOutputEnabled: true,
 			thinkingMode: 'max',
 			strictTools: true,
+			contextWindowTokens: 128000,
+			compressionThresholdPercent: 40,
+			maxOutputTokens: 12000,
 		});
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		const save = commands.find((call) => call.command === 'cli-diff.saveLlmWikiConfig');
@@ -1761,6 +1752,9 @@ suite('Review state', () => {
 			jsonOutputEnabled: true,
 			thinkingMode: 'max',
 			strictTools: true,
+			contextWindowTokens: 128000,
+			compressionThresholdPercent: 40,
+			maxOutputTokens: 12000,
 		});
 		messageHandler({ type: 'openWikiIndex' });
 		messageHandler({ type: 'openExtensionSettings' });
@@ -2106,7 +2100,7 @@ suite('LLM Code Wiki', () => {
 			const service = new WikiInitializationService(vscode.Uri.file(extensionRoot));
 			const result = await service.initialize({
 				root: workspaceFolder(repositoryRoot),
-				config: { provider: 'openai', baseUrl: 'https://example.test', model: 'wiki-test', apiKey: 'secret' },
+				config: { provider: 'deepseek', baseUrl: 'https://example.test', model: 'wiki-test', apiKey: 'secret' },
 				client: { completeJson: async () => responses.shift() ?? '' },
 				onTrace: (event, context) => trace.push({ event, stage: context.stage, moduleId: context.moduleId }),
 			});
@@ -2206,7 +2200,7 @@ suite('LLM Code Wiki', () => {
 				};
 				await new WikiInitializationService(vscode.Uri.file(extensionRoot)).initialize({
 					root: workspaceFolder(repositoryRoot),
-					config: { provider: 'openai', baseUrl: 'https://example.test', model: 'wiki-test', apiKey: 'secret' },
+					config: { provider: 'deepseek', baseUrl: 'https://example.test', model: 'wiki-test', apiKey: 'secret' },
 					client,
 					concurrency: configured,
 				});
@@ -2277,7 +2271,7 @@ suite('LLM Code Wiki', () => {
 			const firstService = new WikiInitializationService(vscode.Uri.file(extensionRoot), vscode.Uri.file(storageRoot));
 			await assert.rejects(() => firstService.initialize({
 				root: workspaceFolder(repositoryRoot),
-				config: { provider: 'openai', baseUrl: 'https://example.test', model: 'wiki-test', apiKey: 'secret' },
+				config: { provider: 'deepseek', baseUrl: 'https://example.test', model: 'wiki-test', apiKey: 'secret' },
 				client: firstClient,
 				concurrency: 1,
 			}), /Temporary second-module failure/);
@@ -2341,7 +2335,7 @@ suite('LLM Code Wiki', () => {
 			const resumedService = new WikiInitializationService(vscode.Uri.file(extensionRoot), vscode.Uri.file(storageRoot));
 			const result = await resumedService.initialize({
 				root: workspaceFolder(repositoryRoot),
-				config: { provider: 'openai', baseUrl: 'https://example.test', model: 'wiki-test', apiKey: 'secret' },
+				config: { provider: 'deepseek', baseUrl: 'https://example.test', model: 'wiki-test', apiKey: 'secret' },
 				client: resumedClient,
 				concurrency: 1,
 			});
@@ -2370,41 +2364,6 @@ suite('LLM Code Wiki', () => {
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
-	});
-
-	test('extracts OpenAI-compatible JSON content from chat completions', async () => {
-		const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
-		const fetchImpl: typeof fetch = async (input, init) => {
-			calls.push({ url: String(input), init });
-			return new Response(JSON.stringify({
-				choices: [{ message: { content: '{"version":1}' } }],
-			}), { status: 200 });
-		};
-		const client = new OpenAiCompatibleClient('https://api.example.test/v1', 'secret', fetchImpl);
-		const content = await client.completeJson({
-			model: 'gpt-test',
-			systemPrompt: 'system',
-			userPrompt: 'user',
-		});
-
-		assert.strictEqual(content, '{"version":1}');
-		assert.strictEqual(calls[0].url, 'https://api.example.test/v1/chat/completions');
-		assert.strictEqual((calls[0].init?.headers as Record<string, string>).authorization, 'Bearer secret');
-		const body = JSON.parse(String(calls[0].init?.body));
-		assert.strictEqual(body.model, 'gpt-test');
-		assert.deepStrictEqual(body.response_format, { type: 'json_object' });
-	});
-
-	test('allows OpenAI-compatible JSON Output to be disabled explicitly', async () => {
-		let body: Record<string, unknown> = {};
-		const client = new OpenAiCompatibleClient('https://api.example.test/v1', 'secret', async (_input, init) => {
-			body = JSON.parse(String(init?.body));
-			return new Response(JSON.stringify({ choices: [{ message: { content: '{"version":1}' } }] }), { status: 200 });
-		}, false);
-
-		await client.completeJson({ model: 'custom', systemPrompt: 'json system', userPrompt: 'user' });
-
-		assert.strictEqual(body.response_format, undefined);
 	});
 
 	test('sends DeepSeek JSON Output, thinking, and strict native tools', async () => {
@@ -2509,61 +2468,62 @@ suite('LLM Code Wiki', () => {
 		assert.strictEqual(body.reasoning_effort, undefined);
 	});
 
-	test('extracts Anthropic JSON content from messages responses', async () => {
-		const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
-		const fetchImpl: typeof fetch = async (input, init) => {
-			calls.push({ url: String(input), init });
-			return new Response(JSON.stringify({
-				content: [{ type: 'text', text: '{"version":1}' }],
-			}), { status: 200 });
-		};
-		const client = new AnthropicClient('https://api.anthropic.test', 'secret', fetchImpl);
-		const content = await client.completeJson({
-			model: 'claude-test',
-			systemPrompt: 'system',
-			userPrompt: 'user',
-		});
-
-		assert.strictEqual(content, '{"version":1}');
-		assert.strictEqual(calls[0].url, 'https://api.anthropic.test/v1/messages');
-		assert.strictEqual((calls[0].init?.headers as Record<string, string>)['x-api-key'], 'secret');
-		assert.strictEqual(JSON.parse(String(calls[0].init?.body)).model, 'claude-test');
-	});
-
 	test('stores LLM config globally while keeping API key in secrets', async () => {
 		const globalState = new TestMemento();
 		const secrets = new TestSecretStorage();
 		const store = new LlmConfigStore({ globalState, secrets } as unknown as vscode.ExtensionContext);
 
 		await store.save({
-			provider: 'anthropic',
-			baseUrl: ' https://api.anthropic.com ',
-			model: ' claude-test ',
+			contextWindowTokens: 128000,
+			provider: 'glm',
+			baseUrl: ' https://glm.example.test ',
+			model: ' glm-test ',
 			apiKey: ' secret-key ',
 		});
 		const saved = await store.savedConfig();
 		const runtime = await store.runtimeConfig();
 
-		assert.strictEqual(saved.provider, 'anthropic');
-		assert.strictEqual(saved.baseUrl, 'https://api.anthropic.com');
-		assert.strictEqual(saved.model, 'claude-test');
+		assert.strictEqual(saved.provider, 'glm');
+		assert.strictEqual(saved.baseUrl, 'https://glm.example.test');
+		assert.strictEqual(saved.model, 'glm-test');
 		assert.strictEqual(saved.configured, true);
 		assert.strictEqual(saved.profiles.length, 1);
 		assert.strictEqual(saved.profiles[0].id, saved.activeProfileId);
 		assert.strictEqual(runtime?.apiKey, 'secret-key');
-		assert.strictEqual(saved.jsonOutputEnabled, false);
-		assert.strictEqual(saved.thinkingMode, 'disabled');
+		assert.strictEqual(saved.jsonOutputEnabled, true);
+		assert.strictEqual(saved.thinkingMode, 'high');
 		assert.strictEqual(saved.strictTools, false);
 		assert.strictEqual(globalState.values.has('cliDiff.llm.apiKey'), false);
 
 		await store.save({
+			contextWindowTokens: 128000,
 			profileId: saved.activeProfileId,
-			provider: 'anthropic',
-			baseUrl: 'https://api.anthropic.com',
-			model: 'claude-updated',
+			provider: 'glm',
+			baseUrl: 'https://glm.example.test',
+			model: 'glm-updated',
 			apiKey: '',
 		});
 		assert.strictEqual((await store.runtimeConfig())?.apiKey, 'secret-key');
+	});
+
+	test('allows model configuration without optional context and output fields', async () => {
+		const globalState = new TestMemento();
+		const secrets = new TestSecretStorage();
+		const store = new LlmConfigStore({ globalState, secrets } as unknown as vscode.ExtensionContext);
+		const input = { provider: 'deepseek' as const, baseUrl: '', model: 'test', apiKey: 'secret' };
+		const saved = await store.save(input);
+		assert.strictEqual(saved.configured, true);
+		assert.strictEqual(saved.contextWindowTokens, undefined);
+		assert.strictEqual(saved.compressionThresholdPercent, 40);
+		assert.strictEqual(saved.maxOutputTokens, 12000);
+		const reloaded = new LlmConfigStore({ globalState, secrets } as unknown as vscode.ExtensionContext);
+		assert.strictEqual((await reloaded.savedConfig()).configured, true);
+		assert.strictEqual((await reloaded.runtimeConfig())?.apiKey, 'secret');
+		const small = await store.save({ ...input, profileId: saved.activeProfileId, contextWindowTokens: 4096 });
+		assert.ok(small.maxOutputTokens! < 4096);
+		await assert.rejects(store.save({ ...input, contextWindowTokens: 0 }), /Context window/);
+		await assert.rejects(store.save({ ...input, maxOutputTokens: NaN }), /Invalid/);
+		await assert.rejects(store.save({ ...input, compressionThresholdPercent: 0 }), /Invalid/);
 	});
 
 	test('stores DeepSeek capabilities and applies provider defaults', async () => {
@@ -2572,6 +2532,7 @@ suite('LLM Code Wiki', () => {
 		const store = new LlmConfigStore({ globalState, secrets } as unknown as vscode.ExtensionContext);
 
 		const saved = await store.save({
+			contextWindowTokens: 128000,
 			provider: 'deepseek',
 			baseUrl: '',
 			model: 'deepseek-custom',
@@ -2593,6 +2554,7 @@ suite('LLM Code Wiki', () => {
 		const store = new LlmConfigStore({ globalState, secrets } as unknown as vscode.ExtensionContext);
 
 		const saved = await store.save({
+			contextWindowTokens: 128000,
 			provider: 'glm',
 			baseUrl: '',
 			model: '',
@@ -2613,71 +2575,10 @@ suite('LLM Code Wiki', () => {
 		assert.strictEqual(runtime?.apiKey, 'secret-key');
 	});
 
-	test('migrates legacy provider config to capability defaults', async () => {
-		const openAiState = new TestMemento();
-		openAiState.values.set('cliDiff.llm.provider', 'openai');
-		openAiState.values.set('cliDiff.llm.baseUrl', 'https://api.openai.com/v1');
-		openAiState.values.set('cliDiff.llm.model', 'gpt-test');
-		const anthropicState = new TestMemento();
-		anthropicState.values.set('cliDiff.llm.provider', 'anthropic');
-		anthropicState.values.set('cliDiff.llm.baseUrl', 'https://api.anthropic.com');
-		anthropicState.values.set('cliDiff.llm.model', 'claude-test');
-		const openAiSecrets = new TestSecretStorage();
-		await openAiSecrets.store('cliDiff.llm.apiKey', 'openai-secret');
-		const anthropicSecrets = new TestSecretStorage();
-		await anthropicSecrets.store('cliDiff.llm.apiKey', 'anthropic-secret');
-
-		const openAi = await new LlmConfigStore({ globalState: openAiState, secrets: openAiSecrets } as unknown as vscode.ExtensionContext).savedConfig();
-		const anthropic = await new LlmConfigStore({ globalState: anthropicState, secrets: anthropicSecrets } as unknown as vscode.ExtensionContext).savedConfig();
-
-		assert.strictEqual(openAi.jsonOutputEnabled, true);
-		assert.strictEqual(anthropic.jsonOutputEnabled, false);
-		assert.strictEqual(openAi.thinkingMode, 'disabled');
-		assert.strictEqual(anthropic.strictTools, false);
-		assert.strictEqual(openAi.activeProfileId, 'default');
-		assert.strictEqual(anthropic.profiles[0].configured, true);
-	});
-
-	test('migrates legacy OpenAI-compatible official DeepSeek config', async () => {
-		const globalState = new TestMemento();
-		globalState.values.set('cliDiff.llm.provider', 'openai');
-		globalState.values.set('cliDiff.llm.baseUrl', 'https://api.deepseek.com');
-		globalState.values.set('cliDiff.llm.model', 'deepseek-v4-pro');
-		const secrets = new TestSecretStorage();
-
-		const saved = await new LlmConfigStore({ globalState, secrets } as unknown as vscode.ExtensionContext).savedConfig();
-
-		assert.strictEqual(saved.provider, 'deepseek');
-		assert.strictEqual(saved.baseUrl, 'https://api.deepseek.com');
-		assert.strictEqual(saved.model, 'deepseek-v4-pro');
-		assert.strictEqual(saved.jsonOutputEnabled, true);
-		assert.strictEqual(saved.thinkingMode, 'high');
-		assert.strictEqual(saved.strictTools, true);
-		assert.strictEqual(globalState.values.get('cliDiff.llm.provider'), 'deepseek');
-	});
-
-	test('migrates legacy OpenAI-compatible official GLM config', async () => {
-		const globalState = new TestMemento();
-		globalState.values.set('cliDiff.llm.provider', 'openai');
-		globalState.values.set('cliDiff.llm.baseUrl', 'https://open.bigmodel.cn/api/paas/v4');
-		globalState.values.set('cliDiff.llm.model', 'glm-5.2');
-		const secrets = new TestSecretStorage();
-
-		const saved = await new LlmConfigStore({ globalState, secrets } as unknown as vscode.ExtensionContext).savedConfig();
-
-		assert.strictEqual(saved.provider, 'glm');
-		assert.strictEqual(saved.baseUrl, 'https://open.bigmodel.cn/api/paas/v4');
-		assert.strictEqual(saved.model, 'glm-5.2');
-		assert.strictEqual(saved.jsonOutputEnabled, true);
-		assert.strictEqual(saved.thinkingMode, 'high');
-		assert.strictEqual(saved.strictTools, false);
-		assert.strictEqual(globalState.values.get('cliDiff.llm.provider'), 'glm');
-	});
-
 	test('includes wiki state in dashboard payload', () => {
 		const wiki = {
 			configured: true,
-			provider: 'openai' as const,
+			provider: 'deepseek' as const,
 			baseUrl: 'https://api.openai.com/v1',
 			model: 'gpt-test',
 			hasApiKey: true,
@@ -2693,7 +2594,7 @@ suite('LLM Code Wiki', () => {
 				activeProfileId: 'openai-gpt-test',
 				profiles: [{
 					id: 'openai-gpt-test',
-					provider: 'openai' as const,
+					provider: 'deepseek' as const,
 					baseUrl: 'https://example.test',
 					model: 'gpt-test',
 					hasApiKey: true,
@@ -2747,7 +2648,7 @@ suite('Agent runtime', () => {
 		const trace: AgentTraceEvent[] = [];
 		const runner = new AgentRunner();
 		const result = await runner.run({
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			config: { provider: 'deepseek', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
 			client: { completeJson: async () => responses.shift() ?? '' },
 			systemPrompt: 'test',
 			userPrompt: 'test',
@@ -2785,7 +2686,7 @@ suite('Agent runtime', () => {
 		assert.throws(() => validateAgentResponse({ type: 'final', result: [] }));
 		const runner = new AgentRunner();
 		await assert.rejects(() => runner.run({
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			config: { provider: 'deepseek', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
 			client: { completeJson: async () => '{"type":"tool_calls","calls":[{"id":"x","name":"missing","arguments":{}}]}' },
 			systemPrompt: 'test',
 			userPrompt: 'test',
@@ -2799,7 +2700,7 @@ suite('Agent runtime', () => {
 		const trace: AgentTraceEvent[] = [];
 		const runner = new AgentRunner();
 		const result = await runner.run({
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			config: { provider: 'deepseek', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
 			client: {
 				completeJson: async (request) => {
 					requests.push(request);
@@ -2832,7 +2733,7 @@ suite('Agent runtime', () => {
 		const trace: AgentTraceEvent[] = [];
 		const runner = new AgentRunner();
 		const result = await runner.run({
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			config: { provider: 'deepseek', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
 			client: {
 				completeJson: async (request) => {
 					requests.push(request);
@@ -3025,12 +2926,12 @@ suite('Agent runtime', () => {
 	test('reports provider, model, and preview after correction retries fail', async () => {
 		const runner = new AgentRunner();
 		await assert.rejects(() => runner.run({
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'broken-model', apiKey: 'secret' },
+			config: { provider: 'deepseek', baseUrl: 'https://example.test', model: 'broken-model', apiKey: 'secret' },
 			client: { completeJson: async () => 'Now I have no JSON.' },
 			systemPrompt: 'test json',
 			userPrompt: 'test',
 			tools: [],
-		}), /OpenAI-compatible model "broken-model".*two correction retries.*Now I have no JSON/);
+		}), /DeepSeek model "broken-model".*two correction retries.*Now I have no JSON/);
 	});
 
 	test('enforces cancellation and runtime limits', async () => {
@@ -3039,7 +2940,7 @@ suite('Agent runtime', () => {
 			signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
 		});
 		await assert.rejects(() => runner.run({
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			config: { provider: 'deepseek', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
 			client: { completeJson: waitForAbort },
 			systemPrompt: 'test',
 			userPrompt: 'test',
@@ -3050,7 +2951,7 @@ suite('Agent runtime', () => {
 		const abortController = new AbortController();
 		abortController.abort();
 		await assert.rejects(() => runner.run({
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			config: { provider: 'deepseek', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
 			client: { completeJson: async () => '{"type":"final","result":{}}' },
 			systemPrompt: 'test',
 			userPrompt: 'test',
@@ -3068,7 +2969,7 @@ suite('Agent runtime', () => {
 		};
 		const limitedRunner = new AgentRunner();
 		await assert.rejects(() => limitedRunner.run({
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			config: { provider: 'deepseek', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
 			client: { completeJson: async () => '{"type":"tool_calls","calls":[{"id":"call-1","name":"echo","arguments":{}}]}' },
 			systemPrompt: 'test',
 			userPrompt: 'test',
@@ -3081,7 +2982,7 @@ suite('Agent runtime', () => {
 			'{"type":"final","result":{"summary":"done"}}',
 		];
 		const unlimitedResult = await new AgentRunner().run({
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			config: { provider: 'deepseek', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
 			client: { completeJson: async () => responses.shift() ?? '' },
 			systemPrompt: 'test',
 			userPrompt: 'test',
@@ -3108,7 +3009,7 @@ suite('Agent runtime', () => {
 		];
 		let checkpoint: AgentRunCheckpoint | undefined;
 		await assert.rejects(() => new AgentRunner().run({
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			config: { provider: 'deepseek', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
 			client: {
 				completeJson: async () => {
 					const response = responses.shift();
@@ -3132,7 +3033,7 @@ suite('Agent runtime', () => {
 
 		const resumedRequests: unknown[] = [];
 		const resumed = await new AgentRunner().run({
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
+			config: { provider: 'deepseek', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
 			client: {
 				completeJson: async (request) => {
 					resumedRequests.push(request);
@@ -3449,596 +3350,6 @@ suite('Wiki state', () => {
 });
 
 suite('AI review findings', () => {
-	test('passes Agent trace events with file context through AI review', async () => {
-		const firstUri = vscode.Uri.file('/repo/src/a.ts');
-		const secondUri = vscode.Uri.file('/repo/src/b.ts');
-		const firstHunk = computeLineDiff(firstUri.toString(), 'a\n', 'aa\n')[0];
-		const secondHunk = computeLineDiff(secondUri.toString(), 'b\n', 'bb\n')[0];
-		const session: ReviewSession = {
-			id: 'ai-review-trace',
-			mode: 'git',
-			rootUri: vscode.Uri.file('/repo'),
-			createdAt: 1,
-			files: new Map([
-				[firstUri.toString(), reviewFileState(firstUri, 'src/a.ts', { hunks: [firstHunk] })],
-				[secondUri.toString(), reviewFileState(secondUri, 'src/b.ts', { hunks: [secondHunk] })],
-			]),
-		};
-		const responses = [
-			`{"type":"final","result":{"findings":[{"hunkId":"${firstHunk.id}","severity":"warning","title":"A","explanation":"Risk A","recommendation":"Fix A"}]}}`,
-			`{"type":"final","result":{"findings":[{"hunkId":"${secondHunk.id}","severity":"info","title":"B","explanation":"Risk B","recommendation":"Fix B"}]}}`,
-		];
-		const trace: Array<{ event: AgentTraceEvent; relativePath: string; fileIndex: number; fileCount: number }> = [];
-		const service = new CodeReviewAgentService();
-
-		const result = await service.review({
-			session,
-			root: workspaceFolder('/repo'),
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
-			client: { completeJson: async () => responses.shift() ?? '' },
-			language: 'en',
-			strategy: 'FileOnly',
-			onTrace: (event, context) => trace.push({
-				event,
-				relativePath: context.relativePath ?? '',
-				fileIndex: context.fileIndex ?? 0,
-				fileCount: context.fileCount ?? 0,
-			}),
-		});
-
-		assert.strictEqual(result.findings.length, 2);
-		assert.ok(trace.some((item) => item.event.kind === 'llm_request' && item.relativePath === 'src/a.ts' && item.fileIndex === 1 && item.fileCount === 2));
-		assert.ok(trace.some((item) => item.event.title === 'Review findings parsed' && item.relativePath === 'src/b.ts'));
-	});
-
-
-	test('runs file review concurrently when file concurrency is zero', async () => {
-		const firstUri = vscode.Uri.file('/repo/src/a.ts');
-		const secondUri = vscode.Uri.file('/repo/src/b.ts');
-		const firstHunk = computeLineDiff(firstUri.toString(), 'a\n', 'aa\n')[0];
-		const secondHunk = computeLineDiff(secondUri.toString(), 'b\n', 'bb\n')[0];
-		const session: ReviewSession = {
-			id: 'ai-review-file-concurrency',
-			mode: 'git',
-			rootUri: vscode.Uri.file('/repo'),
-			createdAt: 1,
-			files: new Map([
-				[firstUri.toString(), reviewFileState(firstUri, 'src/a.ts', { hunks: [firstHunk] })],
-				[secondUri.toString(), reviewFileState(secondUri, 'src/b.ts', { hunks: [secondHunk] })],
-			]),
-		};
-		let activeRequests = 0;
-		let maxActiveRequests = 0;
-		let firstStarted: (() => void) | undefined;
-		const firstStartedPromise = new Promise<void>((resolve) => {
-			firstStarted = resolve;
-		});
-
-		const result = await new CodeReviewAgentService().review({
-			session,
-			root: workspaceFolder('/repo'),
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
-			client: {
-				completeJson: async (request) => {
-					const userPrompt = request.messages?.find((message) => message.role === 'user')?.content ?? '';
-					if (userPrompt.includes('src/a.ts')) {
-						activeRequests += 1;
-						maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
-						firstStarted?.();
-						await new Promise((resolve) => setTimeout(resolve, 25));
-						activeRequests -= 1;
-						return '{"type":"final","result":{"findings":[{"hunkId":"' + firstHunk.id + '","severity":"warning","title":"A","explanation":"Risk A","recommendation":"Fix A"}]}}';
-					}
-					await firstStartedPromise;
-					activeRequests += 1;
-					maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
-					activeRequests -= 1;
-					return '{"type":"final","result":{"findings":[{"hunkId":"' + secondHunk.id + '","severity":"info","title":"B","explanation":"Risk B","recommendation":"Fix B"}]}}';
-				},
-			},
-			language: 'en',
-			strategy: 'FileOnly',
-			fileConcurrency: 0,
-		});
-
-		assert.strictEqual(maxActiveRequests, 2);
-		assert.deepStrictEqual(result.completedFiles, [firstUri.toString(), secondUri.toString()]);
-		assert.deepStrictEqual(result.findings.map((finding) => finding.title), ['A', 'B']);
-		assert.deepStrictEqual(result.findings.map((finding) => finding.generationOrder), [0, 1]);
-	});
-
-	test('runs multi-agent review with skipped KB and integration related hunks', async () => {
-		const apiUri = vscode.Uri.file('/repo/src/api.ts');
-		const callerUri = vscode.Uri.file('/repo/src/caller.ts');
-		const apiHunk = computeLineDiff(apiUri.toString(), 'export const version = 1;\n', 'export const version = 2;\n')[0];
-		const callerHunk = computeLineDiff(callerUri.toString(), 'if (version === 1) {\n}\n', 'if (version === 1) {\n  run();\n}\n')[0];
-		const session: ReviewSession = {
-			id: 'ai-review-multi',
-			mode: 'git',
-			rootUri: vscode.Uri.file('/repo'),
-			createdAt: 1,
-			files: new Map([
-				[apiUri.toString(), reviewFileState(apiUri, 'src/api.ts', { hunks: [apiHunk] })],
-				[callerUri.toString(), reviewFileState(callerUri, 'src/caller.ts', { hunks: [callerHunk] })],
-			]),
-		};
-		const responses = [
-			'{"type":"final","result":{"summary":"Plan summary","changeIntent":"Coordinate API and caller","riskAreas":["contract"],"integrationChecks":["caller"],"filePlans":{"src/api.ts":"Check API contract.","src/caller.ts":"Check caller contract."}}}',
-			'{"type":"final","result":{"findings":[{"hunkId":"' + apiHunk.id + '","severity":"warning","title":"API issue","explanation":"Risk A","recommendation":"Fix A"}],"suggestions":[]}}',
-			'{"type":"final","result":{"findings":[],"suggestions":[]}}',
-			'{"type":"final","result":{"findings":[{"hunkId":"' + apiHunk.id + '","relatedHunkIds":["' + callerHunk.id + '","missing","' + apiHunk.id + '"],"relatedPaths":["src/caller.ts"],"severity":"warning","title":"Caller not updated","explanation":"The caller still assumes the old contract.","recommendation":"Update the caller with the API change.","evidence":["src/caller.ts:1"]},{"hunkId":"' + apiHunk.id + '","severity":"warning","title":"API issue","explanation":"Duplicate","recommendation":"Duplicate"}]}}',
-		];
-		const requests: Array<{ system: string; user: string }> = [];
-
-		const result = await new CodeReviewAgentService().review({
-			session,
-			root: workspaceFolder('/repo'),
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
-			client: {
-				completeJson: async (request) => {
-					requests.push({
-						system: request.messages?.find((message) => message.role === 'system')?.content ?? '',
-						user: request.messages?.find((message) => message.role === 'user')?.content ?? '',
-					});
-					return responses.shift() ?? '{"type":"final","result":{"findings":[]}}';
-				},
-			},
-			language: 'en',
-			strategy: 'Multi',
-			includeWikiTools: false,
-		});
-
-		assert.strictEqual(requests.length, 4);
-		assert.ok(requests[0].system.includes('AI Review Planning Agent'));
-		assert.ok(requests.every((request) => !request.system.includes('Knowledge Retrieval Agent')));
-		assert.ok(requests.some((request) => request.user.includes('Change-set summary:') && request.user.includes('Check API contract.')));
-		assert.ok(requests[3].system.includes('Integration Review Agent'));
-		assert.strictEqual(result.strategy, 'Multi');
-		assert.strictEqual(result.pipeline, 'multi');
-		assert.strictEqual(result.completedIntegration, true);
-		assert.strictEqual(result.planSummary, 'Plan summary');
-		assert.ok(result.knowledgeContextSummary?.includes('KB Retrieval skipped'));
-		assert.deepStrictEqual(result.findings.map((finding) => finding.title), ['API issue', 'Caller not updated']);
-		const integrationFinding = result.findings.find((finding) => finding.title === 'Caller not updated');
-		assert.strictEqual(integrationFinding?.source, 'integration');
-		assert.strictEqual(integrationFinding?.uri, apiUri.toString());
-		assert.deepStrictEqual(integrationFinding?.relatedHunkIds, [callerHunk.id]);
-		assert.deepStrictEqual(integrationFinding?.relatedPaths, ['src/caller.ts']);
-	});
-
-
-	test('retrieves Wiki context with source tools and preserves freshness claims', async () => {
-		const firstUri = vscode.Uri.file('/repo/src/api.ts');
-		const secondUri = vscode.Uri.file('/repo/src/caller.ts');
-		const firstHunk = computeLineDiff(firstUri.toString(), 'old\n', 'new\n')[0];
-		const secondHunk = computeLineDiff(secondUri.toString(), 'old\n', 'new\n')[0];
-		const session: ReviewSession = {
-			id: 'ai-review-knowledge-freshness',
-			mode: 'git',
-			rootUri: vscode.Uri.file('/repo'),
-			createdAt: 1,
-			files: new Map([
-				[firstUri.toString(), reviewFileState(firstUri, 'src/api.ts', { hunks: [firstHunk] })],
-				[secondUri.toString(), reviewFileState(secondUri, 'src/caller.ts', { hunks: [secondHunk] })],
-			]),
-		};
-		const freshness = {
-			status: 'stale' as const,
-			checkedAt: '2026-07-12T00:00:00.000Z',
-			lastSyncedAt: '2026-07-11T00:00:00.000Z',
-			addedSourcePaths: [],
-			modifiedSourcePaths: ['src/api.ts'],
-			deletedSourcePaths: [],
-			totalChangedSourceCount: 1,
-			reason: 'Source files changed since the last Wiki synchronization.',
-		};
-		const responses = [
-			'{"type":"final","result":{"summary":"KB context","relevantPages":["interfaces.md"],"knowledgeClaims":[{"page":"interfaces.md","claim":"API returns new","status":"confirmed","evidencePaths":["src/api.ts:1"],"confidence":0.9},{"page":"bad","claim":"drop","status":"invalid","evidencePaths":[],"confidence":2}]}}',
-			'{"type":"final","result":{"summary":"Plan","filePlans":{"src/api.ts":"Check API.","src/caller.ts":"Check caller."}}}',
-			'{"type":"final","result":{"findings":[],"suggestions":[]}}',
-			'{"type":"final","result":{"findings":[],"suggestions":[]}}',
-			'{"type":"final","result":{"findings":[]}}'
-		];
-		const requests: Array<{ system: string; user: string; tools: string[] }> = [];
-		const result = await new CodeReviewAgentService().review({
-			session,
-			root: workspaceFolder('/repo'),
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
-			client: {
-				completeJson: async (request) => {
-					requests.push({
-						system: request.messages?.find((message) => message.role === 'system')?.content ?? '',
-						user: request.messages?.find((message) => message.role === 'user')?.content ?? '',
-						tools: (request.tools ?? []).map((tool) => tool.name),
-					});
-					return responses.shift() ?? '{"type":"final","result":{"findings":[]}}';
-				},
-			},
-			language: 'en',
-			strategy: 'Multi',
-			includeWikiTools: true,
-			knowledgeFreshness: freshness,
-		});
-
-		assert.strictEqual(requests.length, 5);
-		assert.ok(requests[0].system.includes('Current source code is authoritative'));
-		assert.ok(requests[0].system.includes('Use search_wiki_files to locate relevant Wiki pages'));
-		assert.ok(requests[0].system.includes('read_workspace_file'));
-		assert.ok(requests[0].system.includes('search_workspace'));
-		assert.ok(requests[0].system.includes('read_wiki_file'));
-		assert.ok(requests[0].system.includes('search_wiki_files'));
-		assert.strictEqual(requests[0].system.includes('write_wiki_file'), false);
-		assert.ok(requests[0].user.includes('"status":"stale"'));
-		assert.ok(requests[4].user.includes('Knowledge claims to verify:'));
-		assert.ok(requests[4].user.includes('API returns new'));
-		assert.strictEqual(result.knowledgeFreshness?.status, 'stale');
-		assert.strictEqual(result.knowledgeClaims?.length, 1);
-		assert.strictEqual(result.findings.length, 0);
-	});
-
-	test('resumes partial multi-agent review by rerunning only integration', async () => {
-		const apiUri = vscode.Uri.file('/repo/src/api.ts');
-		const callerUri = vscode.Uri.file('/repo/src/caller.ts');
-		const apiHunk = computeLineDiff(apiUri.toString(), 'a\n', 'aa\n')[0];
-		const callerHunk = computeLineDiff(callerUri.toString(), 'b\n', 'bb\n')[0];
-		const session: ReviewSession = {
-			id: 'ai-review-integration-retry',
-			mode: 'git',
-			rootUri: vscode.Uri.file('/repo'),
-			createdAt: 1,
-			files: new Map([
-				[apiUri.toString(), reviewFileState(apiUri, 'src/api.ts', { hunks: [apiHunk] })],
-				[callerUri.toString(), reviewFileState(callerUri, 'src/caller.ts', { hunks: [callerHunk] })],
-			]),
-		};
-		const responses = [
-			'{"type":"final","result":{"summary":"Retry plan","filePlans":{"src/api.ts":"Check API.","src/caller.ts":"Check caller."}}}',
-			'{"type":"final","result":{"findings":[{"hunkId":"' + apiHunk.id + '","severity":"info","title":"A","explanation":"Risk A","recommendation":"Fix A"}],"suggestions":[]}}',
-			'{"type":"final","result":{"findings":[{"hunkId":"' + callerHunk.id + '","severity":"info","title":"B","explanation":"Risk B","recommendation":"Fix B"}],"suggestions":[]}}',
-			'{"type":"final","result":{"findings":"bad"}}',
-		];
-		let partial: StoredAiReview | undefined;
-		try {
-			await new CodeReviewAgentService().review({
-				session,
-				root: workspaceFolder('/repo'),
-				config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
-				client: { completeJson: async () => responses.shift() ?? '' },
-				language: 'en',
-				strategy: 'Multi',
-			});
-			assert.fail('Expected partial integration review failure.');
-		} catch (error) {
-			assert.ok(error instanceof AiReviewPartialError);
-			partial = error.review;
-		}
-
-		assert.ok(partial);
-		assert.strictEqual(partial.completedIntegration, false);
-		assert.deepStrictEqual(partial.completedFiles, [apiUri.toString(), callerUri.toString()]);
-		assert.deepStrictEqual(partial.findings.map((finding) => finding.title), ['A', 'B']);
-
-		const retryPrompts: string[] = [];
-		const retried = await new CodeReviewAgentService().review({
-			session,
-			root: workspaceFolder('/repo'),
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
-			client: {
-				completeJson: async (request) => {
-					retryPrompts.push(request.messages?.find((message) => message.role === 'user')?.content ?? '');
-					return '{"type":"final","result":{"findings":[{"hunkId":"' + apiHunk.id + '","relatedHunkIds":["' + callerHunk.id + '"],"severity":"warning","title":"Integration","explanation":"Risk","recommendation":"Fix","evidence":["src/api.ts:1"]}]}}';
-				},
-			},
-			language: 'en',
-			strategy: 'Multi',
-			existingReview: partial,
-		});
-
-		assert.deepStrictEqual(retryPrompts.map((prompt) => prompt.startsWith('Run integration review')), [true]);
-		assert.strictEqual(retryPrompts.some((prompt) => prompt.includes('Review all pending chunks')), false);
-		assert.strictEqual(retried.completedIntegration, true);
-		assert.deepStrictEqual(retried.findings.map((finding) => finding.title), ['A', 'B', 'Integration']);
-	});
-
-	test('keeps completed file findings after a later AI review file fails and resumes from partial review', async () => {
-		const firstUri = vscode.Uri.file('/repo/src/a.ts');
-		const secondUri = vscode.Uri.file('/repo/src/b.ts');
-		const firstHunk = computeLineDiff(firstUri.toString(), 'a\n', 'aa\n')[0];
-		const secondHunk = computeLineDiff(secondUri.toString(), 'b\n', 'bb\n')[0];
-		const session: ReviewSession = {
-			id: 'ai-review-partial',
-			mode: 'git',
-			rootUri: vscode.Uri.file('/repo'),
-			createdAt: 1,
-			files: new Map([
-				[firstUri.toString(), reviewFileState(firstUri, 'src/a.ts', { hunks: [firstHunk] })],
-				[secondUri.toString(), reviewFileState(secondUri, 'src/b.ts', { hunks: [secondHunk] })],
-			]),
-		};
-		const completions: StoredAiReview[] = [];
-		let partial: StoredAiReview | undefined;
-
-		try {
-			await new CodeReviewAgentService().review({
-				session,
-				root: workspaceFolder('/repo'),
-				config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
-				client: {
-					completeJson: async (request) => {
-						const userPrompt = request.messages?.find((message) => message.role === 'user')?.content ?? '';
-						if (userPrompt.includes('src/a.ts')) {
-							return `{"type":"final","result":{"findings":[{"hunkId":"${firstHunk.id}","severity":"warning","title":"A","explanation":"Risk A","recommendation":"Fix A"}]}}`;
-						}
-						return '{"type":"final","result":{"findings":"bad"}}';
-					},
-				},
-				language: 'en',
-				strategy: 'FileOnly',
-				maxRounds: 64,
-				onFileComplete: (review) => {
-					completions.push(review);
-				},
-			});
-			assert.fail('Expected partial AI review failure.');
-		} catch (error) {
-			assert.ok(error instanceof AiReviewPartialError);
-			partial = error.review;
-		}
-
-		assert.ok(partial);
-		assert.strictEqual(completions.length, 1);
-		assert.strictEqual(completions[0].status, 'partial');
-		assert.deepStrictEqual(completions[0].completedFiles, [firstUri.toString()]);
-		assert.strictEqual(completions[0].findings[0].title, 'A');
-		assert.strictEqual(partial.status, 'partial');
-		assert.strictEqual(partial.failedFile, secondUri.toString());
-		assert.strictEqual(partial.findings[0].title, 'A');
-
-		const retryPrompts: string[] = [];
-		const retried = await new CodeReviewAgentService().review({
-			session,
-			root: workspaceFolder('/repo'),
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
-			client: {
-				completeJson: async (request) => {
-					retryPrompts.push(request.messages?.find((message) => message.role === 'user')?.content ?? '');
-					return `{"type":"final","result":{"findings":[{"hunkId":"${secondHunk.id}","severity":"info","title":"B","explanation":"Risk B","recommendation":"Fix B"}]}}`;
-				},
-			},
-			language: 'en',
-			strategy: 'FileOnly',
-			existingReview: partial,
-			maxRounds: 'unlimited',
-		});
-
-		assert.deepStrictEqual(retryPrompts.map((prompt) => prompt.includes('src/b.ts')), [true]);
-		assert.strictEqual(retryPrompts.some((prompt) => prompt.includes('src/a.ts')), false);
-		assert.strictEqual(retried.status, 'complete');
-		assert.deepStrictEqual(retried.completedFiles, [firstUri.toString(), secondUri.toString()]);
-		assert.deepStrictEqual(retried.findings.map((finding) => finding.title), ['A', 'B']);
-	});
-
-	test('adds configured finding language instruction to AI review prompts', async () => {
-		const uri = vscode.Uri.file('/repo/src/app.ts');
-		const hunk = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
-		const file = reviewFileState(uri, 'src/app.ts', { hunks: [hunk] });
-		const session: ReviewSession = {
-			id: 'ai-review-language',
-			mode: 'git',
-			rootUri: vscode.Uri.file('/repo'),
-			createdAt: 1,
-			files: new Map([[uri.toString(), file]]),
-		};
-		const reviewWithLanguage = async (language: 'zh-CN' | 'en', includeWikiTools = false): Promise<string> => {
-			let systemPrompt = '';
-			await new CodeReviewAgentService().review({
-				session,
-				root: workspaceFolder('/repo'),
-				config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
-				client: {
-					completeJson: async (request) => {
-						systemPrompt = request.messages?.find((message) => message.role === 'system')?.content ?? '';
-						return '{"type":"final","result":{"findings":[]}}';
-					},
-				},
-				language,
-				includeWikiTools,
-			});
-			return systemPrompt;
-		};
-
-		const zhPrompt = await reviewWithLanguage('zh-CN');
-		const enPrompt = await reviewWithLanguage('en');
-		const wikiPrompt = await reviewWithLanguage('en', true);
-		assert.ok(zhPrompt.includes('Simplified Chinese'));
-		assert.ok(enPrompt.includes('English'));
-		assert.ok(zhPrompt.includes('Do not translate hunkId values'));
-		assert.ok(enPrompt.includes('Do not translate hunkId values'));
-		assert.ok(enPrompt.includes('Source files are read-only.'));
-		assert.strictEqual(enPrompt.includes('optional Wiki context'), false);
-		assert.ok(wikiPrompt.includes('Source and Wiki files are read-only.'));
-		assert.ok(wikiPrompt.includes('optional Wiki context'));
-		assert.ok(enPrompt.includes('Allowed finding severities are error, warning, suggestion, and info'));
-		assert.ok(zhPrompt.includes('Keep finding title, explanation, and recommendation concise'));
-		assert.ok(enPrompt.includes('valid JSON string content'));
-		assert.ok(enPrompt.includes('replacementText replaces the entire current newText'));
-		assert.ok(enPrompt.includes('preserve the hunk line terminator'));
-		assert.ok(enPrompt.includes('Do not create suggestions for delete hunks'));
-	});
-
-	test('stores AI code suggestions and file-level no-finding diagnostics', async () => {
-		const uri = vscode.Uri.file('/repo/src/app.ts');
-		const hunk = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
-		const session: ReviewSession = {
-			id: 'ai-review-suggestion',
-			mode: 'git',
-			rootUri: vscode.Uri.file('/repo'),
-			createdAt: 1,
-			files: new Map([[uri.toString(), reviewFileState(uri, 'src/app.ts', { hunks: [hunk] })]]),
-		};
-
-		const result = await new CodeReviewAgentService().review({
-			session,
-			root: workspaceFolder('/repo'),
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
-			client: {
-				completeJson: async () => `{"type":"final","result":{"findings":[],"suggestions":[{"hunkId":"${hunk.id}","replacementText":"better","rationale":"Tighter implementation."}]}}`,
-			},
-			language: 'en',
-		});
-
-		assert.strictEqual(result.findings.length, 0);
-		assert.strictEqual(result.suggestions.length, 1);
-		assert.strictEqual(result.suggestions[0].replacementText, 'better\n');
-		assert.strictEqual(result.fileResults[0].acceptedFindingCount, 0);
-		assert.strictEqual(result.fileResults[0].acceptedSuggestionCount, 1);
-		assert.ok(result.fileResults[0].summary.includes('Model returned 0 findings.'));
-	});
-
-	test('keeps in-flight AI findings bound when the source chunk is accepted', async () => {
-		const uri = vscode.Uri.file('/repo/src/accepted-during-review.ts');
-		const hunk = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
-		const file = reviewFileState(uri, 'src/accepted-during-review.ts', { hunks: [hunk] });
-		const session: ReviewSession = {
-			id: 'accept-during-ai-review',
-			mode: 'git',
-			rootUri: vscode.Uri.file('/repo'),
-			createdAt: 1,
-			files: new Map([[uri.toString(), file]]),
-		};
-		const result = await new CodeReviewAgentService().review({
-			session,
-			root: workspaceFolder('/repo'),
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
-			client: {
-				completeJson: async () => {
-					file.hunks = [];
-					file.acceptedHunks = [{
-						...reviewedHunkFrom(hunk, 'accept'),
-						sourceHunkId: hunk.id,
-						reviewItemId: hunk.id,
-					}];
-					return `{"type":"final","result":{"findings":[{"hunkId":"${hunk.id}","severity":"warning","title":"Bound","explanation":"Risk","recommendation":"Fix","evidence":[]}],"suggestions":[]}}`;
-				},
-			},
-			language: 'en',
-		});
-
-		assert.strictEqual(result.findings.length, 1);
-		assert.strictEqual(result.findings[0].hunkId, hunk.id);
-		assert.ok(result.sourceSnapshot);
-	});
-
-	test('keeps in-flight AI findings bound when the source chunk is rejected', async () => {
-		const uri = vscode.Uri.file('/repo/src/rejected-during-review.ts');
-		const hunk = computeLineDiff(uri.toString(), 'old\n', 'new\n')[0];
-		const file = reviewFileState(uri, 'src/rejected-during-review.ts', { hunks: [hunk] });
-		const session: ReviewSession = {
-			id: 'reject-during-ai-review',
-			mode: 'git',
-			rootUri: vscode.Uri.file('/repo'),
-			createdAt: 1,
-			files: new Map([[uri.toString(), file]]),
-		};
-		const result = await new CodeReviewAgentService().review({
-			session,
-			root: workspaceFolder('/repo'),
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
-			client: {
-				completeJson: async () => {
-					file.hunks = [];
-					file.rejectedHunks = [{
-						...reviewedHunkFrom(hunk, 'reject'),
-						sourceHunkId: hunk.id,
-						reviewItemId: hunk.id,
-					}];
-					return `{"type":"final","result":{"findings":[{"hunkId":"${hunk.id}","severity":"warning","title":"Rejected binding","explanation":"Risk","recommendation":"Fix","evidence":[]}],"suggestions":[]}}`;
-				},
-			},
-			language: 'en',
-		});
-
-		assert.strictEqual(result.findings.length, 1);
-		assert.strictEqual(result.findings[0].hunkId, hunk.id);
-	});
-
-	test('does not add chunks created during an AI review to the immutable source set', async () => {
-		const uri = vscode.Uri.file('/repo/src/live-edit.ts');
-		const initialHunk = computeLineDiff(uri.toString(), 'one\nkeep\n', 'ONE\nkeep\n')[0];
-		const file = reviewFileState(uri, 'src/live-edit.ts', {
-			oldText: 'one\nkeep\n',
-			newText: 'ONE\nkeep\n',
-			hunks: [initialHunk],
-		});
-		const session: ReviewSession = {
-			id: 'new-hunk-during-ai-review',
-			mode: 'git',
-			rootUri: vscode.Uri.file('/repo'),
-			createdAt: 1,
-			files: new Map([[uri.toString(), file]]),
-		};
-		let addedHunkId = '';
-		const result = await new CodeReviewAgentService().review({
-			session,
-			root: workspaceFolder('/repo'),
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
-			client: {
-				completeJson: async () => {
-					const currentHunks = computeLineDiff(uri.toString(), 'one\nkeep\nlast\n', 'ONE\nkeep\nLAST\n');
-					const addedHunk = currentHunks.find((candidate) => candidate.id !== initialHunk.id && candidate.newText.includes('LAST'))
-						?? currentHunks[currentHunks.length - 1];
-					addedHunkId = addedHunk.id;
-					file.oldText = 'one\nkeep\nlast\n';
-					file.newText = 'ONE\nkeep\nLAST\n';
-					file.hunks = [
-						{ ...currentHunks[0], sourceHunkId: initialHunk.id, reviewItemId: initialHunk.id },
-						addedHunk,
-					];
-					return `{"type":"final","result":{"findings":[{"hunkId":"${initialHunk.id}","severity":"warning","title":"Original","explanation":"Risk","recommendation":"Fix","evidence":[]},{"hunkId":"${addedHunk.id}","severity":"warning","title":"Late","explanation":"Risk","recommendation":"Fix","evidence":[]}],"suggestions":[]}}`;
-				},
-			},
-			language: 'en',
-		});
-
-		assert.strictEqual(result.sourceSnapshot?.files[0].hunks.length, 1);
-		assert.deepStrictEqual(result.findings.map((finding) => finding.title), ['Original']);
-		assert.ok(!result.findings.some((finding) => finding.hunkId === addedHunkId));
-	});
-
-	test('loads snapshot review results across new chunks but invalidates an edited source chunk', async () => {
-		const uri = vscode.Uri.file('/repo/src/store-reconcile.ts');
-		const original = computeLineDiff(uri.toString(), 'one\nkeep\n', 'ONE\nkeep\n')[0];
-		const file = reviewFileState(uri, 'src/store-reconcile.ts', {
-			oldText: 'one\nkeep\n',
-			newText: 'ONE\nkeep\n',
-			hunks: [original],
-		});
-		const session: ReviewSession = {
-			id: 'store-source-snapshot',
-			mode: 'git',
-			rootUri: vscode.Uri.file('/repo'),
-			createdAt: 1,
-			files: new Map([[uri.toString(), file]]),
-		};
-		const review = await new CodeReviewAgentService().review({
-			session,
-			root: workspaceFolder('/repo'),
-			config: { provider: 'openai', baseUrl: 'https://example.test', model: 'test', apiKey: 'secret' },
-			client: {
-				completeJson: async () => `{"type":"final","result":{"findings":[{"hunkId":"${original.id}","severity":"warning","title":"Original","explanation":"Risk","recommendation":"Fix","evidence":[]}],"suggestions":[]}}`,
-			},
-			language: 'en',
-		});
-		const store = new AiReviewStore(new TestMemento() as unknown as vscode.Memento);
-		await store.save(session, review);
-
-		const added = computeLineDiff(uri.toString(), 'last\n', 'LAST\n')[0];
-		file.hunks = [original, added];
-		assert.strictEqual(store.load(session)?.findings[0].title, 'Original');
-
-		file.hunks = [{ ...original, newText: 'CHANGED\n' }, added];
-		assert.strictEqual(store.load(session), undefined);
-	});
 
 	test('drops AI code suggestions for delete chunks', () => {
 		const uri = vscode.Uri.file('/repo/src/deleted.ts');
@@ -4116,6 +3427,7 @@ suite('AI review findings', () => {
 		const first = reviewChangeSignature(session);
 		const store = new AiReviewStore(new TestMemento() as unknown as vscode.Memento);
 		const review: StoredAiReview = {
+			agentState: reviewAgentStateFixture(),
 			signature: first,
 			findings: [{
 				id: 'finding-1',
@@ -4159,7 +3471,7 @@ suite('AI review findings', () => {
 
 		source.hunks = [{ ...hunk, newText: 'changed\n' }];
 		assert.notStrictEqual(reviewChangeSignature(session), first);
-		assert.strictEqual(store.load(session), undefined);
+		assert.strictEqual(store.load(session)?.status, 'partial');
 	});
 
 	test('keeps AI review and stable chunk identities when Reject shifts later hunks', () => {
@@ -4395,6 +3707,7 @@ suite('AI review findings', () => {
 		const store = new AiReviewStore(new TestMemento() as unknown as vscode.Memento);
 		const appliedSignature = reviewChangeSignature(session);
 		const review: StoredAiReview = {
+			agentState: reviewAgentStateFixture(),
 			signature: appliedSignature,
 			findings: [],
 			suggestions: [{
@@ -5876,6 +5189,7 @@ function reviewFileState(
 
 function storedAiReview(overrides: Partial<StoredAiReview> = {}): StoredAiReview {
 	return {
+		agentState: reviewAgentStateFixture(),
 		signature: 'test',
 		findings: [],
 		suggestions: [],
@@ -6021,4 +5335,8 @@ function reviewedHunk(
 		zoneAfterLineNumber: displayStart,
 		reviewedAt: 1,
 	};
+}
+
+function reviewAgentStateFixture(): NonNullable<StoredAiReview['agentState']> {
+ return { version: 2, id: 'fixture', modelKey: 'fixture', live: { revision: 0, versions: {}, evidence: {} }, deliveredVersions: {}, notifications: 0, tasks: {}, results: {}, events: [], mutations: {}, usage: { input: 0, output: 0, estimated: 0, reserved: 0 }, coverage: [] };
 }

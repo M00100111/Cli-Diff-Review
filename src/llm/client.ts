@@ -33,6 +33,7 @@ export interface LlmToolCall {
 }
 
 export interface LlmCompletion {
+	usage?: { inputTokens: number; outputTokens: number };
 	content: string;
 	reasoningContent?: string;
 	toolCalls: LlmToolCall[];
@@ -44,14 +45,14 @@ export interface LlmClient {
 }
 
 const providerFactories: Record<LlmProvider, (config: LlmRuntimeConfig) => LlmClient> = {
-	openai: (config) => new OpenAiCompatibleClient(config.baseUrl, config.apiKey, fetch, config.jsonOutputEnabled ?? true),
-	anthropic: (config) => new AnthropicClient(config.baseUrl, config.apiKey),
 	deepseek: (config) => new DeepSeekClient(config.baseUrl, config.apiKey, config.thinkingMode ?? 'high', config.strictTools ?? true),
 	glm: (config) => new GlmClient(config.baseUrl, config.apiKey, config.thinkingMode ?? 'high'),
 };
 
 export function createLlmClient(config: LlmRuntimeConfig): LlmClient {
-	return providerFactories[config.provider](config);
+	const factory = providerFactories[config.provider];
+	if (!factory) { throw new Error('Only DeepSeek and GLM are supported.'); }
+	return factory(config);
 }
 
 export async function completeLlm(client: LlmClient, request: LlmJsonRequest, signal?: AbortSignal): Promise<LlmCompletion> {
@@ -59,42 +60,6 @@ export async function completeLlm(client: LlmClient, request: LlmJsonRequest, si
 		return client.complete(request, signal);
 	}
 	return { content: await client.completeJson(request, signal), toolCalls: [] };
-}
-
-export class OpenAiCompatibleClient implements LlmClient {
-	public constructor(
-		private readonly baseUrl: string,
-		private readonly apiKey: string,
-		private readonly fetchImpl: typeof fetch = fetch,
-		private readonly jsonOutputEnabled = true,
-	) {}
-
-	public async completeJson(request: LlmJsonRequest, signal?: AbortSignal): Promise<string> {
-		const completion = await this.complete(request, signal);
-		if (!completion.content) {
-			throw new Error('OpenAI-compatible response did not include message content.');
-		}
-		return completion.content;
-	}
-
-	public async complete(request: LlmJsonRequest, signal?: AbortSignal): Promise<LlmCompletion> {
-		const body: Record<string, unknown> = {
-			model: request.model,
-			messages: requestMessages(request).map(openAiMessage),
-			temperature: request.temperature ?? 0,
-			max_tokens: request.maxTokens ?? 8192,
-		};
-		if (request.jsonOutput ?? this.jsonOutputEnabled) {
-			body.response_format = { type: 'json_object' };
-		}
-		const response = await this.fetchImpl(endpoint(this.baseUrl, 'chat/completions'), requestInit(this.apiKey, body, signal));
-		await ensureOk(
-			response,
-			'OpenAI-compatible',
-			body.response_format ? 'This endpoint may not support response_format; disable JSON Output in the LLM configuration.' : undefined,
-		);
-		return parseOpenAiCompletion(await response.json() as unknown, 'OpenAI-compatible');
-	}
 }
 
 export class DeepSeekClient implements LlmClient {
@@ -194,54 +159,6 @@ export class GlmClient implements LlmClient {
 	}
 }
 
-export class AnthropicClient implements LlmClient {
-	public constructor(
-		private readonly baseUrl: string,
-		private readonly apiKey: string,
-		private readonly fetchImpl: typeof fetch = fetch,
-	) {}
-
-	public async completeJson(request: LlmJsonRequest, signal?: AbortSignal): Promise<string> {
-		const completion = await this.complete(request, signal);
-		if (!completion.content) {
-			throw new Error('Anthropic response did not include text content.');
-		}
-		return completion.content;
-	}
-
-	public async complete(request: LlmJsonRequest, signal?: AbortSignal): Promise<LlmCompletion> {
-		const messages = requestMessages(request);
-		const system = messages.filter((message) => message.role === 'system').map((message) => message.content).join('\n\n');
-		const conversation = messages
-			.filter((message) => message.role !== 'system')
-			.map((message) => ({ role: message.role, content: message.content }));
-		const response = await this.fetchImpl(endpoint(this.baseUrl, 'v1/messages'), {
-			method: 'POST',
-			headers: {
-				'anthropic-version': '2023-06-01',
-				'content-type': 'application/json',
-				'x-api-key': this.apiKey,
-			},
-			body: JSON.stringify({
-				model: request.model,
-				system,
-				messages: conversation,
-				temperature: request.temperature ?? 0,
-				max_tokens: request.maxTokens ?? 8192,
-			}),
-			signal,
-		});
-		await ensureOk(response, 'Anthropic');
-		const payload = await response.json() as unknown;
-		const content = isJsonObject(payload) && Array.isArray(payload.content)
-			? payload.content
-				.map((item) => isJsonObject(item) && item.type === 'text' && typeof item.text === 'string' ? item.text : '')
-				.join('')
-			: '';
-		return { content, toolCalls: [] };
-	}
-}
-
 function requestMessages(request: LlmJsonRequest): LlmMessage[] {
 	if (request.messages?.length) {
 		return request.messages;
@@ -291,6 +208,7 @@ function parseOpenAiCompletion(payload: unknown, provider: string): LlmCompletio
 		}).filter((call): call is LlmToolCall => Boolean(call))
 		: [];
 	return {
+		usage: isJsonObject(payload) && isJsonObject(payload.usage) && typeof payload.usage.prompt_tokens === 'number' && typeof payload.usage.completion_tokens === 'number' ? { inputTokens: payload.usage.prompt_tokens, outputTokens: payload.usage.completion_tokens } : undefined,
 		content: typeof message.content === 'string' ? message.content : '',
 		reasoningContent: typeof message.reasoning_content === 'string' ? message.reasoning_content : undefined,
 		toolCalls,
@@ -336,15 +254,21 @@ async function ensureOk(response: Response, provider: string, capabilityHint?: s
 	const hint = response.status >= 400 && response.status < 500
 		? ` ${capabilityHint ?? `Check whether ${provider} supports the configured JSON output, thinking, and tool-call options.`}`
 		: '';
-	throw new Error(`LLM request failed (${response.status}): ${detail || response.statusText}.${hint}`);
+	throw new LlmApiError(response.status, detail || response.statusText, hint, response.headers.get('retry-after'));
 }
 
-export function providerLabel(provider: LlmProvider): string {
-	if (provider === 'anthropic') {
-		return 'Anthropic';
-	}
-	if (provider === 'deepseek') {
-		return 'DeepSeek';
-	}
-	return provider === 'glm' ? 'GLM' : 'OpenAI-compatible';
+export function providerLabel(provider: LlmProvider): string { return provider === 'deepseek' ? 'DeepSeek' : 'GLM'; }
+
+export class LlmApiError extends Error {
+ public readonly code?: string;
+ public readonly errorType?: string;
+ public readonly contextExceeded: boolean;
+ public readonly retryable: boolean;
+ public constructor(public readonly status: number, public readonly detail: string, hint = '', public readonly retryAfter: string | null = null) {
+  super(`LLM request failed (${status}): ${detail}.${hint}`);
+  this.name = 'LlmApiError';
+  try { const data = JSON.parse(detail); this.code = data.error?.code; this.errorType = data.error?.type; } catch { /* preserve unknown error verbatim */ }
+  this.contextExceeded = this.code === 'context_length_exceeded' || this.errorType === 'context_length_exceeded';
+  this.retryable = status === 408 || status === 429 || status >= 500;
+ }
 }

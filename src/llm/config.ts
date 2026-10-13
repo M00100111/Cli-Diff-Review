@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 
-export type LlmProvider = 'openai' | 'anthropic' | 'deepseek' | 'glm';
+export type LlmProvider = 'deepseek' | 'glm';
 export type LlmThinkingMode = 'disabled' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 export interface LlmConfigInput {
@@ -12,6 +12,9 @@ export interface LlmConfigInput {
 	jsonOutputEnabled?: boolean;
 	thinkingMode?: LlmThinkingMode;
 	strictTools?: boolean;
+	contextWindowTokens?: number;
+	compressionThresholdPercent?: number;
+	maxOutputTokens?: number;
 }
 
 export interface LlmConfigProfile {
@@ -24,6 +27,9 @@ export interface LlmConfigProfile {
 	jsonOutputEnabled: boolean;
 	thinkingMode: LlmThinkingMode;
 	strictTools: boolean;
+	contextWindowTokens?: number;
+	compressionThresholdPercent?: number;
+	maxOutputTokens?: number;
 }
 
 export interface LlmSavedConfig extends Omit<LlmConfigProfile, 'id'> {
@@ -39,6 +45,9 @@ export interface LlmRuntimeConfig {
 	jsonOutputEnabled?: boolean;
 	thinkingMode?: LlmThinkingMode;
 	strictTools?: boolean;
+	contextWindowTokens?: number;
+	compressionThresholdPercent?: number;
+	maxOutputTokens?: number;
 }
 
 const providerKey = 'cliDiff.llm.provider';
@@ -62,6 +71,9 @@ interface LlmPersistedProfile {
 	jsonOutputEnabled: boolean;
 	thinkingMode: LlmThinkingMode;
 	strictTools: boolean;
+	contextWindowTokens?: number;
+	compressionThresholdPercent?: number;
+	maxOutputTokens?: number;
 }
 
 export class LlmConfigStore {
@@ -90,6 +102,9 @@ export class LlmConfigStore {
 			jsonOutputEnabled: saved.jsonOutputEnabled,
 			thinkingMode: saved.thinkingMode,
 			strictTools: saved.strictTools,
+			contextWindowTokens: saved.contextWindowTokens,
+			compressionThresholdPercent: saved.compressionThresholdPercent,
+			maxOutputTokens: saved.maxOutputTokens,
 		};
 	}
 
@@ -99,10 +114,15 @@ export class LlmConfigStore {
 		if (!provider) {
 			throw new Error('Select a supported LLM provider.');
 		}
+		if (provider !== 'deepseek' && provider !== 'glm') { throw new Error('Only DeepSeek and GLM are supported.'); }
+		if (input.contextWindowTokens !== undefined && (!Number.isSafeInteger(input.contextWindowTokens) || input.contextWindowTokens < 4096)) { throw new Error('Context window must be at least 4096 tokens when specified.'); }
+		const threshold = input.compressionThresholdPercent ?? 40;
+		const output = input.maxOutputTokens ?? Math.min(12000, input.contextWindowTokens ? Math.floor(input.contextWindowTokens / 4) : 12000);
+		if (!Number.isFinite(threshold) || threshold < 10 || threshold > 90 || !Number.isSafeInteger(output) || output < 256 || (input.contextWindowTokens !== undefined && output >= input.contextWindowTokens)) { throw new Error('Invalid compression threshold or output allowance.'); }
 		const baseUrl = input.baseUrl.trim() || defaultBaseUrl(provider);
 		const model = input.model.trim() || defaultModel(provider);
 		const apiKey = input.apiKey?.trim() ?? '';
-		const jsonOutputEnabled = providerForcesJsonOutput(provider) ? true : input.jsonOutputEnabled ?? provider === 'openai';
+		const jsonOutputEnabled = providerForcesJsonOutput(provider) ? true : input.jsonOutputEnabled ?? true;
 		const thinkingMode = normalizeThinkingMode(provider, this.thinkingModeFromValue(input.thinkingMode));
 		const strictTools = provider === 'deepseek' ? input.strictTools ?? true : false;
 		if (!baseUrl || !model) {
@@ -130,6 +150,9 @@ export class LlmConfigStore {
 			jsonOutputEnabled,
 			thinkingMode,
 			strictTools,
+			contextWindowTokens: input.contextWindowTokens,
+			compressionThresholdPercent: threshold,
+			maxOutputTokens: output,
 		};
 		const profiles = [...store.persistedProfiles];
 		if (existingIndex >= 0) {
@@ -163,7 +186,7 @@ export class LlmConfigStore {
 	}
 
 	private providerFromValue(value: string | undefined): LlmProvider | undefined {
-		if (value === 'openai' || value === 'anthropic' || value === 'deepseek' || value === 'glm') {
+		if (value === 'deepseek' || value === 'glm') {
 			return value;
 		}
 		return undefined;
@@ -215,16 +238,13 @@ export class LlmConfigStore {
 	}
 
 	private async legacyProfile(): Promise<LlmPersistedProfile | undefined> {
-		let provider = this.providerFromValue(this.context.globalState.get<string>(providerKey)) ?? 'openai';
+		const provider = this.providerFromValue(this.context.globalState.get<string>(providerKey));
+		if (!provider) { return undefined; }
 		const baseUrl = this.context.globalState.get<string>(baseUrlKey, '').trim();
 		const model = this.context.globalState.get<string>(modelKey, '').trim();
 		const legacyApiKey = (await this.context.secrets.get(apiKeySecretKey))?.trim();
 		if (!baseUrl && !model && !legacyApiKey) {
 			return undefined;
-		}
-		if (provider === 'openai' && officialProviderForBaseUrl(baseUrl)) {
-			provider = officialProviderForBaseUrl(baseUrl) ?? provider;
-			await this.context.globalState.update(providerKey, provider);
 		}
 		const storedThinkingMode = this.thinkingModeFromValue(this.context.globalState.get<string>(thinkingModeKey));
 		return this.normalizeProfile({
@@ -232,7 +252,7 @@ export class LlmConfigStore {
 			provider,
 			baseUrl,
 			model,
-			jsonOutputEnabled: providerForcesJsonOutput(provider) ? true : this.context.globalState.get<boolean>(jsonOutputKey, provider === 'openai'),
+			jsonOutputEnabled: providerForcesJsonOutput(provider) ? true : this.context.globalState.get<boolean>(jsonOutputKey, true),
 			thinkingMode: normalizeThinkingMode(provider, storedThinkingMode),
 			strictTools: provider === 'deepseek' ? this.context.globalState.get<boolean>(strictToolsKey, true) : false,
 		});
@@ -241,7 +261,7 @@ export class LlmConfigStore {
 	private savedConfigFromProfile(active: LlmConfigProfile | undefined, profiles: LlmConfigProfile[], activeProfileId: string | undefined): LlmSavedConfig {
 		const fallback = this.normalizeProfile({
 			id: '',
-			provider: 'openai',
+			provider: 'deepseek',
 			baseUrl: '',
 			model: '',
 			jsonOutputEnabled: true,
@@ -258,6 +278,9 @@ export class LlmConfigStore {
 			jsonOutputEnabled: profile.jsonOutputEnabled,
 			thinkingMode: profile.thinkingMode,
 			strictTools: profile.strictTools,
+			contextWindowTokens: profile.contextWindowTokens,
+			compressionThresholdPercent: profile.compressionThresholdPercent,
+			maxOutputTokens: profile.maxOutputTokens,
 			activeProfileId,
 			profiles,
 		};
@@ -273,19 +296,25 @@ export class LlmConfigStore {
 			return undefined;
 		}
 		return this.normalizeProfile({
+			contextWindowTokens: typeof candidate.contextWindowTokens === 'number' ? candidate.contextWindowTokens : undefined,
+			compressionThresholdPercent: typeof candidate.compressionThresholdPercent === 'number' ? candidate.compressionThresholdPercent : 40,
+			maxOutputTokens: typeof candidate.maxOutputTokens === 'number' ? candidate.maxOutputTokens : 12000,
 			id: candidate.id,
 			provider,
 			baseUrl: typeof candidate.baseUrl === 'string' ? candidate.baseUrl : '',
 			model: typeof candidate.model === 'string' ? candidate.model : '',
-			jsonOutputEnabled: typeof candidate.jsonOutputEnabled === 'boolean' ? candidate.jsonOutputEnabled : provider === 'openai',
+			jsonOutputEnabled: typeof candidate.jsonOutputEnabled === 'boolean' ? candidate.jsonOutputEnabled : true,
 			thinkingMode: this.thinkingModeFromValue(typeof candidate.thinkingMode === 'string' ? candidate.thinkingMode : undefined) ?? 'disabled',
 			strictTools: typeof candidate.strictTools === 'boolean' ? candidate.strictTools : provider === 'deepseek',
 		});
 	}
 
 	private normalizeProfile(profile: LlmPersistedProfile): LlmPersistedProfile {
-		const provider = this.providerFromValue(profile.provider) ?? 'openai';
+		const provider = this.providerFromValue(profile.provider) ?? 'deepseek';
 		return {
+			contextWindowTokens: profile.contextWindowTokens,
+			compressionThresholdPercent: profile.compressionThresholdPercent ?? 40,
+			maxOutputTokens: profile.maxOutputTokens ?? 12000,
 			id: profile.id.trim(),
 			provider,
 			baseUrl: profile.baseUrl.trim() || defaultBaseUrl(provider),
@@ -342,21 +371,6 @@ function defaultBaseUrl(provider: LlmProvider): string {
 
 function defaultModel(provider: LlmProvider): string {
 	return provider === 'glm' ? glmDefaultModel : '';
-}
-
-function officialProviderForBaseUrl(value: string): LlmProvider | undefined {
-	try {
-		const hostname = new URL(value).hostname;
-		if (hostname === 'api.deepseek.com') {
-			return 'deepseek';
-		}
-		if (hostname === 'open.bigmodel.cn') {
-			return 'glm';
-		}
-	} catch {
-		return undefined;
-	}
-	return undefined;
 }
 
 function slug(value: string): string {

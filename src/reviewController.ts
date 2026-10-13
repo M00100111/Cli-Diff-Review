@@ -1,7 +1,8 @@
+import { hash as reviewContentHash } from './agent/review/live';
 import * as path from 'path';
 import { createHash, randomUUID } from 'crypto';
 import * as vscode from 'vscode';
-import { AiReviewLanguage, AiReviewPartialError, AiReviewStore, AiReviewStrategy, CodeReviewAgentService, CodeReviewTraceContext, normalizeAiSuggestionReplacementText, reviewChangeSignature, StoredAiReview, sortFindings, sourcePendingFiles } from './agent/codeReview';
+import { AiReviewLanguage, AiReviewPartialError, AiReviewStore, CodeReviewAgentService, CodeReviewTraceContext, normalizeAiSuggestionReplacementText, reviewChangeSignature, StoredAiReview, sortFindings, sourcePendingFiles } from './agent/codeReview';
 import type { AgentTraceEvent } from './agent/runtime';
 import { AgentRunStore, ProjectAgentLifecycle, ProjectAgentTaskKind, StoredProjectAgentRun } from './agentRunStore';
 import { GitBranchRef, GitService } from './gitService';
@@ -68,7 +69,7 @@ interface ReviewNavigationTarget extends vscode.QuickPickItem {
 
 type RunLogSource = 'wiki' | 'review';
 
-type RunLogMetadata = Pick<LlmWikiRunLogEntry, 'source' | 'stage' | 'fileUri' | 'relativePath' | 'fileIndex' | 'fileCount'>;
+type RunLogMetadata = Pick<LlmWikiRunLogEntry, 'source' | 'stage' | 'fileUri' | 'relativePath' | 'fileIndex' | 'fileCount' | 'agentId' | 'parentAgentId' | 'role' | 'segment'>;
 
 interface ProjectAgentTask {
 	id: string;
@@ -160,7 +161,7 @@ export class ReviewController implements vscode.Disposable {
 	private activeSession: ReviewSession | undefined;
 	private readonly projectAgentRuntimes = new Map<string, ProjectAgentRuntime>();
 	private llmConfigState: LlmSavedConfig = {
-		provider: 'openai',
+		provider: 'deepseek',
 		baseUrl: '',
 		model: '',
 		hasApiKey: false,
@@ -180,7 +181,7 @@ export class ReviewController implements vscode.Disposable {
 			context.extensionUri,
 			context.storageUri ?? context.globalStorageUri,
 		);
-		this.aiReviewStore = new AiReviewStore(context.workspaceState);
+		this.aiReviewStore = new AiReviewStore(context.workspaceState, context.storageUri ?? context.globalStorageUri);
 		this.agentRunStore = new AgentRunStore(context);
 		void this.migrateLegacyReviewStorage();
 		this.treeProvider = new ReviewTreeProvider(() => this.activeSession, () => this.dashboardStoredAiReview());
@@ -230,7 +231,7 @@ export class ReviewController implements vscode.Disposable {
 				} else if (event.affectsConfiguration('cliDiff.aiReviewLanguage')
 					|| event.affectsConfiguration('cliDiff.aiReviewMaxRounds')
 					|| event.affectsConfiguration('cliDiff.agentConcurrency')
-					|| event.affectsConfiguration('cliDiff.aiReviewStrategy')) {
+					|| event.affectsConfiguration('cliDiff.aiReviewAutoCompress')) {
 					void this.refreshLlmWikiDashboardState();
 				}
 			}),
@@ -2305,6 +2306,10 @@ export class ReviewController implements vscode.Disposable {
 			timestamp: run.updatedAt,
 			source: metadata.source ?? run.source,
 			stage: metadata.stage,
+			agentId: metadata.agentId,
+			parentAgentId: metadata.parentAgentId,
+			role: metadata.role,
+			segment: metadata.segment,
 			fileUri: metadata.fileUri,
 			relativePath: metadata.relativePath,
 			fileIndex: metadata.fileIndex,
@@ -2314,6 +2319,7 @@ export class ReviewController implements vscode.Disposable {
 			summary: event.summary,
 			round: event.round,
 			status: event.status,
+			spawnedAgentId: event.kind === 'tool_result' && event.summary.startsWith('spawn_agent') ? this.spawnedAgentId(event) : undefined,
 			details: event.details,
 		}];
 		if (persist) {
@@ -2724,8 +2730,6 @@ export class ReviewController implements vscode.Disposable {
 			const includeWikiTools = (await this.wikiInitializationService.state(root.uri))?.status === 'ready';
 			const language = vscode.workspace.getConfiguration('cliDiff').get<AiReviewLanguage>('aiReviewLanguage', 'zh-CN');
 			const maxRounds = this.aiReviewMaxRounds();
-			const strategy = this.aiReviewStrategy();
-			const fileConcurrency = this.agentConcurrency();
 			const storedReview = this.aiReviewStore.load(session);
 			if (mode === 'regenerate' && storedReview?.status === 'partial') {
 				const confirmed = await vscode.window.showWarningMessage(
@@ -2742,7 +2746,7 @@ export class ReviewController implements vscode.Disposable {
 			}
 			const existingReview = mode === 'regenerate'
 				? undefined
-				: storedReview?.status === 'partial' ? storedReview : undefined;
+				: storedReview?.status === 'partial' ? await this.aiReviewStore.hydrate(storedReview) : undefined;
 			task = this.beginProjectAgentTask('review', root, project?.id, Boolean(existingReview));
 			if (!task) {
 				return;
@@ -2762,8 +2766,6 @@ export class ReviewController implements vscode.Disposable {
 					model: config.model,
 					language,
 					maxRounds: maxRounds === 'unlimited' ? 'unlimited' : maxRounds,
-					strategy,
-					fileConcurrency,
 					mode: existingReview ? 'continue' : mode === 'regenerate' ? 'regenerate' : 'generate',
 					wikiContext: includeWikiTools ? 'enabled' : 'disabled',
 					completedFiles: existingReview?.completedFiles.length ?? 0,
@@ -2775,23 +2777,17 @@ export class ReviewController implements vscode.Disposable {
 					continueExisting: true,
 					metadata: {
 						source: 'review',
-						stage: existingReview.continuations?.[0]?.stage,
-						fileUri: existingReview.continuations?.[0]?.fileUri,
+						stage: 'main',
+						agentId: 'main',
 					},
 					progress: 'Continuing AI review',
 				});
 			} else {
 				await this.startProjectAgentRun(task, startEvent, 'review', { progress: 'Preparing AI review' });
 			}
-			const continuation = existingReview?.continuations?.[0];
-			this.updateProjectAgentRun(
-				task,
-				continuation
-					? `Continuing ${continuation.stage}${continuation.fileUri ? ` (${continuation.fileUri})` : ''} at round ${continuation.checkpoint.nextRound}`
-					: existingReview ? 'Continuing AI review' : 'Preparing AI review',
-			);
+			this.updateProjectAgentRun(task, existingReview ? 'Continuing AI review' : 'Preparing AI review');
 			await this.refreshLlmWikiDashboardState();
-			task.done = this.runAiReview(task, config, createLlmClient(config), session, language, strategy, fileConcurrency, maxRounds, includeWikiTools, existingReview);
+			task.done = this.runAiReview(task, config, createLlmClient(config), session, language, maxRounds, includeWikiTools, existingReview);
 			await task.done;
 		} catch (error) {
 			if (task) {
@@ -2823,8 +2819,6 @@ export class ReviewController implements vscode.Disposable {
 		client: LlmClient,
 		session: ReviewSession,
 		language: AiReviewLanguage,
-		strategy: AiReviewStrategy,
-		fileConcurrency: number,
 		maxRounds: number | 'unlimited',
 		includeWikiTools: boolean,
 		existingReview?: StoredAiReview,
@@ -2837,12 +2831,20 @@ export class ReviewController implements vscode.Disposable {
 				config,
 				client,
 				language,
-				strategy,
-				fileConcurrency,
 				existingReview,
 				includeWikiTools,
-				knowledgeFreshness,
-				maxRounds,
+                knowledgeFreshness,
+                totalBudgetTokens: vscode.workspace.getConfiguration('cliDiff', task.root.uri).get<number>('aiReviewTotalBudgetTokens', 1000000),
+                childConcurrency: vscode.workspace.getConfiguration('cliDiff', task.root.uri).get<number>('aiReviewChildConcurrency', 5),
+                autoCompress: vscode.workspace.getConfiguration('cliDiff', task.root.uri).get<boolean>('aiReviewAutoCompress', false),
+                changeNotificationLimit: vscode.workspace.getConfiguration('cliDiff', task.root.uri).get<number>('aiReviewChangeNotificationLimit', 5),
+                refreshSession: async () => {
+                 await this.requestGitSessionRefresh();
+                 const current = this.activeSession;
+                 if (!current) { throw new Error('Review session closed'); }
+                 return { ...session, files: new Map([...current.files].filter(([, file]) => task.projectId ? file.projectId === task.projectId : file.uri.fsPath.startsWith(task.root.uri.fsPath + path.sep))) };
+                },
+                maxRounds,
 				signal: task.abortController.signal,
 				onProgress: (message) => this.isCurrentProjectAgentTask(task)
 					&& this.updateProjectAgentRun(task, message),
@@ -2882,7 +2884,7 @@ export class ReviewController implements vscode.Disposable {
 					status: 'success',
 					details: [this.wikiRunJsonDetail('Result', result)],
 				});
-				await this.finishProjectAgentRun(task, 'completed', `AI review completed (${result.findings.length} findings).`);
+				await this.finishProjectAgentRun(task, result.status === 'complete' ? 'completed' : 'failed', result.summary ?? `AI review completed (${result.findings.length} findings).`, result.status === 'partial' ? 'Partial review; continue to resolve remaining scope.' : undefined);
 				vscode.window.showInformationMessage(`${task.root.name}: AI review completed (${result.findings.length} findings).`);
 			}
 		} catch (error) {
@@ -2899,11 +2901,7 @@ export class ReviewController implements vscode.Disposable {
 				}
 			} else {
 				if (error instanceof AiReviewPartialError) {
-					if (error.message.includes('AI review continuation is incompatible')) {
-						await this.aiReviewStore.clear(session.rootUri);
-					} else {
-						await this.aiReviewStore.save(session, error.review);
-					}
+					await this.aiReviewStore.save(session, error.review);
 					this.treeProvider.refresh();
 				}
 				const message = error instanceof Error ? error.message : String(error);
@@ -2988,6 +2986,7 @@ export class ReviewController implements vscode.Disposable {
 				return;
 			}
 
+			if (suggestion.expectedFileHash && reviewContentHash(current.text) !== suggestion.expectedFileHash) { throw new Error('代码已变化，此建议已过期；请继续审阅。'); }
 			const replacementText = normalizeAiSuggestionReplacementText(suggestion.replacementText, hunk);
 			const currentText = replaceLineBlock(current.text, hunk.newStart, hunk.newLines, replacementText);
 			const otherHunks = file.hunks.filter((candidate) => candidate.id !== hunk.id).map((candidate) => ({ ...candidate }));
@@ -3149,12 +3148,10 @@ export class ReviewController implements vscode.Disposable {
 			generatedAt: reviews.map((review) => review.generatedAt).sort().at(-1) ?? new Date(0).toISOString(),
 			status: reviews.every((review) => review.status === 'complete') ? 'complete' : 'partial',
 			completedFiles: reviews.flatMap((review) => review.completedFiles),
-			knowledgeContextSummary: reviews.map((review) => review.knowledgeContextSummary).filter(Boolean).join('\n') || undefined,
+			summary: reviews.map((review) => review.summary).filter(Boolean).join('\n') || undefined,
 			knowledgeFreshness,
 			knowledgeClaims: reviews.flatMap((review) => review.knowledgeClaims ?? []),
-			completedIntegration: reviews.some((review) => review.completedIntegration === false)
-				? false
-				: reviews.every((review) => review.completedIntegration === true) ? true : undefined,
+
 			failedFile: reviews.find((review) => review.failedFile)?.failedFile,
 			error: reviews.find((review) => review.error)?.error,
 		};
@@ -3351,10 +3348,7 @@ export class ReviewController implements vscode.Disposable {
 		return config;
 	}
 
-	private aiReviewStrategy(): AiReviewStrategy {
-		const configured = vscode.workspace.getConfiguration('cliDiff').get<string>('aiReviewStrategy', 'Multi');
-		return configured === 'Auto' || configured === 'FileOnly' ? configured : 'Multi';
-	}
+
 	private agentConcurrency(): number {
 		const configured = vscode.workspace.getConfiguration('cliDiff').get<number>('agentConcurrency', 3);
 		return typeof configured === 'number' && Number.isFinite(configured)
@@ -3824,9 +3818,17 @@ export class ReviewController implements vscode.Disposable {
 		}
 	}
 
+    private spawnedAgentId(event: AgentTraceEvent): string | undefined {
+        try { return JSON.parse(event.details[0]?.content ?? '{}').result?.agentId; } catch { return undefined; }
+    }
+
 	private reviewRunLogMetadata(context: CodeReviewTraceContext): RunLogMetadata {
 		return {
 			source: 'review',
+			agentId: context.agentId,
+			parentAgentId: context.parentAgentId,
+			role: context.role,
+			segment: context.segment,
 			stage: context.stage,
 			fileUri: context.fileUri,
 			relativePath: context.relativePath,
@@ -3968,6 +3970,9 @@ export class ReviewController implements vscode.Disposable {
 			jsonOutputEnabled: this.llmConfigState.jsonOutputEnabled,
 			thinkingMode: this.llmConfigState.thinkingMode,
 			strictTools: this.llmConfigState.strictTools,
+			contextWindowTokens: this.llmConfigState.contextWindowTokens,
+			compressionThresholdPercent: this.llmConfigState.compressionThresholdPercent,
+			maxOutputTokens: this.llmConfigState.maxOutputTokens,
 			activeProfileId: this.llmConfigState.activeProfileId,
 			profiles: this.llmConfigState.profiles,
 			runLog: runtime?.run?.entries ?? [],
@@ -3979,6 +3984,10 @@ export class ReviewController implements vscode.Disposable {
 			aiReviewCompletedFileCount: update.aiReviewCompletedFileCount ?? aiReviewCompletedFileCount,
 			aiReviewTotalFileCount: update.aiReviewTotalFileCount ?? aiReviewTotalFileCount,
 			aiReviewError: update.aiReviewError ?? storedReview?.error,
+			aiReviewSummary: storedReview?.summary,
+			aiReviewUsage: storedReview?.agentState?.usage,
+			aiReviewNotificationCount: storedReview?.agentState?.notifications,
+			aiReviewChildCount: storedReview?.agentState ? Object.values(storedReview.agentState.tasks).filter((task) => task.parentId).length : undefined,
 			aiReviewKnowledgeFreshness: storedReview?.knowledgeFreshness,
 			agentProjectKey: root ? this.agentProjectKey(root.uri) : undefined,
 			aggregateProjectView: aggregateProjects.length > 0,

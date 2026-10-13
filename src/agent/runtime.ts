@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { completeLlm, LlmClient, LlmCompletion, LlmMessage, LlmToolCall, LlmToolDefinition } from '../llm/client';
+import { completeLlm, LlmClient, LlmCompletion, LlmMessage, LlmToolCall, LlmToolDefinition, LlmApiError } from '../llm/client';
 import { LlmRuntimeConfig } from '../llm/config';
 import { isJsonObject, parseStrictJsonObject } from '../llm/json';
 import { throwIfAborted } from '../wiki/cancellation';
@@ -59,8 +59,14 @@ export interface AgentRunOptions {
 	onTrace?: (event: AgentTraceEvent) => void;
 	maxRounds?: number | 'unlimited';
 	maxToolResultChars?: number;
+	maxRoundToolResultChars?: number;
 	maxContextChars?: number;
 	maxRunMs?: number;
+	maxOutputTokens?: number;
+	/** Review runs count maxRounds per continuation segment. Wiki keeps its existing limit. */
+	segmentRounds?: boolean;
+	beforeRound?: (messages: LlmMessage[], round: number, signal: AbortSignal) => Promise<void>;
+	validateFinal?: (result: Record<string, unknown>) => Promise<void>;
 	resumeFrom?: AgentRunCheckpoint;
 	onCheckpoint?: (checkpoint: AgentRunCheckpoint) => void | Promise<void>;
 }
@@ -72,6 +78,7 @@ export interface AgentRunCheckpoint {
 	toolCalls: number;
 	toolResultChars: number;
 	runFingerprint: string;
+	pending?: { response: Extract<ValidAgentRound, { type: 'tool_calls' }>; results: Array<{ id: string; name: string; ok: boolean; result?: unknown; error?: string }> };
 }
 
 export interface AgentRunResult {
@@ -105,6 +112,8 @@ const nativeToolProtocolPrompt = [
 	'The final content must be one strict JSON object with no markdown fences or prose outside JSON.',
 ].join('\n');
 
+export class AgentPauseError extends Error {}
+
 export class AgentRunner {
 	public async run(options: AgentRunOptions): Promise<AgentRunResult> {
 		const maxRounds = options.maxRounds ?? 12;
@@ -128,7 +137,7 @@ export class AgentRunner {
 		timeout.unref();
 		const signal = runAbortController.signal;
 		const tools = new Map(options.tools.map((tool) => [tool.name, tool]));
-		const nativeTools = providerUsesNativeTools(options.config.provider);
+		const nativeTools = providerUsesNativeTools(options.config.provider) && Boolean(options.client.complete);
 		const initialMessages: LlmMessage[] = [
 			{ role: 'system', content: `${nativeTools ? nativeToolProtocolPrompt : protocolPrompt}\n\n${options.systemPrompt}\n\nAvailable tools:\n${toolDescriptions(options.tools)}` },
 			{ role: 'user', content: options.userPrompt },
@@ -143,7 +152,9 @@ export class AgentRunner {
 		let toolCalls = options.resumeFrom?.toolCalls ?? 0;
 		let toolResultChars = options.resumeFrom?.toolResultChars ?? 0;
 		const firstRound = options.resumeFrom?.nextRound ?? 1;
-		if (!unlimitedRounds && firstRound > maxRounds) {
+		const lastRound = maxRounds === 'unlimited' ? Infinity : options.segmentRounds ? firstRound + maxRounds - 1 : maxRounds;
+		let pending = options.resumeFrom?.pending;
+		if (!unlimitedRounds && firstRound > lastRound) {
 			throw new Error(`AI review continuation already consumed ${firstRound - 1} rounds. Increase Cli Diff: AI Review Max Rounds to continue.`);
 		}
 		emitTrace(options, {
@@ -161,6 +172,7 @@ export class AgentRunner {
 		await options.onCheckpoint?.({
 			version: 1,
 			nextRound: firstRound,
+			pending,
 			messages: cloneMessages(messages),
 			toolCalls,
 			toolResultChars,
@@ -168,7 +180,7 @@ export class AgentRunner {
 		});
 
 		try {
-			for (let round = firstRound; unlimitedRounds || round <= maxRounds; round += 1) {
+			for (let round = firstRound; unlimitedRounds || round <= lastRound; round += 1) {
 				throwIfAborted(signal);
 				if (Date.now() - startedAt > maxRunMs) {
 					throw new Error('Agent exceeded its runtime limit.');
@@ -176,11 +188,16 @@ export class AgentRunner {
 				if (messages.reduce((total, message) => total + message.content.length, 0) > maxContextChars) {
 					throw new Error('Agent exceeded its accumulated context limit.');
 				}
+				if (!pending) {
+					await options.beforeRound?.(messages, round, signal);
+					await options.onCheckpoint?.({ version: 1, nextRound: round, messages: cloneMessages(messages), toolCalls, toolResultChars, runFingerprint });
+				}
 				options.onProgress?.({ message: `Agent round ${round}`, round, toolCalls });
-				const response = await requestAgentRound(options, messages, nativeTools, signal, round);
+				const response = pending?.response ?? await requestAgentRound(options, messages, nativeTools, signal, round);
 				throwIfAborted(signal);
 				if (response.type === 'final') {
 					messages.push({ role: 'assistant', content: response.content, reasoningContent: response.reasoningContent });
+					await options.onCheckpoint?.({ version: 1, nextRound: round + 1, messages: cloneMessages(messages), toolCalls, toolResultChars, runFingerprint });
 					const result = { result: response.result, rounds: round, toolCalls };
 					emitTrace(options, {
 						kind: 'run_complete',
@@ -193,8 +210,12 @@ export class AgentRunner {
 					return result;
 				}
 
-				const results: Array<{ id: string; name: string; ok: boolean; result?: unknown; error?: string }> = [];
+				const results: Array<{ id: string; name: string; ok: boolean; result?: unknown; error?: string }> = pending?.results ?? [];
+				pending = { response, results };
+				const savePending = () => options.onCheckpoint?.({ version: 1, nextRound: round, messages: cloneMessages(messages), toolCalls, toolResultChars, runFingerprint, pending: JSON.parse(JSON.stringify(pending)) });
+				await savePending();
 				for (const call of response.calls) {
+					if (results.some((result) => result.id === call.id)) { continue; }
 					throwIfAborted(signal);
 					const tool = tools.get(call.name);
 					if (!tool) {
@@ -218,8 +239,11 @@ export class AgentRunner {
 						ok: true,
 					};
 					try {
+						if (options.maxRoundToolResultChars && JSON.stringify(results).length + 24000 > options.maxRoundToolResultChars) { throw new Error('Round tool-output budget reached. Repeat this tool call in the next round; it was not executed.'); }
 						result.result = await tool.execute(call.arguments, signal);
 					} catch (error) {
+						throwIfAborted(signal);
+						if (error instanceof AgentPauseError) { throw error; }
 						result.ok = false;
 						result.error = error instanceof Error ? error.message : String(error);
 					}
@@ -233,6 +257,7 @@ export class AgentRunner {
 						details: [jsonDetail('Result', result)],
 					});
 					toolCalls += 1;
+					await savePending();
 				}
 				const content = JSON.stringify({ type: 'tool_results', results });
 				toolResultChars += content.length;
@@ -261,6 +286,7 @@ export class AgentRunner {
 					messages.push({ role: 'assistant', content: response.content });
 					messages.push({ role: 'user', content });
 				}
+				pending = undefined;
 				await options.onCheckpoint?.({
 					version: 1,
 					nextRound: round + 1,
@@ -294,11 +320,11 @@ export class AgentRunner {
 function agentRunFingerprint(options: AgentRunOptions, nativeTools: boolean): string {
 	return createHash('sha256').update(JSON.stringify({
 		provider: options.config.provider,
-		baseUrl: options.config.baseUrl,
+		baseUrl: options.segmentRounds ? undefined : options.config.baseUrl,
 		model: options.config.model,
-		jsonOutputEnabled: options.config.jsonOutputEnabled,
-		thinkingMode: options.config.thinkingMode,
-		strictTools: options.config.strictTools,
+		jsonOutputEnabled: options.segmentRounds ? undefined : options.config.jsonOutputEnabled,
+		thinkingMode: options.segmentRounds ? undefined : options.config.thinkingMode,
+		strictTools: options.segmentRounds ? undefined : options.config.strictTools,
 		nativeTools,
 		systemPrompt: options.systemPrompt,
 		userPrompt: options.userPrompt,
@@ -359,12 +385,12 @@ async function requestAgentRound(
 	let preview = '';
 	let previousRawResponse = '';
 	for (let attempt = 0; attempt < 3; attempt += 1) {
-		const correction = attempt === 0 ? [] : [jsonCorrectionMessage(nativeTools, failure, previousRawResponse)];
+		const correction = attempt === 0 || !previousRawResponse ? [] : [jsonCorrectionMessage(nativeTools, failure, previousRawResponse)];
 		const request = {
 			model: options.config.model,
 			messages: [...messages, ...correction],
 			temperature: 0,
-			maxTokens: 12000,
+			maxTokens: options.maxOutputTokens ?? options.config.maxOutputTokens ?? 12000,
 			jsonOutput: providerForcesJsonOutput(options.config.provider) ? true : options.config.jsonOutputEnabled,
 			tools: nativeTools ? toolDefinitions(options.tools) : undefined,
 		};
@@ -376,7 +402,24 @@ async function requestAgentRound(
 			status: 'running',
 			details: [jsonDetail('Request', request)],
 		});
-		const completion = await completeLlm(options.client, request, signal);
+        let completion: LlmCompletion;
+        try { completion = await completeLlm(options.client, request, signal); }
+        catch (error) {
+         throwIfAborted(signal);
+         const retryable = error instanceof LlmApiError ? error.retryable : error instanceof TypeError;
+         if (!retryable || attempt === 2) { throw error; }
+         failure = error;
+         const retryAfter = error instanceof LlmApiError && error.retryAfter ? error.retryAfter : undefined;
+         const serverDelay = retryAfter ? (/^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : Date.parse(retryAfter) - Date.now()) : 0;
+         const delay = Math.max(Number.isFinite(serverDelay) ? serverDelay : 0, (attempt === 0 ? 1000 : 3000) + Math.random() * 250);
+         emitTrace(options, { kind: 'parse_error', title: 'Request retry', summary: errorMessage(error), round, status: 'error', details: [] });
+         await new Promise<void>((resolve, reject) => {
+          const onAbort = () => { clearTimeout(timer); reject(new AgentPauseError('Request interrupted')); };
+          const timer = setTimeout(() => { signal.removeEventListener('abort', onAbort); resolve(); }, delay);
+          signal.addEventListener('abort', onAbort, { once: true });
+         });
+         continue;
+        }
 		emitTrace(options, {
 			kind: 'llm_response',
 			title: 'LLM response',
@@ -389,6 +432,7 @@ async function requestAgentRound(
 		preview = previousRawResponse.slice(0, 240);
 		try {
 			const response = nativeTools ? validateNativeRound(completion, options.tools, options.config.provider) : validateTextRound(completion);
+			if (response.type === 'final') { await options.validateFinal?.(response.result); }
 			emitTrace(options, {
 				kind: 'parse_success',
 				title: 'Parsed response',
@@ -489,7 +533,7 @@ function providerName(provider: LlmRuntimeConfig['provider']): string {
 	if (provider === 'glm') {
 		return 'GLM';
 	}
-	return provider === 'anthropic' ? 'Anthropic' : 'OpenAI-compatible';
+	return 'GLM';
 }
 
 function providerUsesNativeTools(provider: LlmRuntimeConfig['provider']): boolean {
@@ -501,7 +545,8 @@ function providerForcesJsonOutput(provider: LlmRuntimeConfig['provider']): boole
 }
 
 function emitTrace(options: AgentRunOptions, event: AgentTraceEvent): void {
-	options.onTrace?.(event);
+	const key = options.config.apiKey;
+	options.onTrace?.(key ? { ...event, title: event.title.split(key).join('[REDACTED]'), summary: event.summary.split(key).join('[REDACTED]'), details: event.details.map((detail) => ({ ...detail, content: detail.content.split(key).join('[REDACTED]') })) } : event);
 }
 
 function textDetail(label: string, content: string): AgentTraceDetail {

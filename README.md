@@ -4,7 +4,7 @@ Cli Diff Review 是一个面向 CLI Coding Agent 的 VS Code 扩展。
 
 它自动识别 Git 工作区中的代码变更，并提供类似 Cursor、GitHub Copilot 的逐块审阅体验。无论代码由 Codex、Claude Code、Gemini CLI 或其他工具生成，都可以在同一个界面中查看、接受、拒绝和撤销变更。
 
-同时，插件参考 [llm-wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) 理念为项目建立可持续更新的本地知识库，使项目知识能够被 Coding Agent 和 Review Agent 感知，并结合工作区或分支差异提供 Multi Agent AI Review。
+同时，插件参考 [llm-wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) 理念为项目建立可持续更新的本地知识库，使项目知识能够被 Coding Agent 和 Review Agent 感知，并结合工作区或分支差异提供 按需多 Agent AI Review。
 
 > 🎬 项目介绍视频：[点击观看](VIDEO_URL)
 
@@ -140,32 +140,30 @@ AI Review 支持：
 - 将问题和修改建议关联到具体代码块
 - 直接应用或撤销 AI 修改建议
 
-### 多 Agent 审阅架构
+### 主 Agent 与按需子 Agent
 
-完整的代码审阅由多个 Agent 协作完成：
+审阅由一个主 Agent 发起。小变更直接审阅；需要背景调查时调用 Explore，需要独立审阅时调用 Review，复杂任务可选调用 Plan。只有主 Agent 提交问题、建议和整次审阅结果，子 Agent 提供证据和候选结果。
 
-```text
-┌──────────────────────────────┐
-│ Knowledge Retrieval Agent    │───── 从 LLM Code Wiki 提取相关知识，并使用当前源码验证关键结论
-└──────────────────────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│ Review Planning Agent        │───── 分析整个变更集，规划需要重点检查的文件和风险
-└──────────────────────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│ File Review Agents           │───── 并行审阅各个文件，将问题和修改建议关联到具体 Diff Chunk
-└──────────────────────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│ Integration Review Agent     │───── 综合文件审阅结果，检查跨文件调用、配置和整体集成问题
-└──────────────────────────────┘
-```
+- `list_changes` 先返回插件检测到的 Chunk 清单，`read_change` 分页读取指定变更；不再把整个 Diff 一次性塞进提示词。
+- `Glob`、`Grep`、`Read` 用于查找和读取项目源码、测试、配置及 Wiki。工具只读，不提供 Shell。读取已保存的磁盘代码。
+- `spawn_agent` 异步创建子任务；`send_agent_message` 传递消息；`wait_agents` 可选等待；`read_agent_result` 分页读取报告；`cancel_agent` 取消子任务。子 Agent 只有五个读取工具和消息工具。
+- `submit_findings`、`submit_suggestions` 校验并保存结果；`get_review_status` 查看任务、预算、覆盖情况；`finish_review` 保存完整或部分审阅结论。共 14 个工具。
 
-支持 OpenAI、Anthropic，并针对 DeepSeek 和 GLM 模型服务进行了专门适配。
+每个问题绑定版本化 `chunkRef` 和源码 `evidenceRef`。代码或依赖证据变化后必须重新读取；建议应用前再次校验内容。建议提交本身不会修改文件。
+
+审阅期间插件在下一轮调用前补充已保存代码的净变更通知，不会自动重跑整次审阅。默认允许 5 批通知，第 6 批发送前暂停。点击“继续审阅”会重新扫描，并一次性补报暂停期间的变更；这次恢复通知不占下一段额度。
+
+### 模型、预算与恢复
+
+只支持 DeepSeek、GLM；Base URL、API Key 和模型名由用户配置。已有两家配置保留且无需补填参数。上下文窗口、压缩阈值和最大输出 Token 均为可留空的普通输入框。未填写窗口时仍可审阅，但不自动压缩；压缩阈值默认已占用 40%，最大输出默认 12,000 Token（填写较小窗口时，默认值相应降至窗口的四分之一）。
+
+设置中的 `cliDiff.aiReviewAutoCompress` 默认关闭，启用后才会自动压缩。压缩使用同模型的内部无工具请求，分段提炼历史，再合并插件保存的任务、引用及结果状态；校验成功后才替换上下文。固定提示词和工具允许时，目标是将输入降到窗口的 25% 以下。失败保留原历史并继续；关闭压缩不会因本地估算超限而暂停。模型实际拒绝请求时保存进度，提供“继续审阅”。
+
+默认整次审阅预算为 1,000,000 Token，主 Agent、子 Agent、重试和压缩共同计费；恢复不清零。优先使用接口 usage，没有 usage 时采用保守估算并标注。默认最多 5 个活跃子 Agent，主 Agent 单独计算。每段默认 32 轮，继续时获得新一段轮数。
+
+失败或中断后沿用原审阅 ID 和各 Agent 历史，从未完成的工具继续；不会重新创建已保存的子任务或重复提交结果。更换厂商或模型需新建审阅。旧 Auto/Multi/FileOnly 流程、设置及旧审阅 checkpoint 不再兼容。
+
+观测界面按“主 Agent → round → 子任务 → 子 Agent rounds”展开。默认只传摘要，点击查看时分页加载详细请求和响应；压缩、变更通知、失败及恢复分别记录为事件。
 
 ![image-20260803201424106](README.assets/image-20260803201424106.png)
 

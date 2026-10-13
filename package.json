@@ -248,23 +248,12 @@
           "default": true,
           "description": "Include Git-detected changes under .agents/skills/llm-code-wiki in Cli Diff Review. Disable to ignore that directory."
         },
-        "cliDiff.aiReviewStrategy": {
-          "type": "string",
-          "order": 4,
-          "enum": [
-            "Auto",
-            "Multi",
-            "FileOnly"
-          ],
-          "default": "Multi",
-          "description": "AI Review agent strategy. Auto chooses between lightweight file review and multi-agent review; Multi always runs planning and integration review; FileOnly uses only per-file review."
-        },
         "cliDiff.aiReviewMaxRounds": {
           "type": "number",
           "order": 5,
           "default": 32,
           "minimum": 0,
-          "description": "Maximum rounds for each AI Review agent. Applies to knowledge, planning, file, and integration agents. 0 means unlimited."
+          "description": "Maximum rounds per execution segment for Main and child review agents. Continue grants another segment. 0 means unlimited."
         },
         "cliDiff.agentConcurrency": {
           "type": "number",
@@ -282,6 +271,33 @@
           ],
           "default": "zh-CN",
           "description": "AI review findings language."
+        },
+        "cliDiff.aiReviewTotalBudgetTokens": {
+          "type": "number",
+          "default": 1000000,
+          "description": "Total input/output token budget shared by Main, children, retries and compaction.",
+          "minimum": 1,
+          "order": 8
+        },
+        "cliDiff.aiReviewChildConcurrency": {
+          "type": "number",
+          "default": 5,
+          "description": "Maximum active review child agents; Main is separate.",
+          "minimum": 1,
+          "order": 9
+        },
+        "cliDiff.aiReviewAutoCompress": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable automatic context compaction. Threshold is configured per model.",
+          "order": 10
+        },
+        "cliDiff.aiReviewChangeNotificationLimit": {
+          "type": "number",
+          "default": 5,
+          "description": "Pause before sending another live-change batch after this many notifications; Continue merges paused changes.",
+          "minimum": 1,
+          "order": 11
         }
       }
     }
@@ -295,7 +311,7 @@
     "watch-tests": "tsc -p . -w --outDir out",
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
     "lint": "eslint src",
-    "test": "vscode-test"
+    "test": "node scripts/test.cjs"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",

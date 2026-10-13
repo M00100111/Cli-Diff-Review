@@ -10,6 +10,7 @@ import { currentReviewProject, hasAggregateReviewTarget, ReviewFileState, Review
 
 type DashboardMessage =
 	| { type: 'ready' }
+	| { type: 'readRunLogDetail'; entryId: string; detailIndex: number; offset: number }
 	| { type: 'refresh' }
 	| { type: 'open'; uri: string }
 	| { type: 'acceptFile'; uri: string; revision: number }
@@ -36,6 +37,9 @@ type DashboardMessage =
 		jsonOutputEnabled: boolean;
 		thinkingMode: LlmThinkingMode;
 		strictTools: boolean;
+	contextWindowTokens?: number;
+	compressionThresholdPercent?: number;
+	maxOutputTokens?: number;
 	}
 	| { type: 'selectLlmConfigProfile'; profileId: string }
 	| { type: 'deleteLlmConfigProfile'; profileId: string }
@@ -123,7 +127,13 @@ export interface LlmWikiRunLogEntry {
 	sequence: number;
 	timestamp: string;
 	source?: 'wiki' | 'review';
-	stage?: 'knowledge' | 'plan' | 'file' | 'module' | 'integration';
+	spawnedAgentId?: string;
+	detailSizes?: Array<{ label: string; format: string; length: number }>;
+	agentId?: string;
+	parentAgentId?: string;
+	role?: string;
+	segment?: number;
+	stage?: 'main' | 'explore' | 'review' | 'knowledge' | 'plan' | 'file' | 'module' | 'integration';
 	fileUri?: string;
 	relativePath?: string;
 	fileIndex?: number;
@@ -176,6 +186,9 @@ export interface LlmWikiDashboardState {
 	jsonOutputEnabled: boolean;
 	thinkingMode: LlmThinkingMode;
 	strictTools: boolean;
+	contextWindowTokens?: number;
+	compressionThresholdPercent?: number;
+	maxOutputTokens?: number;
 	activeProfileId?: string;
 	profiles: LlmConfigProfile[];
 	runLog: LlmWikiRunLogEntry[];
@@ -187,6 +200,10 @@ export interface LlmWikiDashboardState {
 	aiReviewCompletedFileCount: number;
 	aiReviewTotalFileCount: number;
 	aiReviewError?: string;
+	aiReviewSummary?: string;
+	aiReviewUsage?: { input: number; output: number; estimated: number; reserved: number };
+	aiReviewNotificationCount?: number;
+	aiReviewChildCount?: number;
 	aiReviewKnowledgeFreshness?: WikiFreshnessAssessment;
 	agentProjectKey?: string;
 	aggregateProjectView?: boolean;
@@ -233,11 +250,21 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 		const payload = this.getPayload();
 		this.view.title = dashboardTitleFile(payload.currentReviewLabel);
-		void this.view.webview.postMessage({ type: 'state', payload });
+		const transport = payload.llmWiki ? { ...payload, llmWiki: { ...payload.llmWiki, runLog: payload.llmWiki.runLog.map((entry) => ({ ...entry, detailSizes: entry.details.map((detail) => ({ label: detail.label, format: detail.format, length: detail.content.length })), details: [] })) } } : payload;
+        void this.view.webview.postMessage({ type: 'state', payload: transport });
 	}
 
 	private async handleMessage(message: DashboardMessage): Promise<void> {
-		if (message.type === 'ready') {
+        if (message.type === 'readRunLogDetail') {
+            const entry = this.getPayload().llmWiki?.runLog.find((item) => item.id === message.entryId);
+            if (!entry || !Number.isSafeInteger(message.detailIndex) || !Number.isSafeInteger(message.offset) || message.offset < 0) { return; }
+            const detail = entry.details[message.detailIndex];
+            if (!detail) { return; }
+            const end = Math.min(detail.content.length, message.offset + 16000);
+            void this.view?.webview.postMessage({ type: 'runLogDetail', entryId: entry.id, detailIndex: message.detailIndex, text: detail.content.slice(message.offset, end), offset: message.offset, nextOffset: end < detail.content.length ? end : null, totalChars: detail.content.length });
+            return;
+        }
+        if (message.type === 'ready') {
 			this.postState();
 			return;
 		}
@@ -329,6 +356,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				jsonOutputEnabled: message.jsonOutputEnabled,
 				thinkingMode: message.thinkingMode,
 				strictTools: message.strictTools,
+				contextWindowTokens: message.contextWindowTokens,
+				compressionThresholdPercent: message.compressionThresholdPercent,
+				maxOutputTokens: message.maxOutputTokens,
 			};
 			if (message.profileId) {
 				(input as { profileId?: string }).profileId = message.profileId;
@@ -520,7 +550,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			background: var(--vscode-menu-background, var(--vscode-sideBar-background));
 			box-shadow: 0 2px 8px var(--vscode-widget-shadow);
 		}
-		.settings-menu[hidden] { display: none; }
+		.settings-menu[hidden], .settings-menu-item[hidden] { display: none; }
 		.settings-menu-item {
 			width: 100%;
 			min-height: 28px;
@@ -1468,7 +1498,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 						<span class="settings-menu-title">Generate AI review</span>
 						<span class="settings-menu-reason"></span>
 					</button>
-					<button class="settings-menu-item" type="button" role="menuitem" data-menu-action="regenerateAiReview" hidden>
+                    <button class="settings-menu-item" type="button" role="menuitem" data-menu-action="regenerateAiReview" hidden>
 						<span class="settings-menu-title">Regenerate AI review</span>
 						<span class="settings-menu-reason"></span>
 					</button>
@@ -1493,19 +1523,17 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				<div class="wiki-field">
 					<label for="llmProvider">Provider</label>
 					<select id="llmProvider">
-						<option value="openai">OpenAI-compatible</option>
-						<option value="anthropic">Anthropic</option>
 						<option value="deepseek">DeepSeek</option>
 						<option value="glm">GLM</option>
 					</select>
 				</div>
 				<div class="wiki-field">
 					<label for="llmBaseUrl">Base URL</label>
-					<input id="llmBaseUrl" type="url" autocomplete="off" placeholder="https://api.openai.com/v1">
+					<input id="llmBaseUrl" type="url" autocomplete="off" placeholder="https://api.deepseek.com">
 				</div>
 				<div class="wiki-field">
 					<label for="llmModel">Model</label>
-					<input id="llmModel" type="text" autocomplete="off" placeholder="gpt-4.1">
+					<input id="llmModel" type="text" autocomplete="off" placeholder="Model name">
 				</div>
 				<div class="wiki-field">
 					<label for="llmApiKey">API Key</label>
@@ -1531,7 +1559,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					<input id="llmStrictTools" type="checkbox">
 					<span>Strict Tools (Beta)</span>
 				</label>
-				<div class="wiki-config-actions">
+				<div class="wiki-field"><label for="llmContextWindow">Context window (tokens)</label><input id="llmContextWindow" type="text" inputmode="numeric" pattern="[0-9]+" placeholder="Optional; needed for auto compression"></div>
+                <div class="wiki-field"><label for="llmCompressionThreshold">Auto compression at occupied context (%)</label><input id="llmCompressionThreshold" type="text" inputmode="decimal" pattern="[0-9]+([.][0-9]+)?" placeholder="40"></div>
+                <div class="wiki-field"><label for="llmMaxOutput">Maximum output tokens</label><input id="llmMaxOutput" type="text" inputmode="numeric" pattern="[0-9]+" placeholder="Default: up to 12000"></div>
+                <div class="wiki-config-actions">
 					<button class="wiki-save" id="saveLlmConfig" type="submit">Save</button>
 					<button class="wiki-action secondary" id="deleteLlmConfig" type="button" hidden>Delete</button>
 				</div>
@@ -1667,6 +1698,10 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				showStoredApiKey();
 			}
 		});
+		function optionalNumber(id) {
+			const value = document.getElementById(id).value.trim();
+			return value === '' ? undefined : Number(value);
+		}
 		wikiConfig.addEventListener('submit', (event) => {
 			event.preventDefault();
 			const profileId = editingProfileId;
@@ -1682,6 +1717,9 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				jsonOutputEnabled: llmJsonOutput.checked,
 				thinkingMode: llmThinkingMode.value,
 				strictTools: llmStrictTools.checked,
+				contextWindowTokens: optionalNumber('llmContextWindow'),
+				compressionThresholdPercent: optionalNumber('llmCompressionThreshold'),
+				maxOutputTokens: optionalNumber('llmMaxOutput'),
 			});
 		});
 		deleteLlmConfig.addEventListener('click', () => {
@@ -1715,6 +1753,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		const pendingScrollTops = new WeakMap();
 		const suggestionScrollPositions = new Map();
 		const runLogDetailScrollPositions = new Map();
+        const logDetailPages = new Map();
 		const runLogListScrollPositions = new Map();
 		let renderedRunLogProjectKey;
 		toggle.addEventListener('click', () => setExpanded(!expanded));
@@ -1733,7 +1772,18 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			undoChunk: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 5.5H3.5V3.5"/><path d="M3.8 5.4A5 5 0 1 1 4.9 12"/></svg>',
 		};
 		window.addEventListener('message', (event) => {
-			if (event.data?.type !== 'state') {
+            if (event.data?.type === 'runLogDetail') {
+                const value = event.data, key = value.entryId + ':' + value.detailIndex;
+                const old = logDetailPages.get(key);
+                const text = value.offset === 0 ? value.text : old && old.text.length === value.offset ? old.text + value.text : value.text;
+                logDetailPages.set(key, { ...value, text });
+                if (logDetailPages.size > 64) { logDetailPages.delete(logDetailPages.keys().next().value); }
+                for (const block of wikiRunList.querySelectorAll('[data-log-detail-key]')) {
+                    if (block.dataset.logDetailKey === key) { fillLogDetail(block, value.entryId, value.detailIndex); }
+                }
+                return;
+            }
+            if (event.data?.type !== 'state') {
 				return;
 			}
 			render(event.data.payload || { files: [] });
@@ -1955,6 +2005,11 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 				wikiAction.hidden = true;
 			}
 			wikiStatus.textContent = wikiStatusText(wiki, initialized, running);
+            if (wiki.aiReviewUsage) {
+                const usage = wiki.aiReviewUsage;
+                wikiStatus.textContent += '\\nReview: ' + (usage.input + usage.output).toLocaleString() + ' tokens' + (usage.estimated ? ' (includes estimates)' : '') + ' · ' + (wiki.aiReviewChildCount || 0) + ' children · ' + (wiki.aiReviewNotificationCount || 0) + ' change batches';
+            }
+            if (wiki.aiReviewSummary && !running) { wikiStatus.textContent += '\\n' + wiki.aiReviewSummary; }
 		}
 
 		function renderProjectAgents(items) {
@@ -2136,12 +2191,15 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 
 		function populateConfig(config) {
-			llmProvider.value = config.provider || 'openai';
+			llmProvider.value = config.provider || 'deepseek';
 			llmBaseUrl.value = config.baseUrl || '';
 			llmModel.value = config.model || '';
 			llmJsonOutput.checked = Boolean(config.jsonOutputEnabled);
 			llmThinkingMode.value = config.thinkingMode || 'disabled';
 			llmStrictTools.checked = Boolean(config.strictTools);
+			document.getElementById('llmContextWindow').value = config.contextWindowTokens || '';
+			document.getElementById('llmCompressionThreshold').value = config.compressionThresholdPercent ?? '';
+			document.getElementById('llmMaxOutput').value = config.maxOutputTokens ?? '';
 			if (config.hasApiKey) {
 				showStoredApiKey();
 			} else {
@@ -2214,16 +2272,13 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		}
 
 		function providerLabel(provider) {
-			if (provider === 'anthropic') {
-				return 'Anthropic';
-			}
 			if (provider === 'deepseek') {
 				return 'DeepSeek';
 			}
 			if (provider === 'glm') {
 				return 'GLM';
 			}
-			return 'OpenAI-compatible';
+			return 'Select provider';
 		}
 
 		function urlHost(value) {
@@ -2236,7 +2291,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 
 		function newConfigState() {
 			return {
-				provider: 'openai',
+				provider: 'deepseek',
 				baseUrl: '',
 				model: '',
 				hasApiKey: false,
@@ -2573,7 +2628,12 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			wikiRunList.hidden = items.length === 0;
 			renderedRunLogSignature = nextSignature;
 			renderedRunLogProjectKey = projectKey;
-			const blocks = source === 'review' || items.some((item) => item.source === 'review' || item.fileUri)
+			if (items.some((item) => item.agentId)) {
+                wikiRunList.appendChild(renderAgentTree(items, 'main', openRunLogKeys));
+                restoreScrollTop(wikiRunList, runLogScrollTop);
+                return;
+            }
+            const blocks = source === 'review' || items.some((item) => item.source === 'review' || item.fileUri)
 				? groupRunLogByFile(items)
 				: groupRunLog(items);
 			for (const block of blocks) {
@@ -2586,6 +2646,22 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			pruneRunLogDetailScrollPositions();
 			restoreScrollTop(wikiRunList, runLogScrollTop);
 		}
+
+        function renderAgentTree(items, agentId, openKeys) {
+            const own = items.filter((item) => item.agentId === agentId);
+            const first = own[0] || {};
+            const group = { fileUri: 'agent:' + agentId, relativePath: (first.role || 'Main') + ' · ' + agentId, items: own };
+            const node = renderRunLogFile(group, openKeys);
+            const body = node.querySelector('.wiki-run-file-items');
+            const children = [...new Set(items.filter((item) => item.parentAgentId === agentId).map((item) => item.agentId))];
+            for (const child of children) {
+                const childNode = renderAgentTree(items, child, openKeys);
+                const trigger = own.find((item) => item.spawnedAgentId === child);
+                const round = trigger && body.querySelector('[data-run-log-key="' + runLogFileKey(group) + '/round:' + trigger.round + '"]');
+                (round || body).appendChild(childNode);
+            }
+            return node;
+        }
 
 		function runLogSignature(items, source, projectKey) {
 			return JSON.stringify({ projectKey: projectKey || '', source: source || '', items });
@@ -2807,21 +2883,26 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 
 			const body = document.createElement('div');
 			body.className = 'wiki-run-details';
-			for (const [detailIndex, detail] of (item.details || []).entries()) {
-				const block = document.createElement('div');
-				block.className = 'wiki-run-detail';
-				const label = document.createElement('span');
-				label.className = 'wiki-run-detail-label';
-				label.textContent = detail.label || detail.format || 'Detail';
-				const pre = document.createElement('pre');
-				const scrollKey = entryKey + '/detail:' + detailIndex;
-				pre.dataset.format = detail.format || 'text';
-				pre.dataset.runLogDetailScrollKey = scrollKey;
-				pre.textContent = detail.content || '';
-				restoreRunLogDetailScrollPosition(pre, scrollKey);
-				block.append(label, pre);
-				body.appendChild(block);
-			}
+            let loaded = false;
+            const populate = () => {
+                if (loaded || !details.open) { return; }
+                loaded = true;
+                body.replaceChildren();
+                for (const [detailIndex, detail] of (item.detailSizes || item.details || []).entries()) {
+                    const block = document.createElement('div');
+                    block.className = 'wiki-run-detail';
+                    block.dataset.logDetailKey = item.id + ':' + detailIndex;
+                    const label = document.createElement('span');
+                    label.className = 'wiki-run-detail-label';
+                    label.textContent = detail.label || detail.format || 'Detail';
+                    block.append(label, document.createElement('pre'));
+                    body.appendChild(block);
+                    fillLogDetail(block, item.id, detailIndex);
+                }
+                if (!body.childElementCount) { body.textContent = item.summary || ''; }
+            };
+            details.addEventListener('toggle', populate);
+            populate();
 			if (!body.childElementCount) {
 				const block = document.createElement('div');
 				block.className = 'wiki-run-detail';
@@ -2836,6 +2917,22 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			details.appendChild(body);
 			return details;
 		}
+
+        function fillLogDetail(block, entryId, detailIndex) {
+            const key = entryId + ':' + detailIndex, page = logDetailPages.get(key);
+            let pre = block.querySelector('pre');
+            if (!pre) { pre = document.createElement('pre'); block.appendChild(pre); }
+            pre.textContent = page ? page.text : 'Loading…';
+            const previous = block.querySelector('button');
+            if (previous) { previous.remove(); }
+            if (!page) { vscode.postMessage({ type: 'readRunLogDetail', entryId, detailIndex, offset: 0 }); }
+            else if (page.nextOffset !== null) {
+                const button = document.createElement('button');
+                button.textContent = 'Load more · ' + page.text.length + '/' + page.totalChars + ' characters';
+                button.addEventListener('click', () => { button.disabled = true; vscode.postMessage({ type: 'readRunLogDetail', entryId, detailIndex, offset: page.nextOffset }); });
+                block.appendChild(button);
+            }
+        }
 
 		function roundStatus(items) {
 			return runLogGroupStatus(items);
@@ -2913,7 +3010,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 			const glm = provider === 'glm';
 			const thinking = deepseek || glm;
 			updateThinkingModeOptions(provider, llmThinkingMode.value);
-			jsonOutputField.hidden = provider === 'anthropic';
+			jsonOutputField.hidden = false;
 			thinkingModeField.hidden = !thinking;
 			strictToolsField.hidden = !deepseek;
 			if (providerChanged) {
@@ -2928,14 +3025,6 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 					llmModel.value = 'glm-5.2';
 					llmJsonOutput.checked = true;
 					llmThinkingMode.value = 'high';
-					llmStrictTools.checked = false;
-				} else if (provider === 'anthropic') {
-					llmJsonOutput.checked = false;
-					llmThinkingMode.value = 'disabled';
-					llmStrictTools.checked = false;
-				} else {
-					llmJsonOutput.checked = true;
-					llmThinkingMode.value = 'disabled';
 					llmStrictTools.checked = false;
 				}
 			}
@@ -2975,7 +3064,7 @@ export class ReviewDashboardProvider implements vscode.WebviewViewProvider, vsco
 		function emptyWikiState() {
 			return {
 				configured: false,
-				provider: 'openai',
+				provider: 'deepseek',
 				baseUrl: '',
 				model: '',
 				hasApiKey: false,
@@ -3230,7 +3319,7 @@ export function buildReviewDashboardPayload(
 export function defaultLlmWikiDashboardState(): LlmWikiDashboardState {
 	return {
 		configured: false,
-		provider: 'openai',
+		provider: 'deepseek',
 		baseUrl: '',
 		model: '',
 		hasApiKey: false,
